@@ -3,11 +3,19 @@
 继承 :class:`RobotClient` 的 gRPC 通信与线程管理，
 仅覆盖观测采集（旋转向量→四元数）和动作执行（UMI 坐标变换）两处。
 
-数据集约定（pick_and_place_20260507）
--------------------------------------
-- ``observation.state`` : 8D ``[pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w, gripper]``
-- ``action``             : 同格式 8D UMI ee6d 增量（相对 t₀ 的 SE(3) + 夹爪）
+数据集约定
+----------
+**world_flange 格式（推荐，--pose-format=world_flange）**：
+
+- ``observation.state``    : 1D ``[gripper_width]``
+- ``action``               : 7D ``[pos_x_W, pos_y_W, pos_z_W, rotvec_x_W, rotvec_y_W, rotvec_z_W, gripper]``
+  （sample-relative，相对推理时刻 EE 位姿；t0_mode 须为 ``per_step``）
+- ``observation.umi_pose`` : 6D（仅数据集/训练期间使用，推理时不需要）
 - ``observation.images.camera0`` : 480×640×3 RGB
+
+**legacy ee_at_t0_flange 格式（向后兼容）**：
+
+- ``observation.state`` / ``action`` : 8D ``[pos_xyz, quat_xyzw, gripper]``
 
 与 robot_client.py 的差异
 --------------------------
@@ -39,8 +47,6 @@
         --dry_run
 """
 
-from __future__ import annotations
-
 import logging
 import pickle  # nosec
 import threading
@@ -58,6 +64,7 @@ from lerobot.robots.franka_gen_gripper import (
     FrankaGenGripperConfig,
     UMI_REFERENCE_MODES,
     pose_xyz_quat_to_se3,
+    pose_xyz_rotvec_to_se3,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -104,19 +111,28 @@ class FrankaUMIClientConfig:
 
     # ---- UMI 坐标变换 ----
     reference: str = field(
-        default="camera_t0",
+        default="ee_at_t0",
         metadata={"help": f"ee6d 参考坐标系约定，可选：{UMI_REFERENCE_MODES}"},
     )
     use_gripper: bool = field(default=True, metadata={"help": "是否执行策略输出的夹爪动作"})
+    t0_mode: str = field(
+        default="per_step",
+        metadata={
+            "help": (
+                "T_BE_t₀ 更新策略：'per_step'（每步刷新，推荐与 world_flange 数据集配合使用）、"
+                "'per_chunk'（每块刷新）、'per_episode'（仅 episode 开始时捕获一次）"
+            )
+        },
+    )
     update_t0_per_chunk: bool = field(
         default=False,
-        metadata={"help": "每收到新动作块时重新捕获 T_BE_t0（适合长任务）"},
+        metadata={"help": "[已废弃] 请改用 t0_mode='per_chunk'。保留用于向后兼容。"},
     )
 
     # ---- 控制 ----
     fps: float = field(default=15.0, metadata={"help": "控制循环目标帧率"})
     chunk_size_threshold: float = field(
-        default=0.5,
+        default=0.2,
         metadata={"help": "队列剩余动作比例低于此值时触发新观测请求"},
     )
     task: str = field(default="pick and place", metadata={"help": "传递给策略的任务描述"})
@@ -262,14 +278,31 @@ class FrankaUMIClient(RobotClient):
     # ------------------------------------------------------------------
 
     def control_loop_action(self, verbose: bool = False):
-        """覆盖：将 8D quat 动作经 UMI SE(3) 变换后发送到 Franka。"""
+        """覆盖：将策略动作经 UMI SE(3) 变换后发送到 Franka。
+
+        自动检测动作格式：
+        - 7D ``[pos3, rotvec3, gripper]`` → world_flange / sample-relative 格式
+        - 8D ``[pos3, quat4, gripper]``  → legacy ee_at_t0_flange 格式
+        """
         with self.action_queue_lock:
             self.action_queue_size.append(self.action_queue.qsize())
             timed_action: TimedAction = self.action_queue.get_nowait()
 
         a = timed_action.get_action().cpu().numpy().astype(np.float64)
-        pos, quat_xyzw, gripper_width = a[0:3], a[3:7], float(a[7])
-        delta_k = pose_xyz_quat_to_se3(pos, quat_xyzw)
+
+        if len(a) == 7:
+            # world_flange / sample-relative 格式：7D pos+rotvec+gripper
+            pos, rotvec, gripper_width = a[0:3], a[3:6], float(a[6])
+            delta_k = pose_xyz_rotvec_to_se3(pos, rotvec)
+        else:
+            # legacy 格式：8D pos+quat+gripper
+            pos, quat_xyzw, gripper_width = a[0:3], a[3:7], float(a[7])
+            delta_k = pose_xyz_quat_to_se3(pos, quat_xyzw)
+
+        # per_step 模式：每次动作前更新 T_BE_t0 = 当前 FK
+        t0_mode = self.config.t0_mode
+        if t0_mode == "per_step":
+            self.robot.capture_t0()
 
         T_BE_t0 = self.robot.get_t0()
         if T_BE_t0 is None:
@@ -311,11 +344,17 @@ class FrankaUMIClient(RobotClient):
                 if not timed_actions:
                     continue
 
-                if self.config.update_t0_per_chunk:
+                # per_chunk 模式（或 legacy update_t0_per_chunk 选项）
+                t0_mode = self.config.t0_mode
+                if t0_mode == "per_chunk" or self.config.update_t0_per_chunk:
+                    if self.config.update_t0_per_chunk and t0_mode != "per_chunk":
+                        self.logger.warning(
+                            "update_t0_per_chunk 已废弃，请改用 t0_mode='per_chunk'。"
+                        )
                     self.robot.capture_t0()
                     t0 = self.robot.get_t0()
                     if t0 is not None:
-                        self.logger.debug(f"更新 T_BE_t0: {t0[:3, 3].round(4).tolist()}")
+                        self.logger.debug(f"per_chunk 更新 T_BE_t0: {t0[:3, 3].round(4).tolist()}")
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)

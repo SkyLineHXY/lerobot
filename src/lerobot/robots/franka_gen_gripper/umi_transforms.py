@@ -167,6 +167,25 @@ def ee_relative_action_to_base(
     return T_BE_t0 @ delta_k
 
 
+def compute_sample_relative_poses(
+    W_T_F_window: np.ndarray,
+    base_idx: int = -1,
+) -> np.ndarray:
+    """以窗口内 base_idx 帧为参考，将绝对位姿序列归一化为 sample-relative SE(3)。
+
+    实现 UMI 论文的 ``pose_mat[-1]`` 参考帧约定（每次推理窗口最后一帧为 t₀）。
+
+    Args:
+        W_T_F_window: (T, 4, 4) SE(3) 绝对位姿序列（VIO 坐标系下的法兰位姿）。
+        base_idx:     参考帧索引，默认 -1（最后一帧），即 UMI 论文约定。
+
+    Returns:
+        (T, 4, 4) sample-relative 位姿序列；``result[base_idx]`` 严格等于单位变换。
+    """
+    base_inv = np.linalg.inv(W_T_F_window[base_idx])
+    return base_inv[None] @ W_T_F_window
+
+
 def compute_ee_at_t0_deltas(
     W_T_C_list: list[np.ndarray],
     T_FC: np.ndarray,
