@@ -401,6 +401,11 @@ class ACT(nn.Module):
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
+        # 修复：shape=(1,) 特征在数据集 squeeze 存储后，DataLoader collate 得到 (B,) 而非 (B, 1)。
+        # 在此统一 reshape 为 (B, state_dim)，避免 Linear 层 matmul 失败。
+        if self.config.robot_state_feature and OBS_STATE in batch and batch[OBS_STATE].dim() == 1:
+            batch = {**batch, OBS_STATE: batch[OBS_STATE].reshape(batch_size, -1)}
+
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
