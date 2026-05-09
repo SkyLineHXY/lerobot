@@ -166,9 +166,18 @@ def run_dry(args: argparse.Namespace) -> int:
     logger.info(f"[dry-run] ᶠT_C translation = {T_FC[:3, 3].round(4).tolist()}")
 
     T_BE_t0 = np.eye(4)  # identity placeholder (no FK available)
+
+    # world_flange 格式（7D 绝对位姿）：以首帧为 t₀ 预计算 episode-relative delta
+    is_world_flange = (episode.action_dim == 7)
+    if is_world_flange:
+        W_T_F_t0_dry, _ = _row_to_se3_and_gripper(episode.actions[0])
+        W_T_F_t0_inv_dry = np.linalg.inv(W_T_F_t0_dry)
+        logger.info("[dry-run] world_flange 格式：以首帧为 t₀ 计算 episode-relative delta。")
+
     indices = sorted({0, len(episode.actions) // 2, len(episode.actions) - 1})
     for k in indices:
-        delta_k, grip = _row_to_se3_and_gripper(episode.actions[k])
+        abs_se3_k, grip = _row_to_se3_and_gripper(episode.actions[k])
+        delta_k = W_T_F_t0_inv_dry @ abs_se3_k if is_world_flange else abs_se3_k
         T_target = _transform_dry(delta_k, T_BE_t0, T_FC, args.reference)
         pose6d = se3_to_xyz_rotvec(T_target)
         print(
@@ -237,7 +246,20 @@ def run_live(args: argparse.Namespace) -> int:
         robot.start_cartesian_impedance(Kx=Kx, Kxd=Kxd)
         controller_started = True
 
-        per_step_t0 = (args.reference == "ee_at_t_now")
+        # world_flange 格式（7D 绝对位姿）：以首帧为 t₀ 预计算 episode-relative delta
+        is_world_flange = (episode.action_dim == 7)
+        W_T_F_t0_inv = None
+        if is_world_flange:
+            W_T_F_t0_action, _ = _row_to_se3_and_gripper(actions[0])
+            W_T_F_t0_inv = np.linalg.inv(W_T_F_t0_action)
+            if args.reference == "ee_at_t_now":
+                logger.warning(
+                    "world_flange 绝对位姿格式回放时 ee_at_t_now 无效（无 VIO 状态），"
+                    "已自动退化为 ee_at_t0（固定 episode 起点）。"
+                )
+
+        # 仅对非 world_flange 的旧格式支持 ee_at_t_now（每帧刷新机器人 FK）
+        per_step_t0 = (not is_world_flange) and (args.reference == "ee_at_t_now")
         if per_step_t0:
             logger.info("reference=ee_at_t_now：每帧实时刷新 T_BE_t₀。")
 
@@ -247,20 +269,28 @@ def run_live(args: argparse.Namespace) -> int:
         next_t = time.perf_counter()
         late_frames = 0
         for k, row in enumerate(actions):
-            # ee_at_t_now：每帧都从机器人读取当前 FK 作为 t₀
-            if per_step_t0:
-                T_BE_t0 = robot.get_ee_se3()
+            # 每帧解析位姿与夹爪宽度
+            abs_se3_k, grip = _row_to_se3_and_gripper(row)
 
-            delta_k, grip = _row_to_se3_and_gripper(row)
+            if is_world_flange:
+                # 绝对 W_T_F(k) → episode-relative delta = inv(W_T_F(t₀)) @ W_T_F(k)
+                delta_k = W_T_F_t0_inv @ abs_se3_k
+                current_T_BE_t0 = T_BE_t0   # 固定 episode 起点
+                effective_reference = "ee_at_t0"
+            else:
+                delta_k = abs_se3_k
+                if per_step_t0:
+                    current_T_BE_t0 = robot.get_ee_se3()
+                else:
+                    current_T_BE_t0 = T_BE_t0
+                effective_reference = "ee_at_t0" if per_step_t0 else args.reference
+
             grip_cmd = grip if args.use_gripper else None
-
-            # ee_at_t_now 复用 ee_at_t0 的变换函数
-            effective_reference = "ee_at_t0" if per_step_t0 else args.reference
 
             try:
                 robot.send_umi_action(
                     delta_k=delta_k,
-                    T_BE_t0=T_BE_t0,
+                    T_BE_t0=current_T_BE_t0,
                     reference=effective_reference,
                     gripper_width=grip_cmd,
                 )
@@ -322,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fps", type=float, default=20, help="Override dataset FPS.")
 
     # Robot connection
-    p.add_argument("--robot-ip", default="172.20.10.2")
+    p.add_argument("--robot-ip", default="192.168.110.17")
     p.add_argument("--robot-port", type=int, default=4242)
     p.add_argument("--gripper-side", default="left", choices=["left", "right"])
     p.add_argument("--gripper-serial-port", default=None,
