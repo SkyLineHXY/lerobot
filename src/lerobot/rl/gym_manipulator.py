@@ -55,10 +55,10 @@ from lerobot.processor.converters import identity_transition
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
-    so_follower,
+    so100_follower,
 )
 from lerobot.robots.robot import Robot
-from lerobot.robots.so_follower.robot_kinematic_processor import (
+from lerobot.robots.so100_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
     EEReferenceAndDelta,
     ForwardKinematicsJointsToEEObservation,
@@ -77,7 +77,7 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 
-from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+from joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 
 logging.basicConfig(level=logging.INFO)
 
@@ -324,6 +324,7 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
             render_mode="human",
             use_gripper=use_gripper,
             gripper_penalty=gripper_penalty,
+            use_gamepad=True if cfg.processor.control_mode == "gamepad" else False,
         )
 
         return env, None
@@ -433,10 +434,12 @@ def make_processors(
             )
         )
 
-    # Add time limit processor if reset config exists
-    if cfg.processor.reset is not None:
+    # 只有在 control_time_s > 0 时才添加时间限制，设为 0 或负数表示不限制 episode 时长
+    if cfg.processor.reset is not None and cfg.processor.reset.control_time_s > 0:
+        max_steps = int(cfg.processor.reset.control_time_s * cfg.fps)
+        logging.info(f"Episode 时间限制: {cfg.processor.reset.control_time_s}s ({max_steps} 步)")
         env_pipeline_steps.append(
-            TimeLimitProcessorStep(max_episode_steps=int(cfg.processor.reset.control_time_s * cfg.fps))
+            TimeLimitProcessorStep(max_episode_steps=max_steps)
         )
 
     # Add gripper penalty processor if gripper config exists and enabled
