@@ -31,7 +31,7 @@ import pytest
 # ─────────────────────────────────────────────────────────────────
 
 _HAVE_LOCAL = os.environ.get("OPENCV_ZMQ_DEVICE", "") not in ("", "0")
-_LOCAL_DEVICE = int(os.environ.get("OPENCV_ZMQ_DEVICE", "0"))
+_LOCAL_DEVICE = int(os.environ.get("OPENCV_ZMQ_DEVICE", "2"))
 _HAVE_REMOTE = bool(os.environ.get("OPENCV_ZMQ_REMOTE_HOST", ""))
 _REMOTE_HOST = os.environ.get("OPENCV_ZMQ_REMOTE_HOST", "172.20.10.2")
 _REMOTE_PORT = int(os.environ.get("OPENCV_ZMQ_REMOTE_PORT", "4244"))
@@ -366,5 +366,6 @@ def test_config_sub_conflate_default():
 if __name__ == "__main__":
     import sys
 
+    test_remote_smoke()
     # 默认只跑不需要硬件的配置类测试
     sys.exit(pytest.main(["-sv", __file__]))
