@@ -33,6 +33,13 @@ class OpenCVZmqCamera(OpenCVCamera):
         self._subscriber: ZMQFrameSubscriber | None = None
         self._publisher: ZMQFramePublisher | None = None
 
+    @property
+    def is_connected(self) -> bool:
+        """remote 模式检查 subscriber + 后台线程，local 模式委托父类。"""
+        if self._zmq_config.mode == "remote":
+            return self._subscriber is not None and self.thread is not None and self.thread.is_alive()
+        return super().is_connected
+
     # ------------------------------------------------------------------
     # 连接管理
     # ------------------------------------------------------------------
