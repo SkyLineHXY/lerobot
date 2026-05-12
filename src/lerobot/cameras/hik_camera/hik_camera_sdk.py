@@ -12,9 +12,10 @@ from .MvImport.CameraParams_header import (
     MV_CC_DEVICE_INFO,
     MV_CC_DEVICE_INFO_LIST,
     MV_CC_PIXEL_CONVERT_PARAM,
+    MV_FRAME_OUT_INFO_EX,
     MVCC_INTVALUE,
-    MvCamera,
 )
+from .MvImport.MvCameraControl_class import MvCamera
 from .MvImport.MvErrorDefine_const import (
     MV_E_ABNORMAL_IMAGE,
     MV_E_BUFOVER,
@@ -304,8 +305,6 @@ class HikCameraSDK:
         Raises:
             RuntimeError: 相机未连接或帧读取失败。
         """
-        from .MvImport.CameraParams_header import MV_FRAME_OUT_INFO_EX
-
         if not self._is_connected:
             raise RuntimeError("相机未连接，无法采集图像")
 
@@ -344,8 +343,6 @@ class HikCameraSDK:
     def _decode_frame(self, stFrameInfo) -> np.ndarray:
         """将原始帧缓冲区解码为 BGR numpy 数组。"""
         import cv2
-
-        from .MvImport.CameraParams_header import MV_CC_PIXEL_CONVERT_PARAM
 
         w, h = stFrameInfo.nWidth, stFrameInfo.nHeight
 
