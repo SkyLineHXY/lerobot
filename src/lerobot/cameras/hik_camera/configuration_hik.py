@@ -89,8 +89,12 @@ class HikCameraConfig(CameraConfig):
     recv_timeout_ms: int = 1000
     """remote 模式下 SUB socket 的接收超时（毫秒）。"""
 
-    sub_conflate: bool = True
-    """remote 模式下是否开启 ZMQ CONFLATE（仅保留最新一帧，丢弃旧帧）。"""
+    sub_conflate: bool = False
+    """remote 模式下是否开启 ZMQ CONFLATE（仅保留最新一帧，丢弃旧帧）。
+
+    注意：ZMQ CONFLATE 与 multipart 消息冲突，会导致 ``Assertion failed: !_more``，
+    因此默认关闭。通过 RCVHWM=1 已能限制缓冲区仅保留最新消息。
+    """
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
