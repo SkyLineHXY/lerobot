@@ -1,8 +1,9 @@
 """HikCamera：海康工业相机的 lerobot Camera 实现。
 
 支持两种部署模式：
-- ``local``：相机直连本机，直接调用 HikCameraSDK。
-- ``remote``：相机在 NUC，通过 zerorpc 拉流（需先在 NUC 上启动 hik_camera_server.py）。
+- ``local``：相机直连本机，直接调用 HikCameraSDK。若 sensor_* 与输出尺寸不一致，
+  会在 ``_postprocess_image`` 中通过 cv2.resize 缩放（而非裁剪）。
+- ``remote``：相机在 NUC，通过 ZeroMQ PUB/SUB 拉流（需先在 NUC 上启动 hik_camera_server.py）。
 """
 
 import logging
@@ -10,6 +11,7 @@ import time
 from threading import Event, Lock, Thread
 from typing import Any
 
+import cv2
 import numpy as np
 from numpy.typing import NDArray
 
@@ -33,18 +35,22 @@ class HikCamera(Camera):
         from lerobot.cameras.hik_camera import HikCamera, HikCameraConfig
 
         config = HikCameraConfig(
-            mode="remote", host="192.168.1.10", port=4243,
+            mode="remote", host="192.168.1.10", port=4243, topic="hik",
             fps=30, width=1280, height=720,
         )
         with HikCamera(config) as cam:
             for _ in range(100):
                 frame = cam.read()   # (720, 1280, 3) uint8 BGR
 
-    Example（本地模式，在 NUC 上直接调试）::
+    Example（本地模式，在 NUC 上直接调试，AOI→缩放）::
 
-        config = HikCameraConfig(mode="local", device_index=0, fps=30)
+        config = HikCameraConfig(
+            mode="local", device_index=0, fps=30,
+            sensor_width=1920, sensor_height=1200,
+            width=1280, height=720,
+        )
         with HikCamera(config) as cam:
-            frame = cam.read()
+            frame = cam.read()   # (720, 1280, 3)，已被 cv2.resize 从 1920×1200 缩放到 1280×720
     """
 
     def __init__(self, config: HikCameraConfig) -> None:
@@ -54,8 +60,8 @@ class HikCamera(Camera):
         self.warmup_s = config.warmup_s
         self.rotation = get_cv2_rotation(config.rotation)
 
-        # 运行时 backend：local → HikCameraSDK；remote → HikCameraClient
-        self._backend = None
+        # 运行时 backend：local → HikCameraSDK；remote → HikCameraSubscriber
+        self._backend: Any = None
 
         # 后台读取线程相关
         self._thread: Thread | None = None
@@ -83,8 +89,7 @@ class HikCamera(Camera):
     def find_cameras() -> list[dict[str, Any]]:
         """枚举本机可见的海康相机设备。
 
-        注意：远程模式下仍枚举的是本机设备，不会通过网络查询 NUC。
-        若需枚举 NUC 侧设备，请直接调用 HikCameraClient.find_devices()。
+        注意：此方法仅枚举本机直连设备，不查询远程 NUC。
 
         Returns:
             每台设备一个 dict，包含 ``type``、``id``（device_index）、
@@ -116,7 +121,7 @@ class HikCamera(Camera):
 
         Raises:
             DeviceAlreadyConnectedError: 相机已连接。
-            ConnectionError: 相机或 zerorpc 服务端不可达。
+            ConnectionError: 相机或 ZMQ 服务端不可达。
         """
         if self.config.mode == "local":
             from .hik_camera_sdk import HikCameraSDK
@@ -124,24 +129,21 @@ class HikCamera(Camera):
             sdk = HikCameraSDK(self.config.device_index)
             sdk.connect(
                 fps=self.config.fps,
-                width=self.config.width,
-                height=self.config.height,
+                sensor_width=self.config.sensor_width,
+                sensor_height=self.config.sensor_height,
             )
             self._backend = sdk
         else:
-            from .hik_camera_client import HikCameraClient
+            from .hik_camera_client import HikCameraSubscriber
 
-            client = HikCameraClient(
+            subscriber = HikCameraSubscriber(
                 host=self.config.host,  # type: ignore[arg-type]
                 port=self.config.port,
-                heartbeat=self.config.heartbeat_s,
+                topic=self.config.topic,
+                recv_timeout_ms=self.config.recv_timeout_ms,
+                conflate=self.config.sub_conflate,
             )
-            client.open_camera(
-                fps=self.config.fps,
-                width=self.config.width,
-                height=self.config.height,
-            )
-            self._backend = client
+            self._backend = subscriber
 
         self._start_read_thread()
 
@@ -251,7 +253,6 @@ class HikCamera(Camera):
                 if self.config.mode == "local":
                     self._backend.disconnect()
                 else:
-                    self._backend.close_camera()
                     self._backend.close()
             except Exception as e:
                 logger.warning(f"{self} 关闭 backend 异常: {e}")
@@ -271,8 +272,18 @@ class HikCamera(Camera):
             return self._backend.get_frame()
 
     def _postprocess_image(self, image: NDArray[Any]) -> NDArray[Any]:
-        """应用颜色转换与旋转。"""
-        import cv2
+        """应用分辨率缩放、颜色转换与旋转。
+
+        若 image 尺寸与 config.width/config.height 不一致（例如 local 模式下
+        SDK AOI 与输出尺寸不同），先用 cv2.resize 缩放到目标分辨率。
+        remote 模式通常 server 已 resize，此处的 resize 作为保险。
+        """
+        target_w = self.config.width
+        target_h = self.config.height
+        if target_w and target_h:
+            h, w = image.shape[:2]
+            if w != target_w or h != target_h:
+                image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
         if self.color_mode == ColorMode.RGB:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)

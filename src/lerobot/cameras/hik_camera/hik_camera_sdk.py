@@ -71,8 +71,8 @@ class HikCameraSDK:
         self.max_reconnect_attempts: int = 3
         # connect() 时保存，供 reconnect() 复用
         self._target_fps: float | None = None
-        self._target_width: int | None = None
-        self._target_height: int | None = None
+        self._target_sensor_width: int | None = None
+        self._target_sensor_height: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -137,15 +137,19 @@ class HikCameraSDK:
     def connect(
         self,
         fps: float | None = None,
-        width: int | None = None,
-        height: int | None = None,
+        sensor_width: int | None = None,
+        sensor_height: int | None = None,
     ) -> None:
         """连接指定索引的相机并开始取流。
 
+        注意：``sensor_width/sensor_height`` 直接写入海康 SDK 的 Width/Height 寄存器，
+        这改变的是传感器 AOI（读出窗口），而非软件缩放。如需输出不同分辨率，请在上层
+        调用 ``cv2.resize`` 进行软件缩放，避免图像被裁剪。
+
         Args:
             fps: 目标采集帧率，None 表示保持相机默认值。
-            width: 输出图像宽度（像素），None 表示保持相机默认值。
-            height: 输出图像高度（像素），None 表示保持相机默认值。
+            sensor_width: 传感器 AOI 宽度（像素），None 表示保持相机默认值。
+            sensor_height: 传感器 AOI 高度（像素），None 表示保持相机默认值。
 
         Raises:
             ConnectionError: 枚举失败、索引越界或设备打开失败。
@@ -155,8 +159,8 @@ class HikCameraSDK:
 
         # 保存参数供 reconnect() 复用
         self._target_fps = fps
-        self._target_width = width
-        self._target_height = height
+        self._target_sensor_width = sensor_width
+        self._target_sensor_height = sensor_height
 
         tlayer = MV_GIGE_DEVICE | MV_USB_DEVICE
         ret = MvCamera.MV_CC_EnumDevices(tlayer, self.device_list)
@@ -199,15 +203,15 @@ class HikCameraSDK:
         if ret != 0:
             logger.warning(f"设置增益模式失败，错误码: {ret}")
 
-        # 设置分辨率（必须在 StartGrabbing 之前，否则 PayloadSize 计算错误）
-        if width is not None:
-            ret = self.cam.MV_CC_SetIntValue("Width", width)
+        # 设置 AOI（传感器读出窗口，非软件缩放；必须在 StartGrabbing 之前）
+        if sensor_width is not None:
+            ret = self.cam.MV_CC_SetIntValue("Width", sensor_width)
             if ret != 0:
-                logger.warning(f"设置宽度 {width} 失败，错误码: {ret}，将使用相机默认值")
-        if height is not None:
-            ret = self.cam.MV_CC_SetIntValue("Height", height)
+                logger.warning(f"设置传感器宽度 {sensor_width} 失败，错误码: {ret}，将使用相机默认值")
+        if sensor_height is not None:
+            ret = self.cam.MV_CC_SetIntValue("Height", sensor_height)
             if ret != 0:
-                logger.warning(f"设置高度 {height} 失败，错误码: {ret}，将使用相机默认值")
+                logger.warning(f"设置传感器高度 {sensor_height} 失败，错误码: {ret}，将使用相机默认值")
 
         # 设置帧率（必须在 StartGrabbing 之前）
         if fps is not None:
@@ -235,7 +239,7 @@ class HikCameraSDK:
 
         self._is_connected = True
         self.reconnect_attempts = 0
-        logger.info(f"海康相机 #{self.device_index} 连接成功（fps={fps}, {width}x{height}）")
+        logger.info(f"海康相机 #{self.device_index} 连接成功（fps={fps}, sensor={sensor_width}x{sensor_height}）")
 
     def disconnect(self) -> None:
         """停止取流并释放设备句柄。"""
@@ -265,7 +269,7 @@ class HikCameraSDK:
         self.disconnect()
         time.sleep(0.5)
         try:
-            self.connect(fps=self._target_fps, width=self._target_width, height=self._target_height)
+            self.connect(fps=self._target_fps, sensor_width=self._target_sensor_width, sensor_height=self._target_sensor_height)
             logger.info("相机重连成功")
             return True
         except ConnectionError as e:

@@ -9,6 +9,12 @@
     HIK_CAMERA_DEVICE=1        # 启用本地相机测试（local 模式）
     HIK_CAMERA_REMOTE_HOST=192.168.x.x  # 启用远程相机测试（remote 模式）
     HIK_CAMERA_REMOTE_PORT=4243         # 远程端口（默认 4243）
+
+远程测试前，需先在 NUC 启动 ZMQ PUB 服务端::
+
+    python -m lerobot.cameras.hik_camera.hik_camera_server \\
+        --bind 0.0.0.0 --port 4243 --topic hik \\
+        --fps 30 --wire-encoding jpeg --jpeg-quality 90
 """
 
 import os
@@ -119,7 +125,7 @@ def test_local_connect_read_disconnect():
 
     from lerobot.cameras.hik_camera import HikCamera, HikCameraConfig
 
-    cfg = HikCameraConfig(mode="local", device_index=0, fps=30)
+    cfg = HikCameraConfig(mode="local", device_index=0, fps=30,width=640,height=480,)
     cam = HikCamera(cfg)
     cam.connect(warmup=True)
     assert cam.is_connected
@@ -185,8 +191,8 @@ def test_remote_smoke():
         fps=30,
         wire_encoding="jpeg",
         jpeg_quality=90,
-        width=640,
-        height=480,
+        width=1920,
+        height=1080,
     )
     with HikCamera(cfg) as cam:
         assert cam.is_connected
