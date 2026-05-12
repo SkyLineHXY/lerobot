@@ -112,7 +112,11 @@ def test_find_devices_returns_list():
 
 @pytest.mark.skipif(not _HAVE_LOCAL, reason="未设置 HIK_CAMERA_DEVICE 环境变量")
 def test_local_connect_read_disconnect():
-    """local 模式：连接 → 读取 100 帧 → 断开。"""
+    """local 模式：连接 → 实时预览（按 q 退出）→ 断开。"""
+    import time
+
+    import cv2
+
     from lerobot.cameras.hik_camera import HikCamera, HikCameraConfig
 
     cfg = HikCameraConfig(mode="local", device_index=0, fps=30)
@@ -120,12 +124,42 @@ def test_local_connect_read_disconnect():
     cam.connect(warmup=True)
     assert cam.is_connected
 
-    for _ in range(10):
+    win = "HIK Local - press Q to quit"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    frame_count = 0
+    fps_display = 0.0
+    t_fps = time.perf_counter()
+
+    while True:
         frame = cam.read()
         assert frame.ndim == 3
         assert frame.shape[2] == 3
         assert frame.dtype.name == "uint8"
 
+        frame_count += 1
+        elapsed = time.perf_counter() - t_fps
+        if elapsed >= 1.0:
+            fps_display = frame_count / elapsed
+            frame_count = 0
+            t_fps = time.perf_counter()
+
+        h, w = frame.shape[:2]
+        cv2.putText(
+            frame,
+            f"FPS: {fps_display:.1f}  {w}x{h}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.imshow(win, frame)
+        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
+            break
+
+    cv2.destroyWindow(win)
     cam.disconnect()
     assert not cam.is_connected
 
@@ -137,7 +171,11 @@ def test_local_connect_read_disconnect():
 
 @pytest.mark.skipif(not _HAVE_REMOTE, reason="未设置 HIK_CAMERA_REMOTE_HOST 环境变量")
 def test_remote_smoke():
-    """remote 模式：连接服务端 → 读取帧 → 断开。"""
+    """remote 模式：连接服务端 → 实时预览（按 q 退出）→ 断开。"""
+    import time
+
+    import cv2
+
     from lerobot.cameras.hik_camera import HikCamera, HikCameraConfig
 
     cfg = HikCameraConfig(
@@ -147,10 +185,49 @@ def test_remote_smoke():
         fps=30,
         wire_encoding="jpeg",
         jpeg_quality=90,
+        width=640,
+        height=480,
     )
     with HikCamera(cfg) as cam:
         assert cam.is_connected
-        frame = cam.read()
-        assert frame.ndim == 3
-        assert frame.shape[2] == 3
-        assert frame.dtype.name == "uint8"
+
+        win = f"HIK Remote {_REMOTE_HOST}:{_REMOTE_PORT} - press Q to quit"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+        frame_count = 0
+        fps_display = 0.0
+        t_fps = time.perf_counter()
+
+        while True:
+            frame = cam.read()
+            assert frame.ndim == 3
+            assert frame.shape[2] == 3
+            assert frame.dtype.name == "uint8"
+
+            frame_count += 1
+            elapsed = time.perf_counter() - t_fps
+            if elapsed >= 1.0:
+                fps_display = frame_count / elapsed
+                frame_count = 0
+                t_fps = time.perf_counter()
+
+            h, w = frame.shape[:2]
+            cv2.putText(
+                frame,
+                f"FPS: {fps_display:.1f}  {w}x{h}  {_REMOTE_HOST}:{_REMOTE_PORT}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(win, frame)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
+                break
+
+        cv2.destroyWindow(win)
+
+
+if __name__ == "__main__":
+    test_local_connect_read_disconnect()
