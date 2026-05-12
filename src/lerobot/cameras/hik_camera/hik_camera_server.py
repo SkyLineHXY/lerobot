@@ -30,20 +30,47 @@ class HikCameraServer:
         jpeg_quality: JPEG 压缩质量（1–100），仅 ``jpeg`` 时生效。
     """
 
-    def __init__(self, device_index: int = 0, wire_encoding: str = "jpeg", jpeg_quality: int = 90) -> None:
+    def __init__(
+        self,
+        device_index: int = 0,
+        wire_encoding: str = "jpeg",
+        jpeg_quality: int = 90,
+        fps: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         from .hik_camera_sdk import HikCameraSDK
 
         self._sdk = HikCameraSDK(device_index)
         self._wire_encoding = wire_encoding
         self._jpeg_quality = jpeg_quality
+        # 服务端默认参数，客户端调用 connect_camera 时可覆盖
+        self._default_fps = fps
+        self._default_width = width
+        self._default_height = height
 
     # ------------------------------------------------------------------
     # 相机控制（命名避免与 zerorpc 内置方法冲突）
     # ------------------------------------------------------------------
 
-    def connect_camera(self) -> None:
-        """打开相机并开始取流。"""
-        self._sdk.connect()
+    def connect_camera(
+        self,
+        fps: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        """打开相机并开始取流。
+
+        Args:
+            fps: 目标帧率，None 时使用服务端启动时指定的默认值。
+            width: 输出宽度，None 时使用服务端默认值。
+            height: 输出高度，None 时使用服务端默认值。
+        """
+        self._sdk.connect(
+            fps=fps if fps is not None else self._default_fps,
+            width=width if width is not None else self._default_width,
+            height=height if height is not None else self._default_height,
+        )
 
     def disconnect_camera(self) -> None:
         """停止取流并释放相机句柄。"""
@@ -116,6 +143,9 @@ def _parse_args() -> argparse.Namespace:
         help="帧传输编码（默认 jpeg）",
     )
     p.add_argument("--jpeg-quality", type=int, default=90, dest="jpeg_quality", help="JPEG 质量 1–100")
+    p.add_argument("--fps", type=float, default=None, help="相机采集帧率（默认使用相机硬件默认值）")
+    p.add_argument("--width", type=int, default=None, help="输出图像宽度（像素，默认使用相机默认值）")
+    p.add_argument("--height", type=int, default=None, help="输出图像高度（像素，默认使用相机默认值）")
     return p.parse_args()
 
 
@@ -128,6 +158,9 @@ if __name__ == "__main__":
         device_index=args.device_index,
         wire_encoding=args.wire_encoding,
         jpeg_quality=args.jpeg_quality,
+        fps=args.fps,
+        width=args.width,
+        height=args.height,
     )
 
     # 启动时自动连接相机

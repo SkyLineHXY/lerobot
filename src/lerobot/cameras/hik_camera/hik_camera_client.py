@@ -35,9 +35,20 @@ class HikCameraClient:
     # 相机控制（代理到服务端方法，改名避免与 zerorpc.Client 内置方法冲突）
     # ------------------------------------------------------------------
 
-    def open_camera(self) -> None:
-        """在 NUC 侧打开相机（对应服务端 connect_camera）。"""
-        self._server.connect_camera()
+    def open_camera(
+        self,
+        fps: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        """在 NUC 侧打开相机（对应服务端 connect_camera）。
+
+        Args:
+            fps: 目标帧率，None 表示使用服务端默认值。
+            width: 输出宽度，None 表示使用服务端默认值。
+            height: 输出高度，None 表示使用服务端默认值。
+        """
+        self._server.connect_camera(fps, width, height)
 
     def close_camera(self) -> None:
         """在 NUC 侧关闭相机（对应服务端 disconnect_camera）。"""

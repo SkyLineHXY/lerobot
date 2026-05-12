@@ -122,7 +122,11 @@ class HikCamera(Camera):
             from .hik_camera_sdk import HikCameraSDK
 
             sdk = HikCameraSDK(self.config.device_index)
-            sdk.connect()
+            sdk.connect(
+                fps=self.config.fps,
+                width=self.config.width,
+                height=self.config.height,
+            )
             self._backend = sdk
         else:
             from .hik_camera_client import HikCameraClient
@@ -132,7 +136,11 @@ class HikCamera(Camera):
                 port=self.config.port,
                 heartbeat=self.config.heartbeat_s,
             )
-            client.open_camera()
+            client.open_camera(
+                fps=self.config.fps,
+                width=self.config.width,
+                height=self.config.height,
+            )
             self._backend = client
 
         self._start_read_thread()

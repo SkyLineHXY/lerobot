@@ -69,6 +69,10 @@ class HikCameraSDK:
         self.nDataSize: int = 0
         self.reconnect_attempts: int = 0
         self.max_reconnect_attempts: int = 3
+        # connect() 时保存，供 reconnect() 复用
+        self._target_fps: float | None = None
+        self._target_width: int | None = None
+        self._target_height: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -130,14 +134,29 @@ class HikCameraSDK:
     # 连接管理
     # ------------------------------------------------------------------
 
-    def connect(self) -> None:
+    def connect(
+        self,
+        fps: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         """连接指定索引的相机并开始取流。
+
+        Args:
+            fps: 目标采集帧率，None 表示保持相机默认值。
+            width: 输出图像宽度（像素），None 表示保持相机默认值。
+            height: 输出图像高度（像素），None 表示保持相机默认值。
 
         Raises:
             ConnectionError: 枚举失败、索引越界或设备打开失败。
         """
         if self._is_connected:
             self.disconnect()
+
+        # 保存参数供 reconnect() 复用
+        self._target_fps = fps
+        self._target_width = width
+        self._target_height = height
 
         tlayer = MV_GIGE_DEVICE | MV_USB_DEVICE
         ret = MvCamera.MV_CC_EnumDevices(tlayer, self.device_list)
@@ -180,7 +199,27 @@ class HikCameraSDK:
         if ret != 0:
             logger.warning(f"设置增益模式失败，错误码: {ret}")
 
-        # 获取数据包大小并分配缓冲区
+        # 设置分辨率（必须在 StartGrabbing 之前，否则 PayloadSize 计算错误）
+        if width is not None:
+            ret = self.cam.MV_CC_SetIntValue("Width", width)
+            if ret != 0:
+                logger.warning(f"设置宽度 {width} 失败，错误码: {ret}，将使用相机默认值")
+        if height is not None:
+            ret = self.cam.MV_CC_SetIntValue("Height", height)
+            if ret != 0:
+                logger.warning(f"设置高度 {height} 失败，错误码: {ret}，将使用相机默认值")
+
+        # 设置帧率（必须在 StartGrabbing 之前）
+        if fps is not None:
+            ret = self.cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
+            if ret != 0:
+                logger.warning(f"启用帧率控制失败，错误码: {ret}")
+            else:
+                ret = self.cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(fps))
+                if ret != 0:
+                    logger.warning(f"设置帧率 {fps} fps 失败，错误码: {ret}，将使用相机默认帧率")
+
+        # 获取数据包大小并分配缓冲区（依赖已设置的分辨率）
         stParam = MVCC_INTVALUE()
         memset(byref(stParam), 0, sizeof(MVCC_INTVALUE))
         ret = self.cam.MV_CC_GetIntValue("PayloadSize", stParam)
@@ -196,7 +235,7 @@ class HikCameraSDK:
 
         self._is_connected = True
         self.reconnect_attempts = 0
-        logger.info(f"海康相机 #{self.device_index} 连接成功")
+        logger.info(f"海康相机 #{self.device_index} 连接成功（fps={fps}, {width}x{height}）")
 
     def disconnect(self) -> None:
         """停止取流并释放设备句柄。"""
@@ -226,7 +265,7 @@ class HikCameraSDK:
         self.disconnect()
         time.sleep(0.5)
         try:
-            self.connect()
+            self.connect(fps=self._target_fps, width=self._target_width, height=self._target_height)
             logger.info("相机重连成功")
             return True
         except ConnectionError as e:
