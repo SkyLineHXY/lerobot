@@ -29,7 +29,7 @@ import msgpack
 import numpy as np
 import zmq
 
-from .hik_camera_sdk import HikCameraSDK
+from hik_camera_sdk import HikCameraSDK
 
 logger = logging.getLogger(__name__)
 
@@ -160,11 +160,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=4243, help="PUB 端口（默认 4243）")
     p.add_argument("--topic", default="hik", help="PUB topic 字符串（默认 hik）")
     p.add_argument("--device-index", type=int, default=0, dest="device_index", help="相机枚举索引")
-    p.add_argument("--fps", type=float, default=None, help="相机采集帧率（默认使用相机硬件默认值）")
+    p.add_argument("--fps", type=float, default=30, help="相机采集帧率（默认使用相机硬件默认值）")
     p.add_argument("--sensor-width", type=int, default=None, dest="sensor_width", help="SDK AOI 宽度（像素）")
     p.add_argument("--sensor-height", type=int, default=None, dest="sensor_height", help="SDK AOI 高度（像素）")
-    p.add_argument("--output-width", type=int, default=None, dest="output_width", help="resize 后的输出宽度")
-    p.add_argument("--output-height", type=int, default=None, dest="output_height", help="resize 后的输出高度")
+    p.add_argument("--output-width", type=int, default=640, dest="output_width", help="resize 后的输出宽度")
+    p.add_argument("--output-height", type=int, default=480, dest="output_height", help="resize 后的输出高度")
     p.add_argument(
         "--wire-encoding",
         default="jpeg",
