@@ -47,6 +47,11 @@ HIK_SERVER_DIR="${HIK_SERVER_DIR:-$(cd "$(dirname "$0")/../src/lerobot/cameras/h
 # franka_interface_server（需 --with-franka）
 FRANKA_CONDA_ENV="${FRANKA_CONDA_ENV:-polymetis-local}"
 FRANKA_SERVER_PY="${FRANKA_SERVER_PY:-$(cd "$(dirname "$0")/.." && pwd)/src/lerobot/robots/franka/franka_interface_server.py}"
+FRANKA_BIND="${FRANKA_BIND:-0.0.0.0}"       # zerorpc 绑定地址
+FRANKA_PORT="${FRANKA_PORT:-4242}"           # zerorpc 端口
+FRANKA_ROBOT_IP="${FRANKA_ROBOT_IP:-localhost}"    # Polymetis robot server IP
+FRANKA_ROBOT_PORT="${FRANKA_ROBOT_PORT:-50051}"    # Polymetis robot server 端口
+FRANKA_GO_HOME="${FRANKA_GO_HOME:-0}"        # 1 = 启动后执行 go_home
 
 # ─────────────────────────────────────────────────────────────
 # 命令行 flag 解析
@@ -198,8 +203,6 @@ fi
 # ─────────────────────────────────────────────────────────────
 if [[ "$ENABLE_FRANKA" -eq 1 ]]; then
     log "━━━ Franka Interface Server ━━━"
-    log "⚠️  警告：启动 franka_interface_server 会自动执行 robot_go_home() 和 gripper_grasp(10, 0.1)"
-    log "    请确认机械臂周围安全，无障碍物！"
     echo -n "    输入 yes 继续，或按 Ctrl+C 取消："
     read -r _confirm
     if [[ "$_confirm" != "yes" ]]; then
@@ -221,8 +224,30 @@ if [[ "$ENABLE_FRANKA" -eq 1 ]]; then
             exit 1
         fi
 
+        # 检查 Polymetis gRPC 服务是否已就绪（launch_robot.py 需提前在 polymetis-local 环境中启动）
+        log "检查 Polymetis gRPC 服务（${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT}）…"
+        if ! bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
+            python -c \"from polymetis.utils.grpc_utils import check_server_exists; \
+            exit(0 if check_server_exists('${FRANKA_ROBOT_IP}', ${FRANKA_ROBOT_PORT}) else 1)\"" 2>/dev/null; then
+            err "Polymetis gRPC 服务未就绪（${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT}）！"
+            err "请先在 polymetis-local 环境中执行："
+            err "  launch_robot.py robot_client=franka_hardware"
+            err "  launch_gripper.py gripper=franka_hand"
+            exit 1
+        fi
+        log "Polymetis 服务已就绪 ✓"
+
+        _go_home_flag=""
+        [[ "$FRANKA_GO_HOME" -eq 1 ]] && _go_home_flag="--go-home"
+
         start_bg "franka_server" \
-            bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && python '$FRANKA_SERVER_PY'"
+            bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
+                python '$FRANKA_SERVER_PY' \
+                    --bind '$FRANKA_BIND' \
+                    --port '$FRANKA_PORT' \
+                    --robot-ip '$FRANKA_ROBOT_IP' \
+                    --robot-port '$FRANKA_ROBOT_PORT' \
+                    ${_go_home_flag}"
     fi
 fi
 

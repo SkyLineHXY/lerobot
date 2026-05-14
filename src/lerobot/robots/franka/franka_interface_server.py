@@ -1,41 +1,83 @@
-'''
-run on the NUC connected to the franka robot
-to provide zerorpc server interface
-'''
-import zerorpc
-import time
-from polymetis import RobotInterface
-from polymetis import GripperInterface
-import scipy.spatial.transform as st
-import numpy as np
-import torch
+"""在连接 Franka 机器人的 NUC 上运行，提供 zerorpc 服务接口。
+
+前置条件：需先在 polymetis-local 环境中启动 Polymetis gRPC 服务::
+
+    launch_robot.py robot_client=franka_hardware
+    launch_gripper.py gripper=franka_hand
+
+启动方式::
+
+    python franka_interface_server.py --bind 0.0.0.0 --port 4242
+"""
+import argparse
 import logging
+import time
+
+import numpy as np
+import scipy.spatial.transform as st
+import torch
+import zerorpc
+from polymetis import GripperInterface, RobotInterface
 
 log = logging.getLogger(__name__)
 
-class  FrankaInterfaceServer:
-    def __init__(self):
-        try:
-            self.robot = RobotInterface(enforce_version=True)
-            self.gripper = GripperInterface(enforce_version=True)
-            log.info("FrankaInterfaceServer initialized")
-        except Exception as e:
-            log.error("FrankaInterfaceServer failed to initialize: %s", e)
-            raise
+_POLYMETIS_RETRY_TIMES = 30
+_POLYMETIS_RETRY_INTERVAL = 2.0
 
-    def robot_get_joint_positions(self)-> list:
+
+class FrankaInterfaceServer:
+    def __init__(self, robot_ip: str = "localhost", robot_port: int = 50051):
+        # 等待 Polymetis gRPC 服务就绪（launch_robot.py 需提前启动）
+        last_exc: Exception | None = None
+        for attempt in range(_POLYMETIS_RETRY_TIMES):
+            try:
+                self.robot = RobotInterface(
+                    ip_address=robot_ip,
+                    port=robot_port,
+                    enforce_version=True,
+                )
+                self.gripper = GripperInterface(
+                    ip_address=robot_ip,
+                )
+                log.info("FrankaInterfaceServer 初始化成功")
+                return
+            except Exception as e:
+                last_exc = e
+                remaining = _POLYMETIS_RETRY_TIMES - attempt - 1
+                log.warning(
+                    "连接 Polymetis（%s:%d）失败（第 %d/%d 次），%.1fs 后重试: %s",
+                    robot_ip,
+                    robot_port,
+                    attempt + 1,
+                    _POLYMETIS_RETRY_TIMES,
+                    _POLYMETIS_RETRY_INTERVAL,
+                    e,
+                )
+                if remaining > 0:
+                    time.sleep(_POLYMETIS_RETRY_INTERVAL)
+
+        log.error(
+            "无法连接 Polymetis gRPC 服务（%s:%d）。\n"
+            "请先在 polymetis-local 环境中执行：\n"
+            "  launch_robot.py robot_client=franka_hardware\n"
+            "  launch_gripper.py gripper=franka_hand",
+            robot_ip,
+            robot_port,
+        )
+        raise RuntimeError(f"Polymetis 服务不可达（{robot_ip}:{robot_port}）") from last_exc
+
+    def robot_get_joint_positions(self) -> list:
         return self.robot.get_joint_positions().numpy().tolist()
 
-    def robot_get_joint_velocities(self)-> list:
+    def robot_get_joint_velocities(self) -> list:
         return self.robot.get_joint_velocities().numpy().tolist()
 
-    def robot_get_ee_pose(self)-> list:
+    def robot_get_ee_pose(self) -> list:
         data = self.robot.get_ee_pose()
         pos = data[0].numpy()
         quat_xyzw = data[1].numpy()
         rot_vec = st.Rotation.from_quat(quat_xyzw).as_rotvec()
         return np.concatenate([pos, rot_vec]).tolist()
-
 
     def robot_move_to_joint_positions(
         self,
@@ -58,8 +100,6 @@ class  FrankaInterfaceServer:
 
     def robot_move_to_ee_pose(
         self,
-        # position: list = None,
-        # orientation: list = None,
         pose: list = None,
         time_to_go: float = None,
         delta: bool = False,
@@ -69,17 +109,16 @@ class  FrankaInterfaceServer:
     ):
         pose = torch.Tensor(pose)
         self.robot.move_to_ee_pose(
-            position = torch.Tensor(pose[:3]),
-            orientation = torch.Tensor(st.Rotation.from_rotvec(pose[3:]).as_quat()),
-            time_to_go = time_to_go,
-            delta = delta,
-            Kx = torch.Tensor(Kx) if Kx is not None else None,
-            Kxd = torch.Tensor(Kxd) if Kxd is not None else None,
-            op_space_interp = op_space_interp,
+            position=torch.Tensor(pose[:3]),
+            orientation=torch.Tensor(st.Rotation.from_rotvec(pose[3:]).as_quat()),
+            time_to_go=time_to_go,
+            delta=delta,
+            Kx=torch.Tensor(Kx) if Kx is not None else None,
+            Kxd=torch.Tensor(Kxd) if Kxd is not None else None,
+            op_space_interp=op_space_interp,
         )
 
-    def robot_start_joint_impedance_control(self, Kq: list = None, Kqd: list = None, adaptive=True,):
-
+    def robot_start_joint_impedance_control(self, Kq: list = None, Kqd: list = None, adaptive=True):
         self.robot.start_joint_impedance(
             Kq=torch.Tensor(Kq) if Kq is not None else None,
             Kqd=torch.Tensor(Kqd) if Kqd is not None else None,
@@ -93,9 +132,7 @@ class  FrankaInterfaceServer:
         )
 
     def robot_update_desired_joint_positions(self, positions: np.ndarray):
-        self.robot.update_desired_joint_positions(
-            positions=torch.Tensor(positions)
-        )
+        self.robot.update_desired_joint_positions(positions=torch.Tensor(positions))
 
     def robot_update_desired_ee_pose(self, pose: list):
         pose = torch.Tensor(pose)
@@ -119,7 +156,6 @@ class  FrankaInterfaceServer:
         }
 
     def gripper_goto(self, width: float, speed: float, force: float, blocking: bool = True):
-        """控制夹爪移动到指定宽度"""
         self.gripper.goto(width=width, speed=speed, force=force, blocking=blocking)
 
     def gripper_grasp(
@@ -131,7 +167,6 @@ class  FrankaInterfaceServer:
         epsilon_outer: float = -1.0,
         blocking: bool = True,
     ):
-        """控制夹爪执行抓取动作"""
         self.gripper.grasp(
             speed=speed,
             force=force,
@@ -142,11 +177,29 @@ class  FrankaInterfaceServer:
         )
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Franka zerorpc 服务端（运行于 NUC）")
+    p.add_argument("--bind", default="0.0.0.0", help="zerorpc 绑定地址（默认 0.0.0.0）")
+    p.add_argument("--port", type=int, default=4242, help="zerorpc 端口（默认 4242）")
+    p.add_argument("--robot-ip", default="localhost", dest="robot_ip", help="Polymetis robot server IP（默认 localhost）")
+    p.add_argument("--robot-port", type=int, default=50051, dest="robot_port", help="Polymetis robot server 端口（默认 50051）")
+    p.add_argument("--go-home", action="store_true", dest="go_home", help="启动后执行 go_home")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    server = FrankaInterfaceServer()
-    server.robot_go_home()
-    print(server.robot_get_joint_positions())
-    print(server.robot_get_ee_pose())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    args = _parse_args()
+
+    server = FrankaInterfaceServer(robot_ip=args.robot_ip, robot_port=args.robot_port)
+
+    if args.go_home:
+        log.info("执行 go_home…")
+        server.robot_go_home()
+
     s = zerorpc.Server(server)
-    s.bind("tcp://192.168.172.134:4242")
+    bind_addr = f"tcp://{args.bind}:{args.port}"
+    s.bind(bind_addr)
+    log.info("zerorpc 服务已绑定 %s，等待客户端连接…", bind_addr)
     s.run()
