@@ -41,10 +41,9 @@ from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import (
     aggregate_pipeline_dataset_features,
-    combine_feature_dicts,
     create_initial_features,
 )
-from lerobot.datasets.utils import build_dataset_frame
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.robots.franka_multicam.config_franka_multicam import FrankaMultiCamConfig  # noqa: F401
 from lerobot.cameras.hik_camera.configuration_hik import HikCameraConfig  # noqa: F401 — 触发 draccus 注册
