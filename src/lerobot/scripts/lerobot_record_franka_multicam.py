@@ -8,18 +8,22 @@ observation 和 action 写入 LeRobot v3 数据集。
 
     python -m lerobot.scripts.lerobot_record_franka_multicam \\
         --robot.type=franka_multicam \\
-        --robot.robot_ip=192.168.172.252 \\
+        --robot.robot_ip=172.20.10.2 \\
+        --robot.robot_port=4242 \\
         --robot.cameras='{
-            "front":{"type":"hik","mode":"remote","host":"192.168.172.134","port":4243,
-                     "fps":30,"width":1280,"height":720},
-            "wrist":{"type":"opencv_zmq","mode":"remote","host":"192.168.172.134","port":4244,
-                     "fps":30,"width":640,"height":480,"index_or_path":0}
+            "cam_top":{"type":"opencv_zmq","mode":"remote","host":"172.20.10.2","port":4244,
+                       "topic":"cam_top","fps":30,"width":640,"height":480,"index_or_path":0},
+            "cam_left":{"type":"opencv_zmq","mode":"remote","host":"172.20.10.2","port":4245,
+                        "topic":"cam_left","fps":30,"width":640,"height":480,"index_or_path":0},
+            "cam_right":{"type":"opencv_zmq","mode":"remote","host":"172.20.10.2","port":4246,
+                         "topic":"cam_right","fps":30,"width":640,"height":480,"index_or_path":0}
         }' \\
         --dataset.repo_id=zzq/franka_multicam_demo \\
-        --dataset.single_task="demo task" \\
+        --dataset.root=/home/zzq/lerobot/datasets/franka_multicam_demo \\
+        --dataset.single_task="franka multicam demo" \\
         --dataset.fps=30 \\
-        --dataset.num_episodes=3 \\
-        --dataset.episode_time_s=20 \\
+        --dataset.num_episodes=2 \\
+        --dataset.episode_time_s=10 \\
         --dataset.push_to_hub=false
 
 键盘控制：
@@ -42,8 +46,6 @@ from lerobot.datasets.pipeline_features import (
 )
 from lerobot.datasets.utils import build_dataset_frame
 from lerobot.datasets.video_utils import VideoEncodingManager
-from lerobot.robots import (  # noqa: F401 — 触发 draccus robot 注册
-)
 from lerobot.robots.franka_multicam.config_franka_multicam import FrankaMultiCamConfig  # noqa: F401
 from lerobot.cameras.hik_camera.configuration_hik import HikCameraConfig  # noqa: F401 — 触发 draccus 注册
 from lerobot.cameras.opencv_zmq.configuration_opencv_zmq import OpenCVZmqCameraConfig  # noqa: F401
@@ -54,9 +56,14 @@ from lerobot.scripts.lerobot_record import (  # 复用录制脚本的配置与�
     make_default_processors,
 )
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.utils.control_utils import init_keyboard_listener, log_say
+from lerobot.utils.control_utils import (
+    init_keyboard_listener,
+    is_headless,
+    sanity_check_dataset_name,
+)
 from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.utils import init_logging, is_headless, sanity_check_dataset_name
+from lerobot.utils.utils import init_logging, log_say
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +98,8 @@ class RecordFrankaMultiCamConfig:
 def record(cfg: RecordFrankaMultiCamConfig) -> LeRobotDataset:
     init_logging()
     logger.info(pformat(asdict(cfg)))
+    if cfg.display_data:
+        init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
 
     # 1. 实例化 robot
     robot = make_robot_from_config(cfg.robot)
@@ -128,6 +137,12 @@ def record(cfg: RecordFrankaMultiCamConfig) -> LeRobotDataset:
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
                 encoder_threads=cfg.dataset.encoder_threads,
             )
+            _num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
+            if _num_cameras > 0 and not cfg.dataset.streaming_encoding:
+                dataset.start_image_writer(
+                    num_processes=cfg.dataset.num_image_writer_processes,
+                    num_threads=cfg.dataset.num_image_writer_threads_per_camera * _num_cameras,
+                )
         else:
             sanity_check_dataset_name(cfg.dataset.repo_id, None)
             num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
@@ -195,6 +210,10 @@ def record(cfg: RecordFrankaMultiCamConfig) -> LeRobotDataset:
                         **action_frame,
                         "task": single_task,
                     })
+                    if cfg.display_data:
+                        log_rerun_data(
+                            observation=obs_processed, action=action_dict, compress_images=False
+                        )
 
                     # 维持帧率
                     dt_s = time.perf_counter() - start_loop_t
