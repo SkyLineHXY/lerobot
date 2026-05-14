@@ -15,6 +15,7 @@ import importlib
 import inspect
 import pkgutil
 import sys
+import typing
 from argparse import ArgumentError
 from collections.abc import Callable, Iterable, Sequence
 from functools import wraps
@@ -24,8 +25,26 @@ from types import ModuleType
 from typing import Any, TypeVar, cast
 
 import draccus
+import draccus.parsers.decoding as _draccus_dec
+from draccus.utils import DecodingError as _DecodingError
 
 from lerobot.utils.utils import has_method
+
+
+def _decode_literal(cls: type, raw_value: Any, path: tuple) -> Any:
+    """为 draccus 0.8.0 补充 typing.Literal 解码支持。
+
+    draccus 原生没有 Literal 解码函数，从 YAML/JSON config 文件加载时会报错。
+    注册本函数后，所有 Literal[...] 字段均可从文件和 CLI 正常解析。
+    """
+    allowed = typing.get_args(cls)
+    if raw_value not in allowed:
+        raise _DecodingError(path, f"值 {raw_value!r} 不在 Literal{list(allowed)} 中")
+    return raw_value
+
+
+_draccus_dec.decode.register(typing.Literal, _decode_literal, include_subclasses=True)
+_draccus_dec.get_decoding_fn.cache_clear()
 
 F = TypeVar("F", bound=Callable[..., object])
 

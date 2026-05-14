@@ -1,0 +1,56 @@
+# 用法：
+#   python -m lerobot.scripts.lerobot_record_franka_multicam \
+#       --config_path configs/record_franka_multicam.yaml
+#
+# 单项覆盖（CLI 优先级高于 config 文件）：
+#   python -m lerobot.scripts.lerobot_record_franka_multicam \
+#       --config_path configs/record_franka_multicam.yaml \
+#       --dataset.num_episodes=5
+
+robot:
+  robot_ip: 172.20.10.2
+  robot_port: 4242
+  cameras:
+    cam_top:
+      type: opencv_zmq
+      mode: remote
+      host: 172.20.10.2
+      port: 4244
+      topic: cam_top
+      fps: 30
+      width: 640
+      height: 480
+      index_or_path: 0
+    cam_left:
+      type: opencv_zmq
+      mode: remote
+      host: 172.20.10.2
+      port: 4245
+      topic: cam_left
+      fps: 30
+      width: 640
+      height: 480
+      index_or_path: 0
+    cam_right:
+      type: opencv_zmq
+      mode: remote
+      host: 172.20.10.2
+      port: 4246
+      topic: cam_right
+      fps: 30
+      width: 640
+      height: 480
+      index_or_path: 0
+
+dataset:
+  repo_id: zzq/franka_multicam_demo
+  root: /home/zzq/lerobot/datasets/franka_multicam_demo
+  single_task: "franka multicam demo"
+  fps: 30
+  num_episodes: 2
+  episode_time_s: 10
+  push_to_hub: false
+
+display_data: false
+play_sounds: true
+resume: false
