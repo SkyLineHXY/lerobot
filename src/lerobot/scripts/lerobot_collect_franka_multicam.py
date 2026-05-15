@@ -1,0 +1,418 @@
+"""Interactive FrankaMultiCam dataset collection.
+
+This script uses the same FrankaMultiCam robot interface and LeRobot v3 dataset
+schema as ``lerobot_record_franka_multicam.py``, but exposes a manual collection
+workflow:
+    c      start / resume collection
+    space  pause collection
+    s      save the current episode buffer
+    r      clear the current episode buffer
+    q      finalize and exit
+Usage:
+
+    python -m lerobot.scripts.lerobot_collect_franka_multicam \
+        --config_path configs/collect_franka_multicam.yaml
+"""
+
+import logging
+import queue
+import shutil
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from pprint import pformat
+from typing import Any
+
+from lerobot.configs import parser
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.pipeline_features import (
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+)
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
+from lerobot.datasets.video_utils import VideoEncodingManager
+from lerobot.robots.franka_multicam.config_franka_multicam import FrankaMultiCamConfig  # noqa: F401
+from lerobot.cameras.hik_camera.configuration_hik import HikCameraConfig  # noqa: F401
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.opencv_zmq.configuration_opencv_zmq import OpenCVZmqCameraConfig  # noqa: F401
+from lerobot.robots.utils import make_robot_from_config
+from lerobot.scripts.lerobot_record import DatasetRecordConfig, make_default_processors
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
+from lerobot.utils.control_utils import sanity_check_dataset_name
+from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.utils import init_logging, log_say
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class InteractiveCollectionConfig:
+    """Interactive collection behavior."""
+
+    max_frames_per_episode: int | None = None
+    """Pause collection automatically once this many frames are buffered."""
+
+    min_frames_before_save: int = 1
+    """Minimum buffered frames required before accepting ``s`` save."""
+
+    print_every_n_frames: int = 30
+    """Log progress every N collected frames. Set to 0 to disable."""
+
+
+@dataclass
+class CollectFrankaMultiCamConfig:
+    """FrankaMultiCam interactive data collection config."""
+
+    robot: FrankaMultiCamConfig
+    dataset: DatasetRecordConfig
+    collection: InteractiveCollectionConfig = field(default_factory=InteractiveCollectionConfig)
+    display_data: bool = False
+    display_ip: str | None = None
+    display_port: int | None = None
+    play_sounds: bool = True
+    resume: bool = False
+
+
+def _get_effective_root(cfg_dataset: DatasetRecordConfig) -> Path:
+    """返回数据集的实际存储路径（与 LeRobotDataset 逻辑保持一致）。"""
+    if cfg_dataset.root is not None:
+        return Path(cfg_dataset.root)
+    return HF_LEROBOT_HOME / cfg_dataset.repo_id
+
+
+def _dataset_exists(root: Path) -> bool:
+    """判断指定路径下是否已存在合法的 LeRobot 数据集（含 meta/info.json）。"""
+    return (root / "meta" / "info.json").exists()
+
+
+def _prompt_dataset_conflict(root: Path, repo_id: str) -> str:
+    """检测到已存在数据集时，交互式询问用户的处理策略。
+
+    Returns:
+        ``"overwrite"``：删除并重新创建数据集。
+        ``"resume"``：在已有数据集基础上继续扩充样本。
+    """
+    sep = "═" * 50
+    logger.info(
+        "\n%s\n"
+        "  检测到已存在的数据集：\n"
+        "    repo_id : %s\n"
+        "    路径    : %s\n"
+        "%s\n"
+        "  请选择处理方式：\n"
+        "    [1] 覆盖原数据集（删除并重新创建）\n"
+        "    [2] 在原有数据集基础上继续扩充样本（resume）\n"
+        "    [q] 退出程序\n"
+        "%s",
+        sep,
+        repo_id,
+        root,
+        sep,
+        sep,
+    )
+    while True:
+        try:
+            choice = input("请输入选项 [1/2/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\n操作已取消。")
+        if choice == "1":
+            logger.warning("将删除数据集目录：%s", root)
+            confirm = input("确认删除？此操作不可恢复 [yes/N]: ").strip().lower()
+            if confirm == "yes":
+                return "overwrite"
+            logger.info("已取消删除，请重新选择。")
+        elif choice == "2":
+            return "resume"
+        elif choice == "q":
+            raise SystemExit("用户取消操作。")
+        else:
+            logger.warning("无效输入 '%s'，请输入 1、2 或 q。", choice)
+
+
+def _episode_buffer_size(dataset: LeRobotDataset | None) -> int:
+    if dataset is None or dataset.episode_buffer is None:
+        return 0
+    return int(dataset.episode_buffer.get("size", 0))
+
+
+def _init_interactive_keyboard() -> tuple[Any, queue.Queue[str]]:
+    """Start a pynput keyboard listener and return its event queue."""
+    try:
+        from pynput import keyboard
+    except Exception as e:
+        raise RuntimeError("Interactive collection requires pynput keyboard support.") from e
+
+    key_queue: queue.Queue[str] = queue.Queue()
+
+    def on_press(key: Any) -> None:
+        try:
+            if key == keyboard.Key.space:
+                key_queue.put("space")
+            elif hasattr(key, "char") and key.char in {"c", "s", "r", "q"}:
+                key_queue.put(key.char)
+        except Exception as e:  # pragma: no cover - defensive listener guard
+            logger.warning("Keyboard event handling failed: %s", e)
+
+    listener = keyboard.Listener(on_press=on_press)
+    try:
+        listener.start()
+    except Exception as e:
+        raise RuntimeError("Failed to start keyboard listener for interactive collection.") from e
+
+    return listener, key_queue
+
+
+def _drain_keys(key_queue: queue.Queue[str]) -> list[str]:
+    keys: list[str] = []
+    while True:
+        try:
+            keys.append(key_queue.get_nowait())
+        except queue.Empty:
+            return keys
+
+
+def _print_usage() -> None:
+    logger.info(
+        "\n"
+        "═══════════════════════════════════════════\n"
+        "  FrankaMultiCam Interactive Collection\n"
+        "═══════════════════════════════════════════\n"
+        "  c      → Start / resume collecting\n"
+        "  space  → Pause\n"
+        "  s      → Save current episode\n"
+        "  r      → Clear current buffer\n"
+        "  q      → Finalize dataset & exit\n"
+        "═══════════════════════════════════════════"
+    )
+
+
+def _make_dataset(
+    cfg: CollectFrankaMultiCamConfig,
+    robot: Any,
+    dataset_features: dict[str, Any],
+    overwrite: bool = False,
+) -> LeRobotDataset:
+    num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
+
+    if cfg.resume:
+        dataset = LeRobotDataset(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            vcodec=cfg.dataset.vcodec,
+            streaming_encoding=cfg.dataset.streaming_encoding,
+            encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+            encoder_threads=cfg.dataset.encoder_threads,
+        )
+        if num_cameras > 0 and not cfg.dataset.streaming_encoding:
+            dataset.start_image_writer(
+                num_processes=cfg.dataset.num_image_writer_processes,
+                num_threads=cfg.dataset.num_image_writer_threads_per_camera * num_cameras,
+            )
+        return dataset
+
+    if overwrite:
+        root = _get_effective_root(cfg.dataset)
+        if root.exists():
+            logger.info("正在删除已有数据集目录：%s", root)
+            shutil.rmtree(root)
+
+    sanity_check_dataset_name(cfg.dataset.repo_id, None)
+    return LeRobotDataset.create(
+        cfg.dataset.repo_id,
+        cfg.dataset.fps,
+        root=cfg.dataset.root,
+        robot_type=robot.name,
+        features=dataset_features,
+        use_videos=cfg.dataset.video,
+        image_writer_processes=cfg.dataset.num_image_writer_processes,
+        image_writer_threads=(
+            cfg.dataset.num_image_writer_threads_per_camera * num_cameras if num_cameras > 0 else 0
+        ),
+        batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+        vcodec=cfg.dataset.vcodec,
+        streaming_encoding=cfg.dataset.streaming_encoding,
+        encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+        encoder_threads=cfg.dataset.encoder_threads,
+    )
+
+
+@parser.wrap()
+def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
+    init_logging()
+    logger.info(pformat(asdict(cfg)))
+    if cfg.display_data:
+        init_rerun(session_name="franka_multicam_collection", ip=cfg.display_ip, port=cfg.display_port)
+
+    robot = make_robot_from_config(cfg.robot)
+
+    _, robot_action_proc, robot_obs_proc = make_default_processors()
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_action_proc,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=cfg.dataset.video,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_obs_proc,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=cfg.dataset.video,
+        ),
+    )
+    logger.info("dataset features:\n%s", pformat(dataset_features))
+
+    dataset: LeRobotDataset | None = None
+    listener = None
+    collecting = False
+    stop_requested = False
+    saved_episodes = 0
+    overwrite = False
+
+    # 在非 resume 模式下，若目标路径已存在合法数据集，则询问用户处理策略
+    if not cfg.resume:
+        effective_root = _get_effective_root(cfg.dataset)
+        if _dataset_exists(effective_root):
+            conflict_choice = _prompt_dataset_conflict(effective_root, cfg.dataset.repo_id)
+            if conflict_choice == "resume":
+                cfg.resume = True
+                logger.info("已切换为 resume 模式，将在已有数据集基础上继续扩充样本。")
+            else:
+                overwrite = True
+                logger.info("已选择覆盖模式，将删除并重新创建数据集。")
+
+    try:
+        dataset = _make_dataset(cfg, robot, dataset_features, overwrite=overwrite)
+
+        robot.connect()
+        listener, key_queue = _init_interactive_keyboard()
+        _print_usage()
+
+        fps = cfg.dataset.fps
+        frame_period_s = 1.0 / fps
+        max_frames = cfg.collection.max_frames_per_episode
+
+        with VideoEncodingManager(dataset):
+            while saved_episodes < cfg.dataset.num_episodes and not stop_requested:
+                loop_t = time.perf_counter()
+
+                for key in _drain_keys(key_queue):
+                    buffer_size = _episode_buffer_size(dataset)
+
+                    if key == "c":
+                        if not collecting:
+                            collecting = True
+                            log_say("Start collecting", cfg.play_sounds)
+                            logger.info("Collecting episode %d from frame %d", dataset.num_episodes, buffer_size)
+                    elif key == "space":
+                        if collecting:
+                            collecting = False
+                            log_say("Pause collecting", cfg.play_sounds)
+                            logger.info("Paused at %d buffered frame(s)", buffer_size)
+                    elif key == "s":
+                        if collecting:
+                            logger.warning("Pause with space before saving the current episode.")
+                            continue
+                        if buffer_size < cfg.collection.min_frames_before_save:
+                            logger.warning(
+                                "Not saving: buffer has %d frame(s), minimum is %d.",
+                                buffer_size,
+                                cfg.collection.min_frames_before_save,
+                            )
+                            continue
+                        log_say("Save episode", cfg.play_sounds)
+                        dataset.save_episode()
+                        saved_episodes += 1
+                        logger.info(
+                            "Saved episode %d/%d | total_episodes=%d total_frames=%d",
+                            saved_episodes,
+                            cfg.dataset.num_episodes,
+                            dataset.meta.total_episodes,
+                            dataset.meta.total_frames,
+                        )
+                    elif key == "r":
+                        collecting = False
+                        dataset.clear_episode_buffer()
+                        log_say("Clear episode buffer", cfg.play_sounds)
+                        logger.info("Current episode buffer cleared.")
+                    elif key == "q":
+                        stop_requested = True
+                        collecting = False
+                        logger.info("Exit requested.")
+
+                if stop_requested:
+                    break
+
+                if not collecting:
+                    precise_sleep(0.05)
+                    continue
+
+                start_frame_t = time.perf_counter()
+                obs = robot.get_observation()
+                obs_processed = robot_obs_proc(obs)
+
+                action_dict = {k: obs_processed[k] for k in robot.action_features if k in obs_processed}
+
+                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+                action_frame = build_dataset_frame(dataset.features, action_dict, prefix=ACTION)
+                dataset.add_frame(
+                    {
+                        **observation_frame,
+                        **action_frame,
+                        "task": cfg.dataset.single_task,
+                    }
+                )
+
+                buffer_size = _episode_buffer_size(dataset)
+                if cfg.display_data:
+                    log_rerun_data(
+                        observation=obs_processed,
+                        action=action_dict,
+                        compress_images=False,
+                    )
+
+                if cfg.collection.print_every_n_frames > 0 and buffer_size % cfg.collection.print_every_n_frames == 0:
+                    logger.info("Buffered %d frame(s) in current episode.", buffer_size)
+
+                if max_frames is not None and buffer_size >= max_frames:
+                    collecting = False
+                    logger.info("Reached max_frames_per_episode=%d; paused.", max_frames)
+
+                dt_s = time.perf_counter() - start_frame_t
+                precise_sleep(max(frame_period_s - dt_s, 0.0))
+
+                loop_dt_s = time.perf_counter() - loop_t
+                if loop_dt_s > frame_period_s * 1.5:
+                    logger.debug("Collection loop slower than target FPS: %.1f Hz", 1.0 / loop_dt_s)
+
+            if saved_episodes >= cfg.dataset.num_episodes:
+                logger.info("Reached requested num_episodes=%d.", cfg.dataset.num_episodes)
+
+            unsaved_frames = _episode_buffer_size(dataset)
+            if unsaved_frames > 0:
+                logger.warning(
+                    "Discarding %d unsaved buffered frame(s). Press 's' before 'q' to save them.",
+                    unsaved_frames,
+                )
+                dataset.clear_episode_buffer()
+
+    finally:
+        log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        if dataset is not None:
+            dataset.finalize()
+
+        if robot.is_connected:
+            robot.disconnect()
+
+        if listener is not None:
+            listener.stop()
+
+        if dataset is not None and cfg.dataset.push_to_hub:
+            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+
+    return dataset
+
+
+if __name__ == "__main__":
+    collect()
