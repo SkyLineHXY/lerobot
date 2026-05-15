@@ -18,21 +18,21 @@
 #   ROBOT_PORT=50051 GRIPPER_PORT=50052 FRANKA_PORT=4242 ./launch_franka_servers.sh
 #
 # 可用环境变量：
-#   CONDA_ENV               conda 环境名                    (默认: polymetis-local)
-#   ROBOT_IP                Polymetis robot server IP       (默认: localhost)
-#   ROBOT_PORT              Polymetis robot server 端口     (默认: 50051)
-#   ROBOT_CLIENT            Hydra robot_client config       (默认: franka_hardware)
-#   GRIPPER                 Hydra gripper config            (默认: franka_hand)
-#   GRIPPER_IP              Polymetis gripper server IP     (默认: localhost)
-#   GRIPPER_PORT            Polymetis gripper server 端口   (默认: 50052)
-#   STARTUP_TIMEOUT         等待 gRPC server 就绪的超时秒数  (默认: 60)
-#   GRIPPER_HOMING_WAIT     夹爪 homing 完成等待秒数         (默认: 12)
-#   FRANKA_BIND             zerorpc 绑定地址                (默认: 0.0.0.0)
-#   FRANKA_PORT             zerorpc 端口                    (默认: 4242)
-#   FRANKA_IFACE_TIMEOUT    等待 zerorpc 端口就绪的超时秒数  (默认: 60)
-#   FRANKA_GO_HOME          启动后是否执行 go_home (1/0)    (默认: 0)
-#   FRANKA_INTERFACE_SERVER franka_interface_server.py 路径  (默认: 自动检测)
-#   LOG_DIR                 日志目录                        (默认: /tmp/franka_stack)
+#   CONDA_ENV               conda 环境名                       (默认: polymetis-local)
+#   ROBOT_IP                Polymetis robot server IP          (默认: 172.16.0.2)
+#   ROBOT_PORT              Polymetis robot server 端口        (默认: 50051)
+#   ROBOT_CLIENT            Hydra robot_client config          (默认: franka_hardware)
+#   GRIPPER                 Hydra gripper config               (默认: franka_hand)
+#   GRIPPER_IP              Polymetis gripper server IP        (默认: 与 ROBOT_IP 相同)
+#   GRIPPER_PORT            Polymetis gripper server 端口      (默认: 50052)
+#   STARTUP_TIMEOUT         等待 Polymetis 接口就绪的超时秒数  (默认: 90)
+#   GRIPPER_HOMING_WAIT     夹爪 homing 完成等待秒数           (默认: 12)
+#   FRANKA_BIND             zerorpc 绑定地址                   (默认: 192.168.172.134)
+#   FRANKA_PORT             zerorpc 端口                       (默认: 4242)
+#   FRANKA_IFACE_TIMEOUT    等待 zerorpc 端口就绪的超时秒数    (默认: 120)
+#   FRANKA_GO_HOME          启动后是否执行 go_home (1/0)       (默认: 0)
+#   FRANKA_INTERFACE_SERVER franka_interface_server.py 路径    (默认: 自动检测)
+#   LOG_DIR                 日志目录                           (默认: /tmp/franka_stack)
 
 set -euo pipefail
 
@@ -41,7 +41,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 CONDA_ENV="${CONDA_ENV:-polymetis-local}"
 
-ROBOT_IP="${ROBOT_IP:-localhost}"
+ROBOT_IP="${ROBOT_IP:-172.16.0.2}"
 ROBOT_PORT="${ROBOT_PORT:-50051}"
 ROBOT_CLIENT="${ROBOT_CLIENT:-franka_hardware}"
 
@@ -49,12 +49,12 @@ GRIPPER="${GRIPPER:-franka_hand}"
 GRIPPER_IP="${GRIPPER_IP:-$ROBOT_IP}"
 GRIPPER_PORT="${GRIPPER_PORT:-50052}"
 
-STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-90}"
 GRIPPER_HOMING_WAIT="${GRIPPER_HOMING_WAIT:-12}"
 
-FRANKA_BIND="${FRANKA_BIND:-0.0.0.0}"
+FRANKA_BIND="${FRANKA_BIND:-192.168.172.134}"
 FRANKA_PORT="${FRANKA_PORT:-4242}"
-FRANKA_IFACE_TIMEOUT="${FRANKA_IFACE_TIMEOUT:-60}"
+FRANKA_IFACE_TIMEOUT="${FRANKA_IFACE_TIMEOUT:-120}"
 FRANKA_GO_HOME="${FRANKA_GO_HOME:-0}"
 
 LOG_DIR="${LOG_DIR:-/tmp/franka_stack}"
@@ -67,6 +67,18 @@ FRANKA_INTERFACE_SERVER="${FRANKA_INTERFACE_SERVER:-$SCRIPT_DIR/../src/lerobot/r
 # ─────────────────────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] [stack] $*"; }
 err() { echo "[$(date '+%H:%M:%S')] [stack] [ERROR] $*" >&2; }
+
+# 超时时打印最近 30 行日志并退出
+die_with_log() {
+    local msg="$1" logfile="${2:-}"
+    err "$msg"
+    if [[ -n "$logfile" && -f "$logfile" ]]; then
+        err "━━━ 最近日志（${logfile}）━━━"
+        tail -30 "$logfile" >&2
+        err "━━━ 日志结束 ━━━"
+    fi
+    exit 1
+}
 
 ROBOT_PID=""
 GRIPPER_PID=""
@@ -129,38 +141,74 @@ log "缓存 sudo 凭据（launch_robot.py real-time 模式需要）..."
 sudo -v
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 等待 Polymetis gRPC 服务上线（通过 polymetis 的 check_server_exists 探测）
+# 等待 RobotInterface 真实可用（直接调用 get_joint_positions 验证）
+#
+# 背景：check_server_exists 只做 TCP/gRPC 握手，端口开着就返回 True，
+# 但 RobotInterface(enforce_version=True) 需要发送完整 RPC 请求，
+# 在 franka_panda_client 尚未向服务端注册完元数据时仍会失败。
+# 用 enforce_version=False + get_joint_positions() 做真实可用性探测，
+# 确认服务端能正常响应后再继续。
 # ─────────────────────────────────────────────────────────────────────────────
-wait_for_grpc_server() {
-    local ip="$1" port="$2" timeout="$3" name="$4" t0
-    log "等待 ${name} (${ip}:${port}，超时 ${timeout}s) ..."
+wait_for_robot_interface() {
+    local ip="$1" port="$2" timeout="$3" logfile="${4:-}" t0
+    log "等待 RobotInterface 可用 (${ip}:${port}，超时 ${timeout}s) ..."
     t0=$(date +%s)
     until python - "$ip" "$port" 2>/dev/null <<'PY'
 import sys
-from polymetis.utils.grpc_utils import check_server_exists
-sys.exit(0 if check_server_exists(sys.argv[1], int(sys.argv[2])) else 1)
+try:
+    from polymetis import RobotInterface
+    r = RobotInterface(ip_address=sys.argv[1], port=int(sys.argv[2]), enforce_version=False)
+    _ = r.get_joint_positions()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
 PY
     do
-        sleep 0.5
+        sleep 1
         if [ $(( $(date +%s) - t0 )) -ge "$timeout" ]; then
-            err "${name} 在 ${timeout}s 内未启动。"
-            exit 1
+            die_with_log "RobotInterface (${ip}:${port}) 在 ${timeout}s 内未就绪。" "$logfile"
         fi
     done
-    log "${name} 已就绪 ✓"
+    log "RobotInterface 已就绪 ✓"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 等待 TCP 端口可连接（用于探测 zerorpc server）
+# 等待 GripperInterface 真实可用（直接调用 get_state 验证）
+# ─────────────────────────────────────────────────────────────────────────────
+wait_for_gripper_interface() {
+    local ip="$1" port="$2" timeout="$3" logfile="${4:-}" t0
+    log "等待 GripperInterface 可用 (${ip}:${port}，超时 ${timeout}s) ..."
+    t0=$(date +%s)
+    until python - "$ip" "$port" 2>/dev/null <<'PY'
+import sys
+try:
+    from polymetis import GripperInterface
+    g = GripperInterface(ip_address=sys.argv[1], port=int(sys.argv[2]))
+    _ = g.get_state()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+    do
+        sleep 1
+        if [ $(( $(date +%s) - t0 )) -ge "$timeout" ]; then
+            die_with_log "GripperInterface (${ip}:${port}) 在 ${timeout}s 内未就绪。" "$logfile"
+        fi
+    done
+    log "GripperInterface 已就绪 ✓"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 等待 TCP 端口可连接（用于探测 zerorpc server 绑定完成）
 # ─────────────────────────────────────────────────────────────────────────────
 wait_for_tcp_port() {
-    local port="$1" timeout="$2" name="$3" t0
+    local port="$1" timeout="$2" name="$3" logfile="${4:-}" t0
     log "等待 ${name} (TCP :${port}，超时 ${timeout}s) ..."
     t0=$(date +%s)
     until python - "$port" 2>/dev/null <<'PY'
 import sys, socket
 try:
-    s = socket.create_connection(("localhost", int(sys.argv[1])), timeout=2)
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2)
     s.close()
     sys.exit(0)
 except Exception:
@@ -169,8 +217,7 @@ PY
     do
         sleep 0.5
         if [ $(( $(date +%s) - t0 )) -ge "$timeout" ]; then
-            err "${name} 在 ${timeout}s 内未启动，请检查日志：${LOG_DIR}/"
-            exit 1
+            die_with_log "${name} 在 ${timeout}s 内未启动。" "$logfile"
         fi
     done
     log "${name} 已就绪 ✓"
@@ -192,11 +239,8 @@ launch_robot.py \
     >"${LOG_DIR}/polymetis_robot.log" 2>&1 &
 ROBOT_PID=$!
 
-wait_for_grpc_server "$ROBOT_IP" "$ROBOT_PORT" "$STARTUP_TIMEOUT" "Polymetis robot controller server"
-
-# franka_panda_client 在 gRPC 就绪后还需要一点时间向服务端注册元数据
-log "等待 franka_panda_client 注册元数据（3s）..."
-sleep 3
+wait_for_robot_interface \
+    "$ROBOT_IP" "$ROBOT_PORT" "$STARTUP_TIMEOUT" "${LOG_DIR}/polymetis_robot.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2/3  Polymetis gripper server + franka_hand_client
@@ -212,7 +256,8 @@ launch_gripper.py \
     >"${LOG_DIR}/polymetis_gripper.log" 2>&1 &
 GRIPPER_PID=$!
 
-wait_for_grpc_server "$GRIPPER_IP" "$GRIPPER_PORT" "$STARTUP_TIMEOUT" "Polymetis gripper server"
+wait_for_gripper_interface \
+    "$GRIPPER_IP" "$GRIPPER_PORT" "$STARTUP_TIMEOUT" "${LOG_DIR}/polymetis_gripper.log"
 
 log "等待夹爪 homing 完成（${GRIPPER_HOMING_WAIT}s）..."
 sleep "$GRIPPER_HOMING_WAIT"
@@ -229,17 +274,19 @@ _go_home_flag=""
 [[ "$FRANKA_GO_HOME" -eq 1 ]] && _go_home_flag="--go-home"
 
 python "$FRANKA_INTERFACE_SERVER" \
-    --bind        "$FRANKA_BIND" \
-    --port        "$FRANKA_PORT" \
-    --robot-ip    "$ROBOT_IP" \
-    --robot-port  "$ROBOT_PORT" \
-    --gripper-ip  "$GRIPPER_IP" \
+    --bind         "$FRANKA_BIND" \
+    --port         "$FRANKA_PORT" \
+    --robot-ip     "$ROBOT_IP" \
+    --robot-port   "$ROBOT_PORT" \
+    --gripper-ip   "$GRIPPER_IP" \
     --gripper-port "$GRIPPER_PORT" \
     ${_go_home_flag} \
     >"${LOG_DIR}/franka_interface_server.log" 2>&1 &
 IFACE_PID=$!
 
-wait_for_tcp_port "$FRANKA_PORT" "$FRANKA_IFACE_TIMEOUT" "FrankaInterfaceServer (zerorpc)"
+wait_for_tcp_port \
+    "$FRANKA_PORT" "$FRANKA_IFACE_TIMEOUT" "FrankaInterfaceServer (zerorpc)" \
+    "${LOG_DIR}/franka_interface_server.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 全部就绪，监控子进程存活状态
@@ -255,15 +302,12 @@ log "  按 Ctrl-C 停止所有服务。"
 log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # 任一进程退出则整体退出（cleanup trap 会负责清理其余进程）
-monitor_pids() {
-    while true; do
-        sleep 5
-        for pid_var in "$ROBOT_PID" "$GRIPPER_PID" "$IFACE_PID"; do
-            if [[ -n "$pid_var" ]] && ! kill -0 "$pid_var" 2>/dev/null; then
-                err "进程 PID=${pid_var} 已意外退出！请检查日志：${LOG_DIR}/"
-                exit 1
-            fi
-        done
+while true; do
+    sleep 5
+    for _pid in "$ROBOT_PID" "$GRIPPER_PID" "$IFACE_PID"; do
+        if [[ -n "$_pid" ]] && ! kill -0 "$_pid" 2>/dev/null; then
+            err "进程 PID=${_pid} 已意外退出！请检查日志：${LOG_DIR}/"
+            exit 1
+        fi
     done
-}
-monitor_pids
+done
