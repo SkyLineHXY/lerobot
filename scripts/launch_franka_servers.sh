@@ -39,12 +39,12 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 CONDA_ENV="${CONDA_ENV:-polymetis-local}"
 
-ROBOT_IP="${ROBOT_IP:-172.16.0.1}"
+ROBOT_IP="${ROBOT_IP:-localhost}"
 ROBOT_PORT="${ROBOT_PORT:-50051}"
 ROBOT_CLIENT="${ROBOT_CLIENT:-franka_hardware}"
 
 GRIPPER="${GRIPPER:-franka_hand}"
-GRIPPER_IP="${GRIPPER_IP:-172.16.0.1}"
+GRIPPER_IP="${GRIPPER_IP:-localhost}"
 GRIPPER_PORT="${GRIPPER_PORT:-50052}"
 
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-90}"
@@ -216,7 +216,7 @@ sleep "$GRIPPER_HOMING_WAIT"
 # ─────────────────────────────────────────────────────────────────────────────
 # 3/3  zerorpc FrankaInterfaceServer
 # ─────────────────────────────────────────────────────────────────────────────
-log "━━━ 3/3  启动 zerorpc FrankaInterfaceServer（新终端窗口）━━━"
+log "━━━ 3/3  启动 zerorpc FrankaInterfaceServer ━━━"
 log "    bind=${FRANKA_BIND}  port=${FRANKA_PORT}"
 log "    robot=${ROBOT_IP}:${ROBOT_PORT}  gripper=${GRIPPER_IP}:${GRIPPER_PORT}"
 log "    日志: ${LOG_DIR}/franka_interface_server.log"
@@ -224,60 +224,17 @@ log "    日志: ${LOG_DIR}/franka_interface_server.log"
 _go_home_flag=""
 [[ "$FRANKA_GO_HOME" -eq 1 ]] && _go_home_flag="--go-home"
 
-# 生成独立启动脚本，供新终端窗口执行
-# 输出同时写入终端（可见）和日志文件（供 wait_for_log_pattern 监控）
-_iface_script=$(mktemp /tmp/franka_iface_XXXXXX.sh)
-cat > "$_iface_script" << 'EOSH'
-#!/usr/bin/env bash
-set +u +e
-source "CONDA_BASE_PH/etc/profile.d/conda.sh"
-conda activate "CONDA_ENV_PH"
-set -e
-exec python "FRANKA_INTERFACE_SERVER_PH" \
-    --bind         "FRANKA_BIND_PH" \
-    --port         "FRANKA_PORT_PH" \
-    --robot-ip     "ROBOT_IP_PH" \
-    --robot-port   "ROBOT_PORT_PH" \
-    --gripper-ip   "GRIPPER_IP_PH" \
-    --gripper-port "GRIPPER_PORT_PH" \
-    GO_HOME_PH
-EOSH
-
-# 用实际变量值替换占位符
-sed -i \
-    -e "s|CONDA_BASE_PH|${CONDA_BASE}|g" \
-    -e "s|CONDA_ENV_PH|${CONDA_ENV}|g" \
-    -e "s|FRANKA_INTERFACE_SERVER_PH|${FRANKA_INTERFACE_SERVER}|g" \
-    -e "s|FRANKA_BIND_PH|${FRANKA_BIND}|g" \
-    -e "s|FRANKA_PORT_PH|${FRANKA_PORT}|g" \
-    -e "s|ROBOT_IP_PH|${ROBOT_IP}|g" \
-    -e "s|ROBOT_PORT_PH|${ROBOT_PORT}|g" \
-    -e "s|GRIPPER_IP_PH|${GRIPPER_IP}|g" \
-    -e "s|GRIPPER_PORT_PH|${GRIPPER_PORT}|g" \
-    -e "s|GO_HOME_PH|${_go_home_flag}|g" \
-    "$_iface_script"
-chmod +x "$_iface_script"
-
-if command -v gnome-terminal &>/dev/null; then
-    gnome-terminal \
-        --title="FrankaInterfaceServer [:${FRANKA_PORT}]" \
-        -- bash -c "
-            bash \"$_iface_script\" 2>&1 | tee \"${LOG_DIR}/franka_interface_server.log\"
-            echo
-            echo '=== FrankaInterfaceServer 已退出，按 Enter 关闭 ==='
-            read _
-        " &
-elif command -v xterm &>/dev/null; then
-    xterm -title "FrankaInterfaceServer [:${FRANKA_PORT}]" \
-        -e "bash \"$_iface_script\" 2>&1 | tee \"${LOG_DIR}/franka_interface_server.log\"; \
-            echo; echo '=== 已退出，按 Enter 关闭 ==='; read _" &
-else
-    log "未找到 gnome-terminal/xterm，回退到后台模式..."
-    bash "$_iface_script" >"${LOG_DIR}/franka_interface_server.log" 2>&1 &
-fi
+python "$FRANKA_INTERFACE_SERVER" \
+    --bind         "$FRANKA_BIND" \
+    --port         "$FRANKA_PORT" \
+    --robot-ip     "$ROBOT_IP" \
+    --robot-port   "$ROBOT_PORT" \
+    --gripper-ip   "$GRIPPER_IP" \
+    --gripper-port "$GRIPPER_PORT" \
+    ${_go_home_flag} \
+    >"${LOG_DIR}/franka_interface_server.log" 2>&1 &
 IFACE_PID=$!
 
-# 等待 franka_interface_server.py 日志中出现绑定成功的消息
 wait_for_log_pattern \
     "${LOG_DIR}/franka_interface_server.log" \
     "zerorpc 服务已绑定" \

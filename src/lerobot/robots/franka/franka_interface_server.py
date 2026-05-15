@@ -11,6 +11,7 @@
 """
 import argparse
 import logging
+import os
 import time
 
 import numpy as np
@@ -26,18 +27,27 @@ _POLYMETIS_RETRY_INTERVAL = 2.0
 
 
 class FrankaInterfaceServer:
-    def __init__(self, robot_ip: str = "localhost", robot_port: int = 50051):
+    def __init__(
+        self,
+        robot_ip: str = "localhost",
+        robot_port: int = 50051,
+        gripper_ip: str = "localhost",
+        gripper_port: int = 50052,
+    ):
         # 等待 Polymetis gRPC 服务就绪（launch_robot.py 需提前启动）
+        if gripper_ip is None:
+            gripper_ip = robot_ip
         last_exc: Exception | None = None
         for attempt in range(_POLYMETIS_RETRY_TIMES):
             try:
                 self.robot = RobotInterface(
                     ip_address=robot_ip,
                     port=robot_port,
-                    enforce_version=True,
+                    enforce_version=False,
                 )
                 self.gripper = GripperInterface(
-                    ip_address=robot_ip,
+                    ip_address=gripper_ip,
+                    port=gripper_port,
                 )
                 log.info("FrankaInterfaceServer 初始化成功")
                 return
@@ -178,11 +188,26 @@ class FrankaInterfaceServer:
 
 
 def _parse_args() -> argparse.Namespace:
+    # 优先读取与 launch_franka_servers.sh 相同的环境变量，保持默认值一致
+    _robot_ip = os.environ.get("ROBOT_IP", "localhost")
+    _robot_port = int(os.environ.get("ROBOT_PORT", "50051"))
+    _gripper_ip = os.environ.get("GRIPPER_IP", _robot_ip)
+    _gripper_port = int(os.environ.get("GRIPPER_PORT", "50052"))
+    _bind = os.environ.get("FRANKA_BIND", "192.168.172.134")
+    _port = int(os.environ.get("FRANKA_PORT", "4242"))
+
     p = argparse.ArgumentParser(description="Franka zerorpc 服务端（运行于 NUC）")
-    p.add_argument("--bind", default="0.0.0.0", help="zerorpc 绑定地址（默认 0.0.0.0）")
-    p.add_argument("--port", type=int, default=4242, help="zerorpc 端口（默认 4242）")
-    p.add_argument("--robot-ip", default="localhost", dest="robot_ip", help="Polymetis robot server IP（默认 localhost）")
-    p.add_argument("--robot-port", type=int, default=50051, dest="robot_port", help="Polymetis robot server 端口（默认 50051）")
+    p.add_argument("--bind", default=_bind, help=f"zerorpc 绑定地址（默认 {_bind}，可用 FRANKA_BIND 覆盖）")
+    p.add_argument("--port", type=int, default=_port, help=f"zerorpc 端口（默认 {_port}，可用 FRANKA_PORT 覆盖）")
+    p.add_argument("--robot-ip", default=_robot_ip, dest="robot_ip", help=f"Polymetis robot server IP（默认 {_robot_ip}，可用 ROBOT_IP 覆盖）")
+    p.add_argument("--robot-port", type=int, default=_robot_port, dest="robot_port", help=f"Polymetis robot server 端口（默认 {_robot_port}，可用 ROBOT_PORT 覆盖）")
+    p.add_argument(
+        "--gripper-ip",
+        default=_gripper_ip,
+        dest="gripper_ip",
+        help=f"Polymetis gripper server IP（默认 {_gripper_ip}，可用 GRIPPER_IP 覆盖）",
+    )
+    p.add_argument("--gripper-port", type=int, default=_gripper_port, dest="gripper_port", help=f"Polymetis gripper server 端口（默认 {_gripper_port}，可用 GRIPPER_PORT 覆盖）")
     p.add_argument("--go-home", action="store_true", dest="go_home", help="启动后执行 go_home")
     return p.parse_args()
 
@@ -192,7 +217,14 @@ if __name__ == "__main__":
 
     args = _parse_args()
 
-    server = FrankaInterfaceServer(robot_ip=args.robot_ip, robot_port=args.robot_port)
+    server = FrankaInterfaceServer(
+        robot_ip=args.robot_ip,
+        robot_port=args.robot_port,
+        gripper_ip=args.gripper_ip,
+        gripper_port=args.gripper_port,
+    )
+    # server.robot_go_home()
+    print(server.robot_get_ee_pose())
 
     if args.go_home:
         log.info("执行 go_home…")
