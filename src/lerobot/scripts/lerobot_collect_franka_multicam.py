@@ -36,7 +36,6 @@ from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.robots.franka.franka import EE_POSE_KEYS
 from lerobot.robots.franka_gen_gripper.umi_transforms import (
-    ee_relative_action_to_base,
     pose_xyz_rotvec_to_se3,
     se3_to_xyz_rotvec,
 )
@@ -207,6 +206,43 @@ def _print_usage() -> None:
     )
 
 
+def _go_home_and_restart_cartesian(robot: Any) -> None:
+    """终止当前 Cartesian 控制器 → go_home → 重启 Cartesian 阻抗控制器。
+
+    在 spacemouse 采集模式下，每次 episode 开始前调用，确保机械臂从固定 home 位出发。
+    """
+    # 先终止当前 Cartesian 阻抗控制器（容错：首次启动时可能尚未启动）
+    try:
+        if hasattr(robot, "terminate_policy"):
+            robot.terminate_policy()
+        elif hasattr(robot, "_franka") and hasattr(robot._franka, "terminate_policy"):
+            robot._franka.terminate_policy()
+    except Exception as exc:
+        logger.debug("terminate_policy 跳过（控制器可能尚未启动）: %s", exc)
+
+    # 回到 home 位
+    logger.info("机械臂正在回到 home 位，请勿干扰...")
+    try:
+        if hasattr(robot, "reset"):
+            robot.reset()
+        elif hasattr(robot, "_franka") and hasattr(robot._franka, "reset"):
+            robot._franka.reset()
+        else:
+            logger.warning("未找到 reset() 方法，跳过 go_home。")
+            return
+    except Exception as exc:
+        logger.warning("go_home 失败（可忽略）: %s", exc)
+        return
+
+    logger.info("机械臂已到达 home 位，正在重启 Cartesian 阻抗控制器...")
+    # 重启 Cartesian 阻抗控制器
+    if hasattr(robot, "start_cartesian_impedance"):
+        robot.start_cartesian_impedance()
+    elif hasattr(robot, "_franka") and hasattr(robot._franka, "start_cartesian_impedance"):
+        robot._franka.start_cartesian_impedance()
+    logger.info("Cartesian 阻抗控制器已就绪，可以开始采集。")
+
+
 def _make_dataset(
     cfg: CollectFrankaMultiCamConfig,
     robot: Any,
@@ -311,11 +347,8 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
 
         if teleop_device is not None:
             teleop_device.connect()
-            # SpaceMouse 采集模式：启动 Cartesian 阻抗控制器（polymetis 要求）
-            if hasattr(robot, "start_cartesian_impedance"):
-                robot.start_cartesian_impedance()
-            elif hasattr(robot, "_franka") and hasattr(robot._franka, "start_cartesian_impedance"):
-                robot._franka.start_cartesian_impedance()
+            # SpaceMouse 采集模式：先 go_home 再启动 Cartesian 阻抗控制器
+            _go_home_and_restart_cartesian(robot)
 
         listener, key_queue = _init_interactive_keyboard()
         _print_usage()
@@ -365,6 +398,9 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                             dataset.meta.total_episodes,
                             dataset.meta.total_frames,
                         )
+                        # 保存完成后自动回 home，为下一个 episode 做准备
+                        if teleop_device is not None and saved_episodes < cfg.dataset.num_episodes:
+                            _go_home_and_restart_cartesian(robot)
                     elif key == "r":
                         collecting = False
                         dataset.clear_episode_buffer()
@@ -379,6 +415,9 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     break
 
                 # 处理 spacemouse 按键事件（与键盘热键并行生效）
+                # 注意：TERMINATE_EPISODE / SUCCESS 事件不在此处理，避免与夹爪按键冲突
+                # （右键 = gripper_close_button = terminate_button，两者共用同一物理按键）
+                # episode 的保存/退出统一由键盘 s/q 控制。
                 if teleop_device is not None and hasattr(teleop_device, "get_teleop_events"):
                     teleop_events = teleop_device.get_teleop_events()
                     if teleop_events.get(TeleopEvents.RERECORD_EPISODE, False):
@@ -386,13 +425,6 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                         dataset.clear_episode_buffer()
                         log_say("Clear episode buffer (spacemouse)", cfg.play_sounds)
                         logger.info("SpaceMouse 触发重录：已清空当前 episode 缓冲。")
-                    elif teleop_events.get(TeleopEvents.SUCCESS, False) or teleop_events.get(
-                        TeleopEvents.TERMINATE_EPISODE, False
-                    ):
-                        if collecting:
-                            collecting = False
-                            log_say("Pause collecting (spacemouse)", cfg.play_sounds)
-                            logger.info("SpaceMouse 触发暂停，请按 's' 保存当前 episode。")
 
                 if not collecting:
                     precise_sleep(0.05)
@@ -414,7 +446,7 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     rvec = np.array([obs_processed[k] for k in ("ee_pose.rx", "ee_pose.ry", "ee_pose.rz")])
                     T_curr = pose_xyz_rotvec_to_se3(pos, rvec)
 
-                    # 构造 4×4 SE(3) 增量（EE 坐标系下的位姿增量）
+                    # SpaceMouse 输出的 6-DoF 增量（已缩放，单位：米/弧度）
                     dx = float(delta.get("delta_x", 0.0))
                     dy = float(delta.get("delta_y", 0.0))
                     dz = float(delta.get("delta_z", 0.0))
@@ -422,12 +454,14 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     dp = float(delta.get("delta_pitch", 0.0))
                     dyw = float(delta.get("delta_yaw", 0.0))
 
-                    delta_mat = np.eye(4)
-                    delta_mat[:3, :3] = R.from_rotvec([dr, dp, dyw]).as_matrix()
-                    delta_mat[:3, 3] = [dx, dy, dz]
-
-                    # 积分到目标绝对位姿
-                    T_target = ee_relative_action_to_base(delta_mat, T_curr)
+                    # 积分到目标绝对位姿：
+                    #   平移 —— 直接在基坐标系中叠加，保证"向上拨杆=臂向上运动"
+                    #   旋转 —— 在末端坐标系（body frame）中右乘，保证绕夹爪自身轴旋转
+                    R_curr = T_curr[:3, :3]
+                    R_delta = R.from_rotvec([dr, dp, dyw]).as_matrix()
+                    T_target = np.eye(4)
+                    T_target[:3, :3] = R_curr @ R_delta  # 末端坐标系旋转增量
+                    T_target[:3, 3] = T_curr[:3, 3] + np.array([dx, dy, dz])  # 基坐标系平移增量
                     pose6 = se3_to_xyz_rotvec(T_target)
 
                     action_dict = {key: float(pose6[i]) for i, key in enumerate(EE_POSE_KEYS)}
