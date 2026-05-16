@@ -23,6 +23,9 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import (
@@ -31,12 +34,21 @@ from lerobot.datasets.pipeline_features import (
 )
 from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
+from lerobot.robots.franka.franka import EE_POSE_KEYS
+from lerobot.robots.franka_gen_gripper.umi_transforms import (
+    ee_relative_action_to_base,
+    pose_xyz_rotvec_to_se3,
+    se3_to_xyz_rotvec,
+)
 from lerobot.robots.franka_multicam.config_franka_multicam import FrankaMultiCamConfig  # noqa: F401
 from lerobot.cameras.hik_camera.configuration_hik import HikCameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.opencv_zmq.configuration_opencv_zmq import OpenCVZmqCameraConfig  # noqa: F401
 from lerobot.robots.utils import make_robot_from_config
 from lerobot.scripts.lerobot_record import DatasetRecordConfig, make_default_processors
+from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouseTeleopConfig  # noqa: F401
+from lerobot.teleoperators.utils import TeleopEvents, make_teleoperator_from_config
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.control_utils import sanity_check_dataset_name
 from lerobot.utils.robot_utils import precise_sleep
@@ -67,6 +79,14 @@ class CollectFrankaMultiCamConfig:
     robot: FrankaMultiCamConfig
     dataset: DatasetRecordConfig
     collection: InteractiveCollectionConfig = field(default_factory=InteractiveCollectionConfig)
+    teleop: TeleoperatorConfig | None = None
+    """可选遥操作器配置（如 SpaceMouseTeleopConfig）。
+    当不为 None 时，由遥操作器闭环驱动机械臂并写入动作；
+    为 None 时保持原有"obs→action 复制"行为（机械臂由外部驱动）。"""
+    gripper_width_min_m: float = 0.0
+    """夹爪全合时对应的宽度（米），用于将 gripper 信号映射到 gripper.width。"""
+    gripper_width_max_m: float = 0.08
+    """夹爪全开时对应的宽度（米）。"""
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None
@@ -247,6 +267,9 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
 
     robot = make_robot_from_config(cfg.robot)
 
+    # 可选遥操作器（spacemouse 等）
+    teleop_device = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+
     _, robot_action_proc, robot_obs_proc = make_default_processors()
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
@@ -285,12 +308,24 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
         dataset = _make_dataset(cfg, robot, dataset_features, overwrite=overwrite)
 
         robot.connect()
+
+        if teleop_device is not None:
+            teleop_device.connect()
+            # SpaceMouse 采集模式：启动 Cartesian 阻抗控制器（polymetis 要求）
+            if hasattr(robot, "start_cartesian_impedance"):
+                robot.start_cartesian_impedance()
+            elif hasattr(robot, "_franka") and hasattr(robot._franka, "start_cartesian_impedance"):
+                robot._franka.start_cartesian_impedance()
+
         listener, key_queue = _init_interactive_keyboard()
         _print_usage()
 
         fps = cfg.dataset.fps
         frame_period_s = 1.0 / fps
         max_frames = cfg.collection.max_frames_per_episode
+
+        # spacemouse 模式下的夹爪宽度跟踪（STAY 时保持上一帧值）
+        last_gripper_width = cfg.gripper_width_max_m
 
         with VideoEncodingManager(dataset):
             while saved_episodes < cfg.dataset.num_episodes and not stop_requested:
@@ -343,6 +378,22 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                 if stop_requested:
                     break
 
+                # 处理 spacemouse 按键事件（与键盘热键并行生效）
+                if teleop_device is not None and hasattr(teleop_device, "get_teleop_events"):
+                    teleop_events = teleop_device.get_teleop_events()
+                    if teleop_events.get(TeleopEvents.RERECORD_EPISODE, False):
+                        collecting = False
+                        dataset.clear_episode_buffer()
+                        log_say("Clear episode buffer (spacemouse)", cfg.play_sounds)
+                        logger.info("SpaceMouse 触发重录：已清空当前 episode 缓冲。")
+                    elif teleop_events.get(TeleopEvents.SUCCESS, False) or teleop_events.get(
+                        TeleopEvents.TERMINATE_EPISODE, False
+                    ):
+                        if collecting:
+                            collecting = False
+                            log_say("Pause collecting (spacemouse)", cfg.play_sounds)
+                            logger.info("SpaceMouse 触发暂停，请按 's' 保存当前 episode。")
+
                 if not collecting:
                     precise_sleep(0.05)
                     continue
@@ -351,7 +402,47 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                 obs = robot.get_observation()
                 obs_processed = robot_obs_proc(obs)
 
-                action_dict = {k: obs_processed[k] for k in robot.action_features if k in obs_processed}
+                if teleop_device is None:
+                    # 原有行为：机械臂由外部驱动，将观测复制为动作
+                    action_dict = {k: obs_processed[k] for k in robot.action_features if k in obs_processed}
+                else:
+                    # SpaceMouse 闭环驱动：delta EE → absolute EE pose
+                    delta = teleop_device.get_action()
+
+                    # 从当前观测构造 SE(3) 参考位姿
+                    pos = np.array([obs_processed[k] for k in ("ee_pose.x", "ee_pose.y", "ee_pose.z")])
+                    rvec = np.array([obs_processed[k] for k in ("ee_pose.rx", "ee_pose.ry", "ee_pose.rz")])
+                    T_curr = pose_xyz_rotvec_to_se3(pos, rvec)
+
+                    # 构造 4×4 SE(3) 增量（EE 坐标系下的位姿增量）
+                    dx = float(delta.get("delta_x", 0.0))
+                    dy = float(delta.get("delta_y", 0.0))
+                    dz = float(delta.get("delta_z", 0.0))
+                    dr = float(delta.get("delta_roll", 0.0))
+                    dp = float(delta.get("delta_pitch", 0.0))
+                    dyw = float(delta.get("delta_yaw", 0.0))
+
+                    delta_mat = np.eye(4)
+                    delta_mat[:3, :3] = R.from_rotvec([dr, dp, dyw]).as_matrix()
+                    delta_mat[:3, 3] = [dx, dy, dz]
+
+                    # 积分到目标绝对位姿
+                    T_target = ee_relative_action_to_base(delta_mat, T_curr)
+                    pose6 = se3_to_xyz_rotvec(T_target)
+
+                    action_dict = {key: float(pose6[i]) for i, key in enumerate(EE_POSE_KEYS)}
+
+                    # 夹爪宽度映射（0=合/1=保持/2=开）
+                    if "gripper.width" in robot.action_features:
+                        g = int(delta.get("gripper", 1))
+                        if g == 2:  # OPEN
+                            last_gripper_width = cfg.gripper_width_max_m
+                        elif g == 0:  # CLOSE
+                            last_gripper_width = cfg.gripper_width_min_m
+                        # g == 1 (STAY): last_gripper_width 保持不变
+                        action_dict["gripper.width"] = last_gripper_width
+
+                    robot.send_action(action_dict)
 
                 observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
                 action_frame = build_dataset_frame(dataset.features, action_dict, prefix=ACTION)
@@ -401,6 +492,25 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
 
         if dataset is not None:
             dataset.finalize()
+
+        # 关闭 Cartesian 控制器后再断开连接（polymetis 要求）
+        if teleop_device is not None and robot.is_connected:
+            if hasattr(robot, "terminate_policy"):
+                try:
+                    robot.terminate_policy()
+                except Exception as exc:
+                    logger.warning("terminate_policy 失败（可忽略）: %s", exc)
+            elif hasattr(robot, "_franka") and hasattr(robot._franka, "terminate_policy"):
+                try:
+                    robot._franka.terminate_policy()
+                except Exception as exc:
+                    logger.warning("terminate_policy 失败（可忽略）: %s", exc)
+
+        if teleop_device is not None:
+            try:
+                teleop_device.disconnect()
+            except Exception as exc:
+                logger.warning("teleop disconnect 失败（可忽略）: %s", exc)
 
         if robot.is_connected:
             robot.disconnect()

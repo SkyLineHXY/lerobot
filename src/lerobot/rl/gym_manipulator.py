@@ -70,6 +70,7 @@ from lerobot.teleoperators import (
     keyboard,  # noqa: F401
     make_teleoperator_from_config,
     so_leader,  # noqa: F401
+    spacemouse,  # noqa: F401
 )
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
@@ -601,6 +602,7 @@ def control_loop(
     complementary_data = (
         {"raw_joint_positions": info.pop("raw_joint_positions")} if "raw_joint_positions" in info else {}
     )
+
     env_processor.reset()
     action_processor.reset()
 
@@ -708,7 +710,7 @@ def control_loop(
         episode_step += 1
 
         # Handle episode termination
-        if terminated or truncated:
+        if terminated :
             episode_time = time.perf_counter() - episode_start_time
             logging.info(
                 f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
