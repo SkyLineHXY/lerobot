@@ -359,6 +359,10 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
 
         # spacemouse 模式下的夹爪宽度跟踪（STAY 时保持上一帧值）
         last_gripper_width = cfg.gripper_width_max_m
+        # 期望末端位姿积分变量：从 T_desired 叠加增量，而非从 T_curr 叠加。
+        # 这确保阻抗弹性力 = Kx*(T_desired - T_curr) ≠ 0，外力拖拽会被弹回。
+        # 每次开始新 episode 采集时重置为 None，首帧从当前观测初始化。
+        T_desired: np.ndarray | None = None
 
         with VideoEncodingManager(dataset):
             while saved_episodes < cfg.dataset.num_episodes and not stop_requested:
@@ -399,13 +403,16 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                             dataset.meta.total_frames,
                         )
                         # 保存完成后自动回 home，为下一个 episode 做准备
+                        T_desired = None  # 重置积分变量，下一 episode 重新从当前位姿初始化
                         if teleop_device is not None and saved_episodes < cfg.dataset.num_episodes:
                             _go_home_and_restart_cartesian(robot)
                     elif key == "r":
                         collecting = False
+                        T_desired = None  # 重置积分变量
                         dataset.clear_episode_buffer()
                         log_say("Clear episode buffer", cfg.play_sounds)
                         logger.info("Current episode buffer cleared.")
+                        _go_home_and_restart_cartesian(robot)
                     elif key == "q":
                         stop_requested = True
                         collecting = False
@@ -422,6 +429,7 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     teleop_events = teleop_device.get_teleop_events()
                     if teleop_events.get(TeleopEvents.RERECORD_EPISODE, False):
                         collecting = False
+                        T_desired = None  # 重置积分变量
                         dataset.clear_episode_buffer()
                         log_say("Clear episode buffer (spacemouse)", cfg.play_sounds)
                         logger.info("SpaceMouse 触发重录：已清空当前 episode 缓冲。")
@@ -441,10 +449,14 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     # SpaceMouse 闭环驱动：delta EE → absolute EE pose
                     delta = teleop_device.get_action()
 
-                    # 从当前观测构造 SE(3) 参考位姿
+                    # 从当前观测构造当前位姿（仅用于首帧初始化 T_desired）
                     pos = np.array([obs_processed[k] for k in ("ee_pose.x", "ee_pose.y", "ee_pose.z")])
                     rvec = np.array([obs_processed[k] for k in ("ee_pose.rx", "ee_pose.ry", "ee_pose.rz")])
                     T_curr = pose_xyz_rotvec_to_se3(pos, rvec)
+
+                    # episode 首帧：以当前实际位姿初始化积分变量
+                    if T_desired is None:
+                        T_desired = T_curr.copy()
 
                     # SpaceMouse 输出的 6-DoF 增量（已缩放，单位：米/弧度）
                     dx = float(delta.get("delta_x", 0.0))
@@ -454,14 +466,16 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     dp = float(delta.get("delta_pitch", 0.0))
                     dyw = float(delta.get("delta_yaw", 0.0))
 
-                    # 积分到目标绝对位姿：
+                    # 从 T_desired（而非 T_curr）积分到新目标位姿：
                     #   平移 —— 直接在基坐标系中叠加，保证"向上拨杆=臂向上运动"
                     #   旋转 —— 在末端坐标系（body frame）中右乘，保证绕夹爪自身轴旋转
-                    R_curr = T_curr[:3, :3]
+                    # 阻抗弹性力 = Kx*(T_desired - T_curr)，外力拖拽时 ≠ 0，可抵抗外扰。
+                    R_desired = T_desired[:3, :3]
                     R_delta = R.from_rotvec([dr, dp, dyw]).as_matrix()
                     T_target = np.eye(4)
-                    T_target[:3, :3] = R_curr @ R_delta  # 末端坐标系旋转增量
-                    T_target[:3, 3] = T_curr[:3, 3] + np.array([dx, dy, dz])  # 基坐标系平移增量
+                    T_target[:3, :3] = R_desired @ R_delta
+                    T_target[:3, 3] = T_desired[:3, 3] + np.array([dx, dy, dz])
+                    T_desired = T_target  # 更新积分状态
                     pose6 = se3_to_xyz_rotvec(T_target)
 
                     action_dict = {key: float(pose6[i]) for i, key in enumerate(EE_POSE_KEYS)}
@@ -523,10 +537,8 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
 
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
-
         if dataset is not None:
             dataset.finalize()
-
         # 关闭 Cartesian 控制器后再断开连接（polymetis 要求）
         if teleop_device is not None and robot.is_connected:
             if hasattr(robot, "terminate_policy"):
