@@ -28,6 +28,10 @@ from lerobot.teleoperators.spacemouse.configuration_spacemouse import SpaceMouse
 from lerobot.teleoperators.spacemouse.teleop_spacemouse import SpaceMouseTeleop
 from lerobot.teleoperators.utils import TeleopEvents
 
+# SpaceMouse 运动干预的归一化幅度死区阈值（约为 ee_step_size 的 1%）。
+# 低于此值视为噪声/静止，is_intervention=False，policy 自主执行。
+_INTERVENTION_THRESHOLD = 0.01
+
 
 class SpaceMouseInterventionWrapper(gym.Wrapper):
     """用 SpaceMouse 遥操作器替代 gym_hil 内置 Gamepad/Keyboard 的干预包装器。
@@ -74,18 +78,32 @@ class SpaceMouseInterventionWrapper(gym.Wrapper):
         return obs, info
 
     def step(self, action):
+        action = np.array(action, dtype=np.float32)
+
         # get_teleop_events 须先于 get_action 调用：
         # get_action 会更新 _prev_buttons，若先调用则同帧内边沿检测全部失效
         events = self._teleop.get_teleop_events()
         teleop_dict = self._teleop.get_action()
 
-        # 仿真中 SpaceMouse 始终驱动运动，无需按键激活
         dx_norm = np.clip(teleop_dict.get("delta_x", 0.0) / self._ee_step_size[0], -1.0, 1.0)
         dy_norm = np.clip(teleop_dict.get("delta_y", 0.0) / self._ee_step_size[1], -1.0, 1.0)
         dz_norm = np.clip(teleop_dict.get("delta_z", 0.0) / self._ee_step_size[2], -1.0, 1.0)
         # gripper: 0=合 / 1=保持 / 2=开，EEActionWrapper 内部转为 [-1,1]
         gripper = float(teleop_dict.get("gripper", 1.0))
-        action = np.array([dx_norm, dy_norm, dz_norm, gripper], dtype=np.float32)
+
+        # 以 SpaceMouse 是否有实质性输入判断是否处于干预状态：
+        # 归一化运动幅度超过死区阈值，或夹爪处于非保持状态（按键被按下）。
+        # HIL-RL 中 SpaceMouse 静止时 is_intervention=False，policy 自主执行；
+        # 主动操作或按下夹爪键时 is_intervention=True，SpaceMouse 接管动作。
+        is_intervention = (
+            abs(dx_norm) > _INTERVENTION_THRESHOLD
+            or abs(dy_norm) > _INTERVENTION_THRESHOLD
+            or abs(dz_norm) > _INTERVENTION_THRESHOLD
+            or gripper != 1.0
+        )
+
+        if is_intervention:
+            action = np.array([dx_norm, dy_norm, dz_norm, gripper], dtype=np.float32)
 
         obs, reward, terminated, truncated, info = self.env.step(action)
 
@@ -101,8 +119,7 @@ class SpaceMouseInterventionWrapper(gym.Wrapper):
             else:
                 logging.info("Episode manually ended: FAILURE")
 
-        # SpaceMouse 始终为干预控制状态
-        info["is_intervention"] = True
+        info["is_intervention"] = is_intervention
         info["teleop_action"] = action
         info["rerecord_episode"] = rerecord
 
