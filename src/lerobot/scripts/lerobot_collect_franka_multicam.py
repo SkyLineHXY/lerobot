@@ -1,7 +1,6 @@
 """Interactive FrankaMultiCam dataset collection.
 
 This script uses the same FrankaMultiCam robot interface and LeRobot v3 dataset
-schema as ``lerobot_record_franka_multicam.py``, but exposes a manual collection
 workflow:
     c      start / resume collection
     space  pause collection
@@ -467,13 +466,13 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     dyw = float(delta.get("delta_yaw", 0.0))
 
                     # 从 T_desired（而非 T_curr）积分到新目标位姿：
-                    #   平移 —— 直接在基坐标系中叠加，保证"向上拨杆=臂向上运动"
-                    #   旋转 —— 在末端坐标系（body frame）中右乘，保证绕夹爪自身轴旋转
+                    #   平移 —— 直接在世界坐标系中叠加，保证"向上拨杆=臂向上运动"
+                    #   旋转 —— 在世界坐标系（world frame）中左乘，SpaceMouse 各轴始终对应世界固定轴
                     # 阻抗弹性力 = Kx*(T_desired - T_curr)，外力拖拽时 ≠ 0，可抵抗外扰。
                     R_desired = T_desired[:3, :3]
                     R_delta = R.from_rotvec([dr, dp, dyw]).as_matrix()
                     T_target = np.eye(4)
-                    T_target[:3, :3] = R_desired @ R_delta
+                    T_target[:3, :3] = R_delta @ R_desired
                     T_target[:3, 3] = T_desired[:3, 3] + np.array([dx, dy, dz])
                     T_desired = T_target  # 更新积分状态
                     pose6 = se3_to_xyz_rotvec(T_target)
