@@ -50,7 +50,11 @@ class SpaceMouseInterventionWrapper(gym.Wrapper):
     ):
         super().__init__(env)
         if spacemouse_config is None:
-            spacemouse_config = SpaceMouseTeleopConfig()
+            # 仿真默认按键布局：左键(0)=夹爪合，右键(1)=夹爪开，无需按键激活运动
+            spacemouse_config = SpaceMouseTeleopConfig(
+                gripper_open_button=1,
+                gripper_close_button=0,
+            )
 
         self._teleop = SpaceMouseTeleop(spacemouse_config)
         self._teleop.connect()
@@ -66,21 +70,18 @@ class SpaceMouseInterventionWrapper(gym.Wrapper):
         return obs, info
 
     def step(self, action):
-        action = np.array(action, dtype=np.float32)
-
-        teleop_dict = self._teleop.get_action()
+        # get_teleop_events 须先于 get_action 调用：
+        # get_action 会更新 _prev_buttons，若先调用则同帧内边沿检测全部失效
         events = self._teleop.get_teleop_events()
+        teleop_dict = self._teleop.get_action()
 
-        is_intervention = bool(events.get(TeleopEvents.IS_INTERVENTION, False))
-
-        if is_intervention:
-            # 米制增量 → EEActionWrapper 期望的 [-1, 1] 归一化值
-            dx_norm = np.clip(teleop_dict.get("delta_x", 0.0) / self._ee_step_size[0], -1.0, 1.0)
-            dy_norm = np.clip(teleop_dict.get("delta_y", 0.0) / self._ee_step_size[1], -1.0, 1.0)
-            dz_norm = np.clip(teleop_dict.get("delta_z", 0.0) / self._ee_step_size[2], -1.0, 1.0)
-            # gripper: 0=合 / 1=保持 / 2=开，EEActionWrapper 内部转为 [-1,1]
-            gripper = float(teleop_dict.get("gripper", 1.0))
-            action = np.array([dx_norm, dy_norm, dz_norm, gripper], dtype=np.float32)
+        # 仿真中 SpaceMouse 始终驱动运动，无需按键激活
+        dx_norm = np.clip(teleop_dict.get("delta_x", 0.0) / self._ee_step_size[0], -1.0, 1.0)
+        dy_norm = np.clip(teleop_dict.get("delta_y", 0.0) / self._ee_step_size[1], -1.0, 1.0)
+        dz_norm = np.clip(teleop_dict.get("delta_z", 0.0) / self._ee_step_size[2], -1.0, 1.0)
+        # gripper: 0=合 / 1=保持 / 2=开，EEActionWrapper 内部转为 [-1,1]
+        gripper = float(teleop_dict.get("gripper", 1.0))
+        action = np.array([dx_norm, dy_norm, dz_norm, gripper], dtype=np.float32)
 
         obs, reward, terminated, truncated, info = self.env.step(action)
 
@@ -96,7 +97,8 @@ class SpaceMouseInterventionWrapper(gym.Wrapper):
             else:
                 logging.info("Episode manually ended: FAILURE")
 
-        info["is_intervention"] = is_intervention
+        # SpaceMouse 始终为干预控制状态
+        info["is_intervention"] = True
         info["teleop_action"] = action
         info["rerecord_episode"] = rerecord
 
