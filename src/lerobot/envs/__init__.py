@@ -13,3 +13,4 @@
 # limitations under the License.
 
 from .configs import AlohaEnv, EnvConfig, HubEnvConfig, PushtEnv  # noqa: F401
+from . import gym_hil_spacemouse  # noqa: F401

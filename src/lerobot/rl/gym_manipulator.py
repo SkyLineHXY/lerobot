@@ -26,6 +26,7 @@ import torch
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.envs import gym_hil_spacemouse  # noqa: F401  触发 SpaceMouse env 注册
 from lerobot.envs.configs import HILSerlRobotEnvConfig
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import (
@@ -312,21 +313,35 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     """
     # Check if this is a GymHIL simulation environment
     if cfg.name == "gym_hil":
-        assert cfg.robot is None and cfg.teleop is None, "GymHIL environment does not support robot or teleop"
+        assert cfg.robot is None, "GymHIL 仿真环境不支持真实机器人配置"
+        # spacemouse 模式下允许 cfg.teleop 为 SpaceMouseTeleopConfig；其余情况不需要 teleop
+        if cfg.processor.control_mode != "spacemouse":
+            assert cfg.teleop is None, "GymHIL 仿真环境（非 spacemouse 模式）不支持 teleop 配置"
         import gym_hil  # noqa: F401
 
         # Extract gripper settings with defaults
         use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
         gripper_penalty = cfg.processor.gripper.gripper_penalty if cfg.processor.gripper is not None else 0.0
 
-        env = gym.make(
-            f"gym_hil/{cfg.task}",
-            image_obs=True,
-            render_mode="human",
-            use_gripper=use_gripper,
-            gripper_penalty=gripper_penalty,
-            use_gamepad=True if cfg.processor.control_mode == "gamepad" else False,
-        )
+        if cfg.processor.control_mode == "spacemouse":
+            # 使用 SpaceMouse 作为干预设备，cfg.teleop 为 SpaceMouseTeleopConfig（可为 None）
+            env = gym.make(
+                f"gym_hil/{cfg.task}",
+                image_obs=True,
+                render_mode="human",
+                use_gripper=use_gripper,
+                gripper_penalty=gripper_penalty,
+                spacemouse_config=cfg.teleop,
+            )
+        else:
+            env = gym.make(
+                f"gym_hil/{cfg.task}",
+                image_obs=True,
+                render_mode="human",
+                use_gripper=use_gripper,
+                gripper_penalty=gripper_penalty,
+                use_gamepad=cfg.processor.control_mode == "gamepad",
+            )
 
         return env, None
 
