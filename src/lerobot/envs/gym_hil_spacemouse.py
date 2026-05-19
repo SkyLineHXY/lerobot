@@ -50,10 +50,14 @@ class SpaceMouseInterventionWrapper(gym.Wrapper):
     ):
         super().__init__(env)
         if spacemouse_config is None:
-            # 仿真默认按键布局：左键(0)=夹爪合，右键(1)=夹爪开，无需按键激活运动
+            # 仿真默认按键布局：左键(0)=夹爪合，右键(1)=夹爪开。
+            # terminate_button/intervention_button 设为越界索引(99)，_safe_button 越界返回 0，
+            # 边沿检测永不成立，避免与夹爪按键冲突导致误终止 episode。
             spacemouse_config = SpaceMouseTeleopConfig(
                 gripper_open_button=1,
                 gripper_close_button=0,
+                intervention_button=99,
+                terminate_button=99,
             )
 
         self._teleop = SpaceMouseTeleop(spacemouse_config)

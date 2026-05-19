@@ -685,7 +685,7 @@ def control_loop(
         # Create a neutral action (no movement)
         neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
         if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([0.0])])  # Gripper stay
+            neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay (1=保持, 0=合, 2=开)
 
         # Use the new step function
         transition = step_env_and_process_transition(
