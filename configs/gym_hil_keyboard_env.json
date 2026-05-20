@@ -1,0 +1,34 @@
+{
+    "env": {
+        "name": "gym_hil",
+        "task": "PandaPickCubeKeyboard-v0",
+        "fps": 30,
+        "type": "gym_manipulator",
+        "robot": null,
+        "teleop": null,
+        "processor": {
+            "control_mode": "keyboard",
+            "gripper": {
+                "use_gripper": true,
+                "gripper_penalty": -0.02
+            },
+            "reset": {
+                "fixed_reset_joint_positions": [0.0, 0.195, 0.0, -2.43, 0.0, 2.62, 0.785],
+                "reset_time_s": 100.0,
+                "control_time_s": 0,
+                "terminate_on_success": false
+            }
+        }
+    },
+    "dataset": {
+        "repo_id": "gym_hil/franka_sim_pick_lift",
+        "root": "/home/zzq/lerobot/datasets/gym_hil/franka_sim_pick_lift_keyboard",
+        "task": "PandaPickCubeKeyboard-v0",
+        "num_episodes_to_record": 30,
+        "replay_episode": 0,
+        "push_to_hub": false
+
+    },
+    "mode": "record",
+    "device": "cuda"
+}

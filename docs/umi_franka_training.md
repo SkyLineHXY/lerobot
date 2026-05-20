@@ -22,16 +22,21 @@
 
 ### UMI t₀ 约定（sample-relative）
 
-UMI 论文的关键设计：每次推理窗口的 **最后一帧观测** 作为当前 t₀，动作 chunk 是相对于此时刻 EE 位姿的增量序列。
+UMI 论文的关键设计：每次推理窗口的 **最后一帧观测** 作为当前 t₀，整个动作 chunk（chunk_size 步）共用同一个 t₀，每一步是相对此参考的增量。
 
 ```
-t₀ = 推理时刻机器人 EE 当前位姿（滑动刷新，非 episode 固定值）
-Δ_k = inv(W_T_F(t₀)) @ W_T_F(t₀ + k·dt)
+t₀ = 当次推理时（采集 obs 的时刻）EE 法兰世界位姿（每个 chunk 刷新一次，chunk 内固定）
+Δ_k = inv(W_T_F(t₀)) @ W_T_F(t₀ + k·dt)        for k = 0, 1, ..., chunk_size-1
 ```
 
 **训练/推理必须保持一致**：
-- 训练时：`apply_umi_sample_relative_transform` 将数据集绝对位姿转为 sample-relative
-- 推理时：每步 `capture_t0()` 刷新参考系，策略输出直接作为 delta_k 使用
+- 训练时：`apply_umi_sample_relative_transform` 取 `umi_pose[..., -1, :]`（最后一帧 obs）
+  作为整个 chunk 的统一 base，把数据集绝对位姿转为 sample-relative。
+- 推理时：每收到一个新 chunk 调用一次 `capture_t0()`（`t0_mode=per_chunk`），chunk 内
+  所有动作都用同一个 t₀；策略输出 7D `[pos3, rotvec3, gripper]` 直接作为 Δ_k 使用。
+
+> **不要使用 `per_step`**：每步刷新 t₀ 等价于把策略当成 chunk_size=1 来执行，与训练
+> 时 chunk_size=30/50 的分布严重不符；只有 `per_chunk` 才与训练 collate 一致。
 
 ### world_flange 数据集格式
 
@@ -42,7 +47,7 @@ t₀ = 推理时刻机器人 EE 当前位姿（滑动刷新，非 episode 固定
 | `observation.umi_pose` | 6D | `[pos_x_W, pos_y_W, pos_z_W, rotvec_x_W, rotvec_y_W, rotvec_z_W]`（同一帧绝对位姿，供 sample-relative processor 使用） |
 | `observation.images.camera0` | H×W×3 | RGB 图像（鱼眼中心镜头） |
 
-> **旧格式（ee_at_t0_flange）**：action/state 均为 8D `[pos_xyz, quat_xyzw, gripper]`，以 episode 首帧为固定 t₀。新项目推荐使用 world_flange 格式。
+[//]: # (> **旧格式（ee_at_t0_flange）**：action/state 均为 8D `[pos_xyz, quat_xyzw, gripper]`，以 episode 首帧为固定 t₀。新项目推荐使用 world_flange 格式。)
 
 ### 坐标系关系
 
@@ -80,7 +85,7 @@ sample-relative action chunk（7D）→ ACT/Diffusion 训练
      │
      ▼ 策略检查点
      │
-FrankaUMIClient + per_step t₀ 刷新 → 真机推理
+FrankaUMIClient + per_chunk t₀ 刷新 → 真机推理
 ```
 
 ---
@@ -341,7 +346,7 @@ python franka_umi_async_client.py \
     --server_address <GPU_IP>:8081 \
     --robot.robot_ip 192.168.1.104 \
     --robot.camera_extrinsic_yaml_path /home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml \
-    --t0_mode per_step \
+    --t0_mode per_chunk \
     --reference ee_at_t0 \
     --use_gripper \
     --fps 15 \
@@ -352,10 +357,23 @@ python franka_umi_async_client.py \
 
 | 参数 | 推荐值 | 说明 |
 |---|---|---|
-| `--t0_mode` | `per_step` | 每步刷新 t₀，与 world_flange 数据集对齐 |
+| `--t0_mode` | `per_chunk` | 每收到一个新 chunk 刷新 t₀；chunk 内固定，与训练 collate 一致 |
 | `--reference` | `ee_at_t0` | world_flange 格式策略输出的 delta 解释方式 |
 | `--fps` | 15 | 控制循环频率，应低于数据集录制帧率 |
 | `--actions_per_chunk` | 50 | 每次从动作队列取出并执行的步数 |
+
+**`t0_mode` 三种模式对比**：
+
+| 模式 | 行为 | 与训练对齐 | 何时使用 |
+|---|---|---|---|
+| `per_chunk`（默认，推荐） | 收到新 chunk 时 capture_t0()，chunk 内所有动作共用此 t₀ | ✅ 与训练 collate（取 `umi_pose[-1]` 作 base）一致 | world_flange 数据集训练的策略 |
+| `per_step` | 每一步执行前 capture_t0() | ❌ 等效 chunk_size=1，分布不符 | 仅用于诊断或专门为 chunk_size=1 训练的策略 |
+| `per_episode` | episode 开头捕获一次后固定 | ❌ 退化为固定参考 | 仅用于 episode-level 固定 t₀ 的旧数据集（已废弃） |
+
+> **时序备注**：`per_chunk` 在 chunk 到达客户端时才 capture_t0()，相对于服务端推理使用的
+> obs 时刻有一个 ~RTT 的延迟。如需消除此漂移，可改造客户端使其在 `control_loop_observation`
+> 中采集 obs 时同步保存 t₀ 快照并与 `TimedObservation.timestep` 绑定，对应 chunk 返回后查表
+> 取出 t₀。此为更严格的 UMI 实现，需扩展 `TimedAction` 携带 source timestep。
 
 **空跑验证**（不执行运动）：
 
@@ -393,33 +411,58 @@ camera_transform:
 
 ### 策略只在起始位置小幅晃动
 
-**根因**：训练时 t₀ 约定与推理不一致（episode-level vs sample-level）。
+**根因**：训练时 t₀ 约定与推理不一致（episode-level vs sample-level，或 chunk-level vs step-level）。
 
 **排查**：
 1. 确认数据集使用 `--pose-format=world_flange` 生成（action 首帧不应全为 0）
 2. 确认训练 DataLoader 中调用了 `apply_umi_sample_relative_transform`
-3. 确认推理时 `t0_mode=per_step`
+3. 确认推理时 `t0_mode=per_chunk`（不要用 `per_step` 或 `per_episode`）
+4. 确认 `--reference=ee_at_t0`（world_flange 训练的策略输出 7D `[pos3, rotvec3, gripper]`，
+   解释为 Δ_k 后由 `T_BE_target = T_BE_t0 @ Δ_k` 转回基座系目标位姿）
 
-### 回放姿态发散
+### KeyError: 'gripper' / 'pos_x_W'（policy_server 启动后第一次推理）
 
-**根因**：常见两个原因。
+**根因**：客户端 `get_umi_observation()` 返回的 dict key 与 `umi_observation_features`
+中各 feature 的 `names` 列表不一致，服务端 `build_dataset_frame` 按 names 抽取时报错。
 
-1. `world_flange` 绝对位姿被当成 delta 直接发送（坐标系混用）
-2. 循环体未解析当前帧位姿（`_row_to_se3_and_gripper` 调用缺失）
+**排查**：
+1. 检查 `FrankaGenGripper.get_umi_observation()` 返回的是**扁平的原始 key**
+   （`"gripper"`、`"pos_x_W"` 等），**不是**已组装的数据集 key
+   （`"observation.state"`、`"observation.umi_pose"`）。
+2. 检查 `FrankaGenGripper.umi_observation_features` 中 `observation.umi_pose` 的
+   `names` 与数据集（`mcap_to_lerobotv3.py`）一致：
+   `["pos_x_W", "pos_y_W", "pos_z_W", "rotvec_x_W", "rotvec_y_W", "rotvec_z_W"]`。
 
-**排查**：使用 `--dry-run` 检查首帧输出，`pos` 应全为 `[0.0, 0.0, 0.0]`（episode-relative delta 的首帧等于单位变换）。
+[//]: # (### 回放姿态发散)
 
-### `TypeError: only 0-dimensional arrays can be converted to Python scalars`
+[//]: # ()
+[//]: # (**根因**：常见两个原因。)
 
-**根因**：LeRobot 将 `shape=(1,)` 特征映射为 HF 标量 `Value`，传入 `np.array([x])` 会失败。
+[//]: # ()
+[//]: # (1. `world_flange` 绝对位姿被当成 delta 直接发送（坐标系混用）)
 
-**修复**：传入 numpy 标量 `np.float32(x)` 而非 1D 数组。
+[//]: # (2. 循环体未解析当前帧位姿（`_row_to_se3_and_gripper` 调用缺失）)
 
-参见 `lerobot/datasets/utils.py:581`：`shape == (1,)` → `datasets.Value(dtype=...)`.
+[//]: # ()
+[//]: # (**排查**：使用 `--dry-run` 检查首帧输出，`pos` 应全为 `[0.0, 0.0, 0.0]`（episode-relative delta 的首帧等于单位变换）。)
 
-### `'camera_transform' key not found`
+[//]: # ()
+[//]: # (### `TypeError: only 0-dimensional arrays can be converted to Python scalars`)
 
-手眼标定 YAML 格式不正确，确保顶层键为 `camera_transform`，子键包含 `translation`、`rotation`、`parent_frame`、`child_frame`。
+[//]: # ()
+[//]: # (**根因**：LeRobot 将 `shape=&#40;1,&#41;` 特征映射为 HF 标量 `Value`，传入 `np.array&#40;[x]&#41;` 会失败。)
+
+[//]: # ()
+[//]: # (**修复**：传入 numpy 标量 `np.float32&#40;x&#41;` 而非 1D 数组。)
+
+[//]: # ()
+[//]: # (参见 `lerobot/datasets/utils.py:581`：`shape == &#40;1,&#41;` → `datasets.Value&#40;dtype=...&#41;`.)
+
+[//]: # ()
+[//]: # (### `'camera_transform' key not found`)
+
+[//]: # ()
+[//]: # (手眼标定 YAML 格式不正确，确保顶层键为 `camera_transform`，子键包含 `translation`、`rotation`、`parent_frame`、`child_frame`。)
 
 ### 推理帧率低于目标
 

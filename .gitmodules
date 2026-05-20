@@ -1,0 +1,3 @@
+[submodule "src/lerobot/robots/gen_gripper/gen_con_sdk_python_release"]
+	path = src/lerobot/robots/gen_gripper/gen_con_sdk_python_release
+	url = https://github.com/genrobot-ai/gen_con_sdk_python_release.git
