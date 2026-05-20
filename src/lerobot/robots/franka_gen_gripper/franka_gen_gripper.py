@@ -122,18 +122,18 @@ class FrankaGenGripper(Robot):
         except Exception as e:
             raise ConnectionError(f"Franka connection failed: {e}") from e
 
-        # # Then connect UMI gripper
-        try:
-            self._gripper.connect(calibrate=calibrate)
-            logger.info("UMI gripper connected.")
-        except Exception as e:
-            # Roll back franka connection on gripper failure
-            logger.warning(f"Gripper connection failed: {e}, disconnecting Franka ...")
-            try:
-                self._franka.disconnect()
-            except Exception:
-                pass
-            raise ConnectionError(f"Gripper connection failed: {e}") from e
+        # Then connect UMI gripper
+        # try:
+        #     self._gripper.connect(calibrate=calibrate)
+        #     logger.info("UMI gripper connected.")
+        # except Exception as e:
+        #     # Roll back franka connection on gripper failure
+        #     logger.warning(f"Gripper connection failed: {e}, disconnecting Franka ...")
+        #     try:
+        #         self._franka.disconnect()
+        #     except Exception:
+        #         pass
+        #     raise ConnectionError(f"Gripper connection failed: {e}") from e
 
         logger.info("Franka + UMI gripper system ready.")
 
@@ -334,49 +334,47 @@ class FrankaGenGripper(Robot):
         return self.send_action(action)
 
     # ------------------------------------------------------------------
-    # UMI 数据集格式接口（与 pick_and_place 数据集 info.json 对齐）
+    # UMI 数据集格式接口
     # ------------------------------------------------------------------
 
     @property
     def umi_observation_features(self) -> dict[str, dict]:
-        """返回与数据集对齐的 lerobot_features（8D quat + camera0）。"""
+        """返回与数据集对齐的 lerobot_features（gripper 状态 + EE 位姿 + 多摄像头）。"""
         h = self.config.gripper_camera_height
         w = self.config.gripper_camera_width
-        return {
+        features = {
             "observation.state": {
                 "dtype": "float32",
-                "shape": (8,),
-                "names": ["pos_x", "pos_y", "pos_z",
-                          "quat_x", "quat_y", "quat_z", "quat_w",
-                          "gripper"],
+                "shape": (1,),
+                "names": ["gripper"],
             },
-            "observation.images.camera0": {
+            "observation.umi_pose": {
+                "dtype": "float32",
+                "shape": (6,),
+                "names": ["x", "y", "z", "rx", "ry", "rz"],
+            },
+        }
+        for i in range(self.config.gripper_camera_count):
+            features[f"observation.images.camera{i}"] = {
                 "dtype": "image",
                 "shape": (h, w, 3),
                 "names": ["height", "width", "channels"],
-            },
-        }
+            }
+        return features
 
     def get_umi_observation(self) -> dict[str, Any]:
-        """返回数据集格式观测（旋转向量 → 四元数，key 与数据集 info.json 一致）。"""
-        from scipy.spatial.transform import Rotation
-
+        """返回数据集格式观测（key 与 umi_observation_features 一致）。"""
         raw = self.get_observation()
         pos = np.array([raw["ee_pose.x"], raw["ee_pose.y"], raw["ee_pose.z"]])
         rotvec = np.array([raw["ee_pose.rx"], raw["ee_pose.ry"], raw["ee_pose.rz"]])
-        quat_xyzw = Rotation.from_rotvec(rotvec).as_quat()  # scipy 默认 xyzw
 
-        return {
-            "pos_x": float(pos[0]),
-            "pos_y": float(pos[1]),
-            "pos_z": float(pos[2]),
-            "quat_x": float(quat_xyzw[0]),
-            "quat_y": float(quat_xyzw[1]),
-            "quat_z": float(quat_xyzw[2]),
-            "quat_w": float(quat_xyzw[3]),
-            "gripper": float(raw.get("gripper.pos", 0.0)),
-            "camera0": raw.get("camera0"),
+        obs: dict[str, Any] = {
+            "observation.state": np.array([raw.get("gripper.pos", 0.0)], dtype=np.float32),
+            "observation.umi_pose": np.concatenate([pos, rotvec]).astype(np.float32),
         }
+        for i in range(self.config.gripper_camera_count):
+            obs[f"observation.images.camera{i}"] = raw.get(f"camera{i}")
+        return obs
 
     def capture_t0(self) -> None:
         """捕获当前法兰位姿作为 UMI t₀ 参考点（线程安全）。"""
