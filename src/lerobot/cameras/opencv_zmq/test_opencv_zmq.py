@@ -289,11 +289,8 @@ def test_local_publish():
 def test_remote_smoke():
     """remote 模式：连接服务端 → 实时预览（按 q 退出）→ 断开。"""
     import time
-
     import cv2
-
     from lerobot.cameras.opencv_zmq import OpenCVZmqCamera, OpenCVZmqCameraConfig
-
     cfg = OpenCVZmqCameraConfig(
         index_or_path=0,
         mode="remote",
@@ -306,7 +303,10 @@ def test_remote_smoke():
         width=640,
         height=480,
     )
+    cam = OpenCVZmqCamera(cfg)
+
     with OpenCVZmqCamera(cfg) as cam:
+        cam.connect(warmup=True)
         assert cam.is_connected
         win = f"OpenCV ZMQ Remote {_REMOTE_HOST}:{_REMOTE_PORT} - press Q to quit"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)

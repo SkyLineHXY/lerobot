@@ -62,7 +62,7 @@ class WallXConfig(PreTrainedConfig):
 
     # Attention Implementation, options: "eager", "flash_attention_2", "sdpa"
     # NOTE: flash-attn==2.7.4.post1 is required for flash_attention_2 implementation
-    attn_implementation: str = "eager"
+    attn_implementation: str = "flash_attention_2"
 
     # ==================== Optimizer Presets ====================
     optimizer_lr: float = 2e-5

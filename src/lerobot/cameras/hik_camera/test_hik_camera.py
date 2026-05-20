@@ -28,7 +28,7 @@ import pytest
 
 _HAVE_LOCAL = os.environ.get("HIK_CAMERA_DEVICE", "") not in ("", "0")
 _HAVE_REMOTE = bool(os.environ.get("HIK_CAMERA_REMOTE_HOST", ""))
-_REMOTE_HOST = os.environ.get("HIK_CAMERA_REMOTE_HOST", "127.0.0.1")
+_REMOTE_HOST = os.environ.get("HIK_CAMERA_REMOTE_HOST", "172.20.10.2")
 _REMOTE_PORT = int(os.environ.get("HIK_CAMERA_REMOTE_PORT", "4243"))
 
 
@@ -191,12 +191,11 @@ def test_remote_smoke():
         fps=30,
         wire_encoding="jpeg",
         jpeg_quality=90,
-        width=1920,
-        height=1080,
+        width=640,
+        height=480,
     )
     with HikCamera(cfg) as cam:
         assert cam.is_connected
-
         win = f"HIK Remote {_REMOTE_HOST}:{_REMOTE_PORT} - press Q to quit"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
@@ -236,4 +235,14 @@ def test_remote_smoke():
 
 
 if __name__ == "__main__":
-    test_local_connect_read_disconnect()
+    test_remote_smoke()
+
+# from lerobot.cameras.hik_camera import HikCamera, HikCameraConfig
+#
+# cfg = HikCameraConfig(
+#     mode="remote", host="172.20.10.2", port=4243, topic="hik",
+#     fps=30
+# )
+# with HikCamera(cfg) as cam:
+#     for i in range(100):
+#         frame = cam.read()   # (720, 1280, 3) uint8 BGR numpy array

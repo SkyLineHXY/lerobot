@@ -22,11 +22,9 @@ from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
     is_torchdynamo_compiling,
     logging,
-    replace_return_docstrings,
-)
+    replace_return_docstrings,)
 
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 
@@ -153,6 +151,19 @@ class Qwen2_5_VLPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        这一个 `.view()` 操作做了什么？它将内存上**连续的 4 个** patch token 的特征向量直接拼接成一个长向量：
+        拼接前（4个相邻 patch，每个维度 d）：
+        ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+        │patch_0  │ │patch_1  │ │patch_2  │ │patch_3  │
+        │ [d]     │ │ [d]     │ │ [d]     │ │ [d]     │
+        └─────────┘ └─────────┘ └─────────┘ └─────────┘
+        拼接后（1个合并 token，维度 4d）：
+        ┌─────────────────────────────────────────┐
+        │  patch_0 | patch_1 | patch_2 | patch_3  │
+        │              [4d]                       │
+        └─────────────────────────────────────────┘
+        """
         x = self.mlp(self.ln_q(x).view(-1, self.hidden_size))
         return x
 
@@ -445,6 +456,8 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
 
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        # RoPE编码的目标维度是attention中的Q和K，qkv的形状如下：
+        # q, k, v  →  [seq_len, num_heads, head_dim]
 
         self.blocks = nn.ModuleList(
             [Qwen2_5_VLVisionBlock(config, config._attn_implementation) for _ in range(config.depth)]

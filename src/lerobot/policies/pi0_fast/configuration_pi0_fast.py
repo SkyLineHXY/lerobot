@@ -26,7 +26,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 DEFAULT_IMAGE_SIZE = 224
 
 
-@PreTrainedConfig.register_subclass("pi0_fast")
+#@PreTrainedConfig.register_subclass("pi0_fast")
 @dataclass
 class PI0FastConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"

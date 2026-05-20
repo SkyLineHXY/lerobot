@@ -34,7 +34,7 @@ class SpaceMouseTeleopConfig(TeleoperatorConfig):
     """是否在动作向量中暴露旋转通道（delta_roll/pitch/yaw）。
     RL 管线只读 dx/dy/dz[/gripper]，故默认关闭；真机采集时可置 True。"""
 
-    position_scale: float = 0.003
+    position_scale: float = 0.009
     """位移缩放因子（米/tick），将 SpaceMouse 归一化值 [-1,1] 映射到物理增量。"""
 
     orientation_scale: float = 0.02

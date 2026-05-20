@@ -123,17 +123,17 @@ class FrankaGenGripper(Robot):
             raise ConnectionError(f"Franka connection failed: {e}") from e
 
         # Then connect UMI gripper
-        # try:
-        #     self._gripper.connect(calibrate=calibrate)
-        #     logger.info("UMI gripper connected.")
-        # except Exception as e:
-        #     # Roll back franka connection on gripper failure
-        #     logger.warning(f"Gripper connection failed: {e}, disconnecting Franka ...")
-        #     try:
-        #         self._franka.disconnect()
-        #     except Exception:
-        #         pass
-        #     raise ConnectionError(f"Gripper connection failed: {e}") from e
+        try:
+            self._gripper.connect(calibrate=calibrate)
+            logger.info("UMI gripper connected.")
+        except Exception as e:
+            # Roll back franka connection on gripper failure
+            logger.warning(f"Gripper connection failed: {e}, disconnecting Franka ...")
+            try:
+                self._franka.disconnect()
+            except Exception:
+                pass
+            raise ConnectionError(f"Gripper connection failed: {e}") from e
 
         logger.info("Franka + UMI gripper system ready.")
 
@@ -339,7 +339,11 @@ class FrankaGenGripper(Robot):
 
     @property
     def umi_observation_features(self) -> dict[str, dict]:
-        """返回与数据集对齐的 lerobot_features（gripper 状态 + EE 位姿 + 多摄像头）。"""
+        """返回与数据集（mcap_to_lerobotv3.py world_flange 格式）对齐的 lerobot_features。
+
+        names 与数据集严格一致；服务端 build_dataset_frame 会按这些 names
+        从 get_umi_observation() 返回的原始 key-value 字典中提取并组装。
+        """
         h = self.config.gripper_camera_height
         w = self.config.gripper_camera_width
         features = {
@@ -351,7 +355,10 @@ class FrankaGenGripper(Robot):
             "observation.umi_pose": {
                 "dtype": "float32",
                 "shape": (6,),
-                "names": ["x", "y", "z", "rx", "ry", "rz"],
+                "names": [
+                    "pos_x_W", "pos_y_W", "pos_z_W",
+                    "rotvec_x_W", "rotvec_y_W", "rotvec_z_W",
+                ],
             },
         }
         for i in range(self.config.gripper_camera_count):
@@ -363,17 +370,26 @@ class FrankaGenGripper(Robot):
         return features
 
     def get_umi_observation(self) -> dict[str, Any]:
-        """返回数据集格式观测（key 与 umi_observation_features 一致）。"""
-        raw = self.get_observation()
-        pos = np.array([raw["ee_pose.x"], raw["ee_pose.y"], raw["ee_pose.z"]])
-        rotvec = np.array([raw["ee_pose.rx"], raw["ee_pose.ry"], raw["ee_pose.rz"]])
+        """返回原始硬件级 key-value，供服务端 build_dataset_frame 按 names 组装。
 
+        key 必须与 umi_observation_features 中各 feature 的 names 列表一致：
+            - 'gripper'                              → observation.state
+            - 'pos_x_W' / 'pos_y_W' / 'pos_z_W'      → observation.umi_pose 前 3 维
+            - 'rotvec_x_W' / 'rotvec_y_W' / 'rotvec_z_W' → observation.umi_pose 后 3 维
+            - 'camera{i}'                            → observation.images.camera{i}
+        """
+        raw = self.get_observation()
         obs: dict[str, Any] = {
-            "observation.state": np.array([raw.get("gripper.pos", 0.0)], dtype=np.float32),
-            "observation.umi_pose": np.concatenate([pos, rotvec]).astype(np.float32),
+            "gripper": float(raw.get("gripper.pos", 0.0)),
+            "pos_x_W": float(raw["ee_pose.x"]),
+            "pos_y_W": float(raw["ee_pose.y"]),
+            "pos_z_W": float(raw["ee_pose.z"]),
+            "rotvec_x_W": float(raw["ee_pose.rx"]),
+            "rotvec_y_W": float(raw["ee_pose.ry"]),
+            "rotvec_z_W": float(raw["ee_pose.rz"]),
         }
         for i in range(self.config.gripper_camera_count):
-            obs[f"observation.images.camera{i}"] = raw.get(f"camera{i}")
+            obs[f"camera{i}"] = raw.get(f"camera{i}")
         return obs
 
     def capture_t0(self) -> None:

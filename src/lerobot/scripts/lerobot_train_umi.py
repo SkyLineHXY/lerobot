@@ -41,8 +41,6 @@
         --umi_transform=false
 """
 
-from __future__ import annotations
-
 import dataclasses
 import logging
 import time
@@ -151,7 +149,6 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # 单步更新（与 lerobot_train.py 完全相同，便于独立使用）
 # ──────────────────────────────────────────────────────────────────────────────
-
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,

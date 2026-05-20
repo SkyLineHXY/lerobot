@@ -105,7 +105,7 @@ class AddBatchDimensionObservationStep(ObservationProcessorStep):
             if state_key in observation:
                 state_value = observation[state_key]
                 if isinstance(state_value, Tensor) and state_value.dim() == 1:
-                    observation[state_key] = state_value.unsqueeze(0)
+                    observation[state_key] = state_value.unsqueeze(1)
 
         # Process single image observation - add batch dim if 3D
         if OBS_IMAGE in observation:

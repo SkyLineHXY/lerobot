@@ -153,10 +153,12 @@ def visualize_dataset(
                     rr.log(f"{ACTION}/{dim_idx}", rr.Scalars(val.item()))
 
             # display each dimension of observed state space (e.g. agent position in joint space)
+            # if OBS_STATE in batch:
+            #     for dim_idx, val in enumerate(batch[OBS_STATE][i]):
+            #         rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
             if OBS_STATE in batch:
-                for dim_idx, val in enumerate(batch[OBS_STATE][i]):
-                    rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
-
+                for dim_idx, val in enumerate(batch['observation.umi_pose'][i]):
+                        rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))
 
@@ -279,11 +281,19 @@ def main():
         help="If set, display compressed images in Rerun instead of uncompressed ones.",
     )
 
+    parser.add_argument(
+        "--video-backend",
+        type=str,
+        default=None,
+        help="Video decoding backend: 'torchcodec' (default when available) or 'pyav'. Use 'pyav' if torchcodec fails to load.",
+    )
+
     args = parser.parse_args()
     kwargs = vars(args)
     repo_id = kwargs.pop("repo_id")
     root = kwargs.pop("root")
     tolerance_s = kwargs.pop("tolerance_s")
+    video_backend = kwargs.pop("video_backend")
 
     if kwargs["ws_port"] is not None:
         logging.warning(
@@ -294,7 +304,7 @@ def main():
 
     init_logging()
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
+    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s, video_backend=video_backend)
 
     visualize_dataset(dataset, **vars(args))
 

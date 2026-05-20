@@ -127,7 +127,7 @@ class FrankaInterfaceClient:
         grasp_width: float = 0.0,
         epsilon_inner: float = -1.0,
         epsilon_outer: float = -1.0,
-        blocking: bool = True,
+        blocking: bool = False,
     ):
         """控制夹爪执行抓取动作"""
         self.server.gripper_grasp(speed, force, grasp_width, epsilon_inner, epsilon_outer, blocking)
@@ -366,7 +366,7 @@ if __name__ == "__main__":
     import time
 
     parser = argparse.ArgumentParser(description="Franka Interface Client — Communication & Tracking Tests")
-    parser.add_argument("--ip", default="192.168.110.17", help="NUC IP address")
+    parser.add_argument("--ip", default="172.20.10.2", help="NUC IP address")
     parser.add_argument("--port", type=int, default=4242, help="zerorpc port")
     parser.add_argument("--test", default="all",
                         choices=["all", "latency", "throughput", "consistency",
@@ -384,44 +384,9 @@ if __name__ == "__main__":
     client = FrankaInterfaceClient(ip=args.ip, port=args.port)
     print(f"  joint positions: {np.round(client.robot_get_joint_positions(), 4).tolist()}")
     print(f"  ee pose:         {np.round(client.robot_get_ee_pose(), 4).tolist()}")
-
-    run_all = args.test == "all"
-
-    # --- Communication tests ---
-    if run_all or args.test == "latency":
-        test_rpc_latency(client, n=200)
-
-    if run_all or args.test == "throughput":
-        test_throughput(client, duration=5.0)
-
-    if run_all or args.test == "consistency":
-        test_observation_consistency(client, n=100, hz=args.hz)
-
-    # --- Action tracking tests ---
-    if run_all or args.test == "track_joint":
-        amp = args.amplitude if args.amplitude is not None else 5.0
-        log_t, log_cmd, log_actual = test_action_tracking_joint(
-            client, amplitude_deg=amp, freq=args.freq,
-            duration=args.duration, control_hz=args.hz,
-        )
-        if args.save_csv:
-            save_tracking_csv("track_joint.csv", log_t, log_cmd, log_actual, label="joint4_rad")
-        # Return to home after joint test
-        print("  Returning to home ...")
-        client.robot_go_home()
-
-    if run_all or args.test == "track_cartesian":
-        amp = (args.amplitude / 1000) if args.amplitude is not None else 0.03
-        log_t, log_cmd, log_actual = test_action_tracking_cartesian(
-            client, amplitude_m=amp, freq=args.freq,
-            duration=args.duration, control_hz=args.hz,
-        )
-        if args.save_csv:
-            save_tracking_csv("track_cartesian.csv", log_t, log_cmd, log_actual, label="y_m")
-        print("  Returning to home ...")
-        client.robot_go_home()
-
-    print(f"\n{'='*60}")
-    print("  All tests done.")
-    print(f"{'='*60}")
+    print(f"  gripper state:   {client.gripper_get_state()}")
+    client.robot_go_home()
+    client.gripper_grasp(speed=50.0, force=0.1)
+    time.sleep(5)
+    print(f"  gripper state:   {client.gripper_get_state()}")
     client.close()

@@ -223,7 +223,7 @@ if __name__ == "__main__":
         gripper_ip=args.gripper_ip,
         gripper_port=args.gripper_port,
     )
-    # server.robot_go_home()
+    server.robot_go_home()
     print(server.robot_get_ee_pose())
 
     if args.go_home:

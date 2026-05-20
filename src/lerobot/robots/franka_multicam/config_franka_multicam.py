@@ -28,7 +28,7 @@ class FrankaMultiCamConfig(RobotConfig):
         )
     """
 
-    robot_ip: str = "192.168.172.252"
+    robot_ip: str = "172.20.10.2"
     """Franka NUC 的 IP 地址。"""
 
     robot_port: int = 4242

@@ -29,7 +29,8 @@ OPENCV_PORTS="${OPENCV_PORTS:-4244,4245,4246}"
 OPENCV_TOPICS="${OPENCV_TOPICS:-cam_top,cam_left,cam_right}"
 OPENCV_WIDTH="${OPENCV_WIDTH:-640}"
 OPENCV_HEIGHT="${OPENCV_HEIGHT:-480}"
-OPENCV_FPS="${OPENCV_FPS:-30}"
+OPENCV_FPS="${OPENCV_FPS:-15}"
+OPENCV_FOURCC="${OPENCV_FOURCC:-MJPG}"
 OPENCV_WIRE_ENCODING="${OPENCV_WIRE_ENCODING:-jpeg}"
 OPENCV_JPEG_QUALITY="${OPENCV_JPEG_QUALITY:-90}"
 
@@ -45,13 +46,21 @@ HIK_JPEG_QUALITY="${HIK_JPEG_QUALITY:-90}"
 HIK_SERVER_DIR="${HIK_SERVER_DIR:-$(cd "$(dirname "$0")/../src/lerobot/cameras/hik_camera" && pwd)}"
 
 # franka_interface_server（需 --with-franka）
-FRANKA_CONDA_ENV="${FRANKA_CONDA_ENV:-polymetis-local}"
-FRANKA_SERVER_PY="${FRANKA_SERVER_PY:-$(cd "$(dirname "$0")/.." && pwd)/src/lerobot/robots/franka/franka_interface_server.py}"
-FRANKA_BIND="${FRANKA_BIND:-0.0.0.0}"       # zerorpc 绑定地址
-FRANKA_PORT="${FRANKA_PORT:-4242}"           # zerorpc 端口
-FRANKA_ROBOT_IP="${FRANKA_ROBOT_IP:-localhost}"    # Polymetis robot server IP
-FRANKA_ROBOT_PORT="${FRANKA_ROBOT_PORT:-50051}"    # Polymetis robot server 端口
-FRANKA_GO_HOME="${FRANKA_GO_HOME:-0}"        # 1 = 启动后执行 go_home
+#FRANKA_CONDA_ENV="${FRANKA_CONDA_ENV:-polymetis-local}"
+#FRANKA_SERVER_PY="${FRANKA_SERVER_PY:-$(cd "$(dirname "$0")/.." && pwd)/src/lerobot/robots/franka/franka_interface_server.py}"
+#POLYMETIS_SCRIPTS_DIR="${POLYMETIS_SCRIPTS_DIR:-$HOME/fairo/polymetis/polymetis/python/scripts}"
+#POLYMETIS_LAUNCH_ROBOT_PY="${POLYMETIS_LAUNCH_ROBOT_PY:-$POLYMETIS_SCRIPTS_DIR/launch_robot.py}"
+#POLYMETIS_LAUNCH_GRIPPER_PY="${POLYMETIS_LAUNCH_GRIPPER_PY:-$POLYMETIS_SCRIPTS_DIR/launch_gripper.py}"
+#POLYMETIS_ROBOT_CLIENT="${POLYMETIS_ROBOT_CLIENT:-franka_hardware}"
+#POLYMETIS_GRIPPER_CLIENT="${POLYMETIS_GRIPPER_CLIENT:-franka_hand}"
+#POLYMETIS_WAIT_TIMEOUT="${POLYMETIS_WAIT_TIMEOUT:-60}"
+#FRANKA_BIND="${FRANKA_BIND:-172.20.10.2}"       # zerorpc 绑定地址
+#FRANKA_PORT="${FRANKA_PORT:-4242}"           # zerorpc 端口
+#FRANKA_ROBOT_IP="${FRANKA_ROBOT_IP:-localhost}"    # Polymetis robot server IP
+#FRANKA_ROBOT_PORT="${FRANKA_ROBOT_PORT:-50051}"    # Polymetis robot server 端口
+#FRANKA_GRIPPER_IP="${FRANKA_GRIPPER_IP:-$FRANKA_ROBOT_IP}"  # Polymetis gripper server IP
+#FRANKA_GRIPPER_PORT="${FRANKA_GRIPPER_PORT:-50052}"         # Polymetis gripper server 端口
+#FRANKA_GO_HOME="${FRANKA_GO_HOME:-0}"        # 1 = 启动后执行 go_home
 
 # ─────────────────────────────────────────────────────────────
 # 命令行 flag 解析
@@ -78,11 +87,13 @@ done
 # 工具函数
 # ─────────────────────────────────────────────────────────────
 PIDS=()
+LOG_FILES=()
 
 log()   { echo "[$(date '+%H:%M:%S')] $*"; }
 err()   { echo "[$(date '+%H:%M:%S')] [ERROR] $*" >&2; }
 
 cleanup() {
+    trap - SIGINT SIGTERM EXIT
     log "收到退出信号，关闭所有子进程…"
     # 先杀记录的 PID，再 kill 0（清理所有同进程组的子孙进程）
     for pid in "${PIDS[@]}"; do
@@ -111,9 +122,9 @@ start_bg() {
     "$@" >"$logfile" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
+    LOG_FILES+=("$logfile")
     log "  PID=$pid"
 }
-
 # ─────────────────────────────────────────────────────────────
 # 前置检查
 # ─────────────────────────────────────────────────────────────
@@ -165,6 +176,7 @@ for i in "${!_devs[@]}"; do
             --width    "$OPENCV_WIDTH" \
             --height   "$OPENCV_HEIGHT" \
             --fps      "$OPENCV_FPS" \
+            --fourcc   "$OPENCV_FOURCC" \
             --wire-encoding   "$OPENCV_WIRE_ENCODING" \
             --jpeg-quality    "$OPENCV_JPEG_QUALITY"
 done
@@ -198,58 +210,113 @@ if [[ "$ENABLE_HIK" -eq 1 ]]; then
             --jpeg-quality '$HIK_JPEG_QUALITY'"
 fi
 
-# ─────────────────────────────────────────────────────────────
-# 启动 franka_interface_server（--with-franka）
-# ─────────────────────────────────────────────────────────────
-if [[ "$ENABLE_FRANKA" -eq 1 ]]; then
-    log "━━━ Franka Interface Server ━━━"
-    echo -n "    输入 yes 继续，或按 Ctrl+C 取消："
-    read -r _confirm
-    if [[ "$_confirm" != "yes" ]]; then
-        log "已取消启动 Franka server。"
-        ENABLE_FRANKA=0
-    else
-        if [[ ! -f "$FRANKA_SERVER_PY" ]]; then
-            err "未找到 franka_interface_server.py：$FRANKA_SERVER_PY"
-            exit 1
-        fi
-
-        # 在 polymetis conda 环境中启动
-        CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
-        if [[ ! -f "$CONDA_SH" ]]; then
-            CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
-        fi
-        if [[ ! -f "$CONDA_SH" ]]; then
-            err "找不到 conda.sh，请手动设置 CONDA_SH 环境变量"
-            exit 1
-        fi
-
-        # 检查 Polymetis gRPC 服务是否已就绪（launch_robot.py 需提前在 polymetis-local 环境中启动）
-        log "检查 Polymetis gRPC 服务（${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT}）…"
-        if ! bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
-            python -c \"from polymetis.utils.grpc_utils import check_server_exists; \
-            exit(0 if check_server_exists('${FRANKA_ROBOT_IP}', ${FRANKA_ROBOT_PORT}) else 1)\"" 2>/dev/null; then
-            err "Polymetis gRPC 服务未就绪（${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT}）！"
-            err "请先在 polymetis-local 环境中执行："
-            err "  launch_robot.py robot_client=franka_hardware"
-            err "  launch_gripper.py gripper=franka_hand"
-            exit 1
-        fi
-        log "Polymetis 服务已就绪 ✓"
-
-        _go_home_flag=""
-        [[ "$FRANKA_GO_HOME" -eq 1 ]] && _go_home_flag="--go-home"
-
-        start_bg "franka_server" \
-            bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
-                python '$FRANKA_SERVER_PY' \
-                    --bind '$FRANKA_BIND' \
-                    --port '$FRANKA_PORT' \
-                    --robot-ip '$FRANKA_ROBOT_IP' \
-                    --robot-port '$FRANKA_ROBOT_PORT' \
-                    ${_go_home_flag}"
-    fi
-fi
+## ─────────────────────────────────────────────────────────────
+## 启动 franka_interface_server（--with-franka）
+## ─────────────────────────────────────────────────────────────
+#if [[ "$ENABLE_FRANKA" -eq 1 ]]; then
+#    log "━━━ Franka Interface Server ━━━"
+#    echo -n "    输入 yes 继续，或按 Ctrl+C 取消："
+#    read -r _confirm
+#    if [[ "$_confirm" != "yes" ]]; then
+#        log "已取消启动 Franka server。"
+#        ENABLE_FRANKA=0
+#    else
+#        if [[ ! -f "$FRANKA_SERVER_PY" ]]; then
+#            err "未找到 franka_interface_server.py：$FRANKA_SERVER_PY"
+#            exit 1
+#        fi
+#        if [[ ! -f "$POLYMETIS_LAUNCH_ROBOT_PY" ]]; then
+#            err "未找到 launch_robot.py：$POLYMETIS_LAUNCH_ROBOT_PY"
+#            exit 1
+#        fi
+#        if [[ ! -f "$POLYMETIS_LAUNCH_GRIPPER_PY" ]]; then
+#            err "未找到 launch_gripper.py：$POLYMETIS_LAUNCH_GRIPPER_PY"
+#            exit 1
+#        fi
+#
+#        # 在 polymetis conda 环境中启动
+#        CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
+#        if [[ ! -f "$CONDA_SH" ]]; then
+#            CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
+#        fi
+#        if [[ ! -f "$CONDA_SH" ]]; then
+#            err "找不到 conda.sh，请手动设置 CONDA_SH 环境变量"
+#            exit 1
+#        fi
+#
+#        if ! check_polymetis_robot_interface "$CONDA_SH" "$FRANKA_ROBOT_IP" "$FRANKA_ROBOT_PORT"; then
+#            log "Polymetis robot gRPC 未运行，准备自动启动（${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT}）…"
+#            if check_polymetis_tcp_server "$CONDA_SH" "$FRANKA_ROBOT_IP" "$FRANKA_ROBOT_PORT"; then
+#                err "端口 ${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT} 已打开，但 RobotInterface 不可用。"
+#                err "这通常是旧的/stale Polymetis run_server 占用了端口，或 launch_robot.py 仍在异常启动中。"
+#                err "请先停止旧的 Polymetis 进程后重试；可检查：ps -ef | grep -E 'launch_robot|run_server|franka_panda'"
+#                exit 1
+#            else
+#                log "预先获取 sudo 权限（launch_robot.py 需要 real-time 模式）…"
+#                sudo -v
+#                start_bg "polymetis_robot" \
+#                    bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
+#                        cd '$POLYMETIS_SCRIPTS_DIR' && \
+#                        python '$POLYMETIS_LAUNCH_ROBOT_PY' \
+#                            robot_client='$POLYMETIS_ROBOT_CLIENT' \
+#                            ip='$FRANKA_ROBOT_IP' \
+#                            port='$FRANKA_ROBOT_PORT'"
+#            fi
+#            if ! wait_for_polymetis_interface "$CONDA_SH" "robot" "Polymetis robot 服务" "$FRANKA_ROBOT_IP" "$FRANKA_ROBOT_PORT" "$POLYMETIS_WAIT_TIMEOUT"; then
+#                err "请检查日志：$LOG_DIR/polymetis_robot.log"
+#                exit 1
+#            fi
+#        else
+#            log "Polymetis robot 服务已在运行，跳过启动 ✓"
+#        fi
+#
+#        if ! check_polymetis_gripper_interface "$CONDA_SH" "$FRANKA_GRIPPER_IP" "$FRANKA_GRIPPER_PORT"; then
+#            log "Polymetis gripper gRPC 未运行，准备自动启动（${FRANKA_GRIPPER_IP}:${FRANKA_GRIPPER_PORT}）…"
+#            if check_polymetis_tcp_server "$CONDA_SH" "$FRANKA_GRIPPER_IP" "$FRANKA_GRIPPER_PORT"; then
+#                err "端口 ${FRANKA_GRIPPER_IP}:${FRANKA_GRIPPER_PORT} 已打开，但 GripperInterface 不可用。"
+#                err "请先停止旧的 Polymetis gripper 进程后重试；可检查：ps -ef | grep -E 'launch_gripper|franka_hand'"
+#                exit 1
+#            else
+#                start_bg "polymetis_gripper" \
+#                    bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
+#                        cd '$POLYMETIS_SCRIPTS_DIR' && \
+#                        python '$POLYMETIS_LAUNCH_GRIPPER_PY' \
+#                            gripper='$POLYMETIS_GRIPPER_CLIENT' \
+#                            ip='$FRANKA_GRIPPER_IP' \
+#                            port='$FRANKA_GRIPPER_PORT'"
+#            fi
+#            if ! wait_for_polymetis_interface "$CONDA_SH" "gripper" "Polymetis gripper 服务" "$FRANKA_GRIPPER_IP" "$FRANKA_GRIPPER_PORT" "$POLYMETIS_WAIT_TIMEOUT"; then
+#                err "请检查日志：$LOG_DIR/polymetis_gripper.log"
+#                exit 1
+#            fi
+#        else
+#            log "Polymetis gripper 服务已在运行，跳过启动 ✓"
+#        fi
+#
+#        if ! check_polymetis_robot_interface "$CONDA_SH" "$FRANKA_ROBOT_IP" "$FRANKA_ROBOT_PORT"; then
+#            err "Polymetis robot gRPC 服务未就绪（${FRANKA_ROBOT_IP}:${FRANKA_ROBOT_PORT}）！"
+#            exit 1
+#        fi
+#        if ! check_polymetis_gripper_interface "$CONDA_SH" "$FRANKA_GRIPPER_IP" "$FRANKA_GRIPPER_PORT"; then
+#            err "Polymetis gripper gRPC 服务未就绪（${FRANKA_GRIPPER_IP}:${FRANKA_GRIPPER_PORT}）！"
+#            exit 1
+#        fi
+#
+#        _go_home_flag=""
+#        [[ "$FRANKA_GO_HOME" -eq 1 ]] && _go_home_flag="--go-home"
+#
+#        start_bg "franka_server" \
+#            bash -c "source '$CONDA_SH' && conda activate '$FRANKA_CONDA_ENV' && \
+#                python '$FRANKA_SERVER_PY' \
+#                    --bind '$FRANKA_BIND' \
+#                    --port '$FRANKA_PORT' \
+#                    --robot-ip '$FRANKA_ROBOT_IP' \
+#                    --robot-port '$FRANKA_ROBOT_PORT' \
+#                    --gripper-ip '$FRANKA_GRIPPER_IP' \
+#                    --gripper-port '$FRANKA_GRIPPER_PORT' \
+#                    ${_go_home_flag}"
+#    fi
+#fi
 
 # ─────────────────────────────────────────────────────────────
 # 等待并串流日志
@@ -270,10 +337,11 @@ for pid in "${PIDS[@]}"; do
 done
 log "$alive / ${#PIDS[@]} 个进程存活"
 
-# tail -F 串流所有日志直到收到退出信号
-# shellcheck disable=SC2046
-tail -F $(ls "$LOG_DIR"/*.log 2>/dev/null) &
-PIDS+=($!)
+# tail -F 串流本次启动的日志直到收到退出信号
+if [[ "${#LOG_FILES[@]}" -gt 0 ]]; then
+    tail -F "${LOG_FILES[@]}" &
+    PIDS+=($!)
+fi
 
 # 主循环：持续检查进程是否全部存活
 while true; do

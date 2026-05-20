@@ -346,13 +346,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset-root", type=Path, required=True,
         help="LeRobot v3 dataset root (must contain meta/info.json and data/).",
     )
-    p.add_argument("--episode", type=int, default=0, help="Episode index to replay.")
+    p.add_argument("--episode", type=int, default=1, help="Episode index to replay.")
     p.add_argument("--start-frame", type=int, default=0, help="First frame to play (inclusive).")
     p.add_argument("--end-frame", type=int, default=None, help="Last frame to play (exclusive).")
     p.add_argument("--fps", type=float, default=20, help="Override dataset FPS.")
 
     # Robot connection
-    p.add_argument("--robot-ip", default="192.168.110.17")
+    p.add_argument("--robot-ip", default="192.168.172.134")
     p.add_argument("--robot-port", type=int, default=4242)
     p.add_argument("--gripper-side", default="left", choices=["left", "right"])
     p.add_argument("--gripper-serial-port", default=None,

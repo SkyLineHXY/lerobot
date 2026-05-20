@@ -224,15 +224,15 @@ log "    日志: ${LOG_DIR}/franka_interface_server.log"
 _go_home_flag=""
 [[ "$FRANKA_GO_HOME" -eq 1 ]] && _go_home_flag="--go-home"
 
-python "$FRANKA_INTERFACE_SERVER" \
-    --bind         "$FRANKA_BIND" \
-    --port         "$FRANKA_PORT" \
-    --robot-ip     "$ROBOT_IP" \
-    --robot-port   "$ROBOT_PORT" \
-    --gripper-ip   "$GRIPPER_IP" \
-    --gripper-port "$GRIPPER_PORT" \
-    ${_go_home_flag} \
-    >"${LOG_DIR}/franka_interface_server.log" 2>&1 &
+python "$FRANKA_INTERFACE_SERVER"
+#    --bind         "$FRANKA_BIND" \
+#    --port         "$FRANKA_PORT" \
+#    --robot-ip     "$ROBOT_IP" \
+#    --robot-port   "$ROBOT_PORT" \
+#    --gripper-ip   "$GRIPPER_IP" \
+#    --gripper-port "$GRIPPER_PORT" \
+#    ${_go_home_flag} \
+#    >"${LOG_DIR}/franka_interface_server.log" 2>&1 &
 IFACE_PID=$!
 
 wait_for_log_pattern \

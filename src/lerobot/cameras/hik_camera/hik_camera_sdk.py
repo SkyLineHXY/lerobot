@@ -7,16 +7,16 @@ from typing import Any
 
 import numpy as np
 
-from .MvImport.CameraParams_const import MV_GIGE_DEVICE, MV_USB_DEVICE
-from .MvImport.CameraParams_header import (
+from MvImport.CameraParams_const import MV_GIGE_DEVICE, MV_USB_DEVICE
+from MvImport.CameraParams_header import (
     MV_CC_DEVICE_INFO,
     MV_CC_DEVICE_INFO_LIST,
     MV_CC_PIXEL_CONVERT_PARAM,
     MV_FRAME_OUT_INFO_EX,
     MVCC_INTVALUE,
 )
-from .MvImport.MvCameraControl_class import MvCamera
-from .MvImport.MvErrorDefine_const import (
+from MvImport.MvCameraControl_class import MvCamera
+from MvImport.MvErrorDefine_const import (
     MV_E_ABNORMAL_IMAGE,
     MV_E_BUFOVER,
     MV_E_GC_TIMEOUT,
@@ -25,7 +25,7 @@ from .MvImport.MvErrorDefine_const import (
     MV_E_PARAMETER,
     MV_E_RESOURCE,
 )
-from .MvImport.PixelType_header import (
+from MvImport.PixelType_header import (
     PixelType_Gvsp_BayerBG8,
     PixelType_Gvsp_BayerGB8,
     PixelType_Gvsp_BayerGR8,

@@ -346,7 +346,7 @@ class ReplayBuffer:
         Yields:
             BatchTransition: A batch sampled from the replay buffer.
         """
-        import queue
+        import rl_queue
         import threading
 
         data_queue: queue.Queue = queue.Queue(maxsize=queue_size)

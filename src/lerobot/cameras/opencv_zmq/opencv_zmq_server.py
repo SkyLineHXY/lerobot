@@ -18,7 +18,7 @@ import time
 import cv2
 from numpy.typing import NDArray
 
-from .._zmq_utils import ZMQFramePublisher
+from lerobot.cameras._zmq_utils import ZMQFramePublisher
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ class OpenCVZmqServer:
         width: int | None = None,
         height: int | None = None,
         fps: float | None = None,
+        fourcc: str | None = None,
         wire_encoding: str = "jpeg",
         jpeg_quality: int = 90,
     ) -> None:
@@ -48,6 +49,7 @@ class OpenCVZmqServer:
         self._width = width
         self._height = height
         self._fps = fps
+        self._fourcc = fourcc
         self._wire_encoding = wire_encoding
         self._jpeg_quality = jpeg_quality
         self._cap: cv2.VideoCapture | None = None
@@ -59,6 +61,8 @@ class OpenCVZmqServer:
         if not self._cap.isOpened():
             raise ConnectionError(f"无法打开摄像头: {self._device}")
 
+        if self._fourcc is not None:
+            self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self._fourcc))
         if self._width is not None:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
         if self._height is not None:
@@ -69,7 +73,9 @@ class OpenCVZmqServer:
         actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
-        logger.info("摄像头已打开: %dx%d @ %.1f fps", actual_w, actual_h, actual_fps)
+        actual_fourcc_code = int(self._cap.get(cv2.CAP_PROP_FOURCC))
+        actual_fourcc = "".join(chr((actual_fourcc_code >> 8 * i) & 0xFF) for i in range(4))
+        logger.info("摄像头已打开: %dx%d @ %.1f fps fourcc=%s", actual_w, actual_h, actual_fps, actual_fourcc)
 
     def bind(self, host: str, port: int, topic: str) -> None:
         """创建 ZMQ PUB socket 并绑定地址。"""
@@ -125,13 +131,14 @@ class OpenCVZmqServer:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OpenCV ZMQ PUB 服务端（运行于 NUC）")
-    p.add_argument("--device", default="0", help="摄像头设备索引或路径（默认 0）")
+    p.add_argument("--device", default="6", help="摄像头设备索引或路径（默认 0）")
     p.add_argument("--bind", default="0.0.0.0", help="绑定地址（默认 0.0.0.0）")
     p.add_argument("--port", type=int, default=4244, help="PUB 端口（默认 4244）")
     p.add_argument("--topic", default="opencv", help="PUB topic 字符串（默认 opencv）")
     p.add_argument("--fps", type=float, default=30.0, help="目标帧率（默认 30）")
     p.add_argument("--width", type=int, default=640, help="输出宽度（默认 640）")
     p.add_argument("--height", type=int, default=480, help="输出高度（默认 480）")
+    p.add_argument("--fourcc", default=None, help="OpenCV/V4L2 FOURCC，例如 MJPG 或 YUYV（默认自动）")
     p.add_argument(
         "--wire-encoding",
         default="jpeg",
@@ -154,6 +161,7 @@ if __name__ == "__main__":
         width=args.width,
         height=args.height,
         fps=args.fps,
+        fourcc=args.fourcc,
         wire_encoding=args.wire_encoding,
         jpeg_quality=args.jpeg_quality,
     )

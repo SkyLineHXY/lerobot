@@ -461,10 +461,11 @@ def collect(cfg: CollectFrankaMultiCamConfig) -> LeRobotDataset:
                     dx = float(delta.get("delta_x", 0.0))
                     dy = float(delta.get("delta_y", 0.0))
                     dz = float(delta.get("delta_z", 0.0))
-                    dr = float(delta.get("delta_roll", 0.0))
-                    dp = float(delta.get("delta_pitch", 0.0))
+                    # dr = float(delta.get("delta_roll", 0.0))
+                    # dp = float(delta.get("delta_pitch", 0.0))
                     dyw = float(delta.get("delta_yaw", 0.0))
-
+                    dp = 0
+                    dr = 0
                     # 从 T_desired（而非 T_curr）积分到新目标位姿：
                     #   平移 —— 直接在世界坐标系中叠加，保证"向上拨杆=臂向上运动"
                     #   旋转 —— 在世界坐标系（world frame）中左乘，SpaceMouse 各轴始终对应世界固定轴

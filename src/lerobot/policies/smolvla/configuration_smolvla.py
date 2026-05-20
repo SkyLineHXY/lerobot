@@ -29,8 +29,8 @@ from lerobot.utils.constants import OBS_IMAGES
 class SmolVLAConfig(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 50
-    n_action_steps: int = 50
+    chunk_size: int = 30
+    n_action_steps: int = 30
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -69,8 +69,8 @@ class SmolVLAConfig(PreTrainedConfig):
     use_cache: bool = True
 
     # Finetuning settings
-    freeze_vision_encoder: bool = True
-    train_expert_only: bool = True
+    freeze_vision_encoder: bool = False
+    train_expert_only: bool = False
     train_state_proj: bool = True
 
     # Training presets

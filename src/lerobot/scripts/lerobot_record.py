@@ -103,17 +103,15 @@ from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_openarm_follower,
-    bi_so_follower,
+    bi_so100_follower,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
     make_robot_from_config,
-    omx_follower,
-    openarm_follower,
     reachy2,
-    so_follower,
-    unitree_g1 as unitree_g1_robot,
+    so100_follower,
+    franka_multicam,
+    franka_gen_gripper
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
@@ -128,7 +126,6 @@ from lerobot.teleoperators import (  # noqa: F401
     openarm_mini,
     reachy2_teleoperator,
     so_leader,
-    unitree_g1,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR

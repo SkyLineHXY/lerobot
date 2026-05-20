@@ -295,6 +295,7 @@ class FrankaUMIClient(RobotClient):
         if len(a) == 7:
             # world_flange / sample-relative 格式：7D pos+rotvec+gripper
             pos, rotvec, gripper_width = a[0:3], a[3:6], float(a[6])
+            rotvec = [0.0, 0.0, 0.0]
             delta_k = pose_xyz_rotvec_to_se3(pos, rotvec)
         else:
             # legacy 格式：8D pos+quat+gripper
