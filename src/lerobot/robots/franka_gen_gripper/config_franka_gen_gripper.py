@@ -25,6 +25,12 @@ class FrankaGenGripperConfig(RobotConfig):
     gripper_enable_tactile: bool = False
     gripper_encoder_freq: float = 30.0
 
+    # ---- 立体相机图像裁切配置 ----
+    # 是否对 camera1/camera2 做中心裁切（与 mcap_to_lerobotv3.py --stereo-crop 行为一致）
+    stereo_crop: bool = False
+    # 裁切后保留的比例（0 < ratio ≤ 1），裁切后 resize 到 gripper_camera_height/width
+    stereo_crop_ratio: float = 0.75
+
     # ---- UMI ee6d 坐标变换配置 ----
     # hand-eye 标定 YAML（parent_frame: panda_link8, child_frame: camera_color_optical_frame）
     camera_extrinsic_yaml_path: Optional[str] = '/home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml'

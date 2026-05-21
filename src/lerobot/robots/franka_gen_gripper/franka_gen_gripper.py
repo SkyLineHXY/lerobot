@@ -3,6 +3,7 @@ import threading
 from functools import cached_property
 from typing import Any
 
+import cv2
 import numpy as np
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -24,6 +25,32 @@ logger = logging.getLogger(__name__)
 
 # UMI ee6d → base reference modes accepted by ``send_umi_action``.
 UMI_REFERENCE_MODES = ("camera_t0", "ee_at_t0", "abs_pos_world_rot")
+
+
+def _prepare_camera_img(img: np.ndarray, h: int, w: int, crop_ratio: float = 1.0) -> np.ndarray:
+    """中心裁切（可选）→ resize → BGR 转 RGB。
+
+    与 mcap_to_lerobotv3.py 中 _prepare_img 的行为完全一致，确保推理端
+    与训练数据预处理对齐。
+
+    Args:
+        img:        原始 BGR 帧（来自 OpenCV VideoCapture）。
+        h:          目标高度。
+        w:          目标宽度。
+        crop_ratio: 保留图像中心区域的比例（1.0 表示不裁切）。
+    """
+    if crop_ratio < 1.0:
+        ih, iw = img.shape[:2]
+        ch = int(ih * crop_ratio)
+        cw = int(iw * crop_ratio)
+        y0 = (ih - ch) // 2
+        x0 = (iw - cw) // 2
+        img = img[y0:y0 + ch, x0:x0 + cw]
+    if img.shape[0] != h or img.shape[1] != w:
+        img = cv2.resize(img, (w, h))
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 class FrankaGenGripper(Robot):
@@ -388,8 +415,16 @@ class FrankaGenGripper(Robot):
             "rotvec_y_W": float(raw["ee_pose.ry"]),
             "rotvec_z_W": float(raw["ee_pose.rz"]),
         }
+        h = self.config.gripper_camera_height
+        w = self.config.gripper_camera_width
+        stereo_ratio = self.config.stereo_crop_ratio if self.config.stereo_crop else 1.0
         for i in range(self.config.gripper_camera_count):
-            obs[f"camera{i}"] = raw.get(f"camera{i}")
+            frame = raw.get(f"camera{i}")
+            if frame is not None:
+                # camera1/camera2 为立体相机，按配置做中心裁切；camera0 仅做 BGR→RGB
+                crop_ratio = stereo_ratio if i > 0 else 1.0
+                frame = _prepare_camera_img(frame, h, w, crop_ratio=crop_ratio)
+            obs[f"camera{i}"] = frame
         return obs
 
     def capture_t0(self) -> None:
