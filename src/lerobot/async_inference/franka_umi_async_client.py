@@ -72,7 +72,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options
 
-from src.lerobot.async_inference.configs import get_aggregate_function
+from configs import get_aggregate_function
 from helpers import (
     FPSTracker,
     RemotePolicyConfig,
@@ -129,6 +129,28 @@ class FrankaUMIClientConfig:
         metadata={"help": "[已废弃] 请改用 t0_mode='per_chunk'。保留用于向后兼容。"},
     )
 
+    # ---- 系统偏置（SE3 右乘，补偿 TCP 标定误差）----
+    action_pos_bias: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0],
+        metadata={
+            "help": (
+                "动作位置系统偏置 [x, y, z]（单位 m）。"
+                "以 delta_k 右乘方式应用：T_target = T_t0 @ delta_k @ T_bias，"
+                "等效于补偿工具坐标系下的 TCP 标定偏移（如法兰-夹爪距离误差），"
+                "不影响 policy 的相对运动语义。"
+            )
+        },
+    )
+    action_rotvec_bias: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0],
+        metadata={
+            "help": (
+                "动作旋转系统偏置 [rx, ry, rz]（旋转向量格式，单位 rad）。"
+                "与 action_pos_bias 共同构成 SE3 右乘偏置矩阵。"
+            )
+        },
+    )
+
     # ---- 控制 ----
     fps: float = field(default=15.0, metadata={"help": "控制循环目标帧率"})
     chunk_size_threshold: float = field(
@@ -171,7 +193,6 @@ class FrankaUMIClient(RobotClient):
 
     prefix = "franka_umi_async_client"
     logger = get_logger("franka_umi_async_client")
-
     def __init__(self, cfg: FrankaUMIClientConfig):
         # 不调用 RobotClient.__init__（其内部使用 make_robot_from_config），
         # 手动复制所有线程状态初始化逻辑。
@@ -219,10 +240,15 @@ class FrankaUMIClient(RobotClient):
         # 避免在非 gevent Hub 线程中调用 capture_t0() 引发 AssertionError。
         self._pending_t0_capture = threading.Event()
 
+        # 预计算 SE3 系统偏置矩阵（右乘 delta_k，补偿工具坐标系下的 TCP 标定误差）
+        _pos_b = np.array(cfg.action_pos_bias, dtype=np.float64)
+        _rot_b = np.array(cfg.action_rotvec_bias, dtype=np.float64)
+        self._T_action_bias: np.ndarray = pose_xyz_rotvec_to_se3(_pos_b, _rot_b)
+        self._has_action_bias: bool = not np.allclose(self._T_action_bias, np.eye(4))
+
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
-
     def stop(self) -> None:
         """停止控制循环：先终止控制器，再断连，再关 gRPC 通道。"""
         self.shutdown_event.set()
@@ -240,7 +266,6 @@ class FrankaUMIClient(RobotClient):
     # ------------------------------------------------------------------
     # 覆盖：观测采集（数据集格式）
     # ------------------------------------------------------------------
-
     def control_loop_observation(self, task: str, verbose: bool = False):
         """覆盖：通过 get_umi_observation() 获取四元数格式观测。"""
         try:
@@ -295,12 +320,17 @@ class FrankaUMIClient(RobotClient):
         if len(a) == 7:
             # world_flange / sample-relative 格式：7D pos+rotvec+gripper
             pos, rotvec, gripper_width = a[0:3], a[3:6], float(a[6])
-            rotvec = [0.0, 0.0, 0.0]
+            # rotvec = [0.0, 0.0, 0.0]
             delta_k = pose_xyz_rotvec_to_se3(pos, rotvec)
         else:
             # legacy 格式：8D pos+quat+gripper
             pos, quat_xyzw, gripper_width = a[0:3], a[3:7], float(a[7])
             delta_k = pose_xyz_quat_to_se3(pos, quat_xyzw)
+
+        # SE3 右乘系统偏置：T_target = T_t0 @ delta_k @ T_bias
+        # 等效于工具坐标系下的 TCP 补偿，不改变 policy 的相对运动语义
+        if self._has_action_bias:
+            delta_k = delta_k @ self._T_action_bias
 
         # per_step：每步刷新；per_chunk：由 receive_actions 设旗，在此统一捕获，
         # 确保 capture_t0() 始终在主线程（gevent Hub 所在线程）中执行。
