@@ -37,17 +37,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation as R
 
-
-# ----------------------------------------------------------------------
-# Calibration loading
-# ----------------------------------------------------------------------
 
 def load_flange_to_camera_extrinsic(yaml_path: str | Path) -> np.ndarray:
     """Load ᶠT_C (panda_link8 → camera_color_optical_frame) from a YAML file.
@@ -87,10 +83,6 @@ def load_flange_to_camera_extrinsic(yaml_path: str | Path) -> np.ndarray:
     return T
 
 
-# ----------------------------------------------------------------------
-# SE(3) <-> 6D pose helpers
-# ----------------------------------------------------------------------
-
 def pose_xyz_quat_to_se3(pos: Sequence[float], quat_xyzw: Sequence[float]) -> np.ndarray:
     """Build 4×4 SE(3) from (xyz position, xyzw quaternion)."""
     T = np.eye(4)
@@ -124,10 +116,6 @@ def se3_to_xyz_quat(T: np.ndarray) -> np.ndarray:
     quat = R.from_matrix(T[:3, :3]).as_quat()  # xyzw
     return np.concatenate([pos, quat])
 
-
-# ----------------------------------------------------------------------
-# UMI ee6d → robot base frame
-# ----------------------------------------------------------------------
 
 def umi_camera_t0_action_to_base(
     delta_k: np.ndarray,

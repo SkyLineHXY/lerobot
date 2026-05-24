@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import threading
 from functools import cached_property
@@ -18,7 +19,6 @@ from .umi_transforms import (
     load_flange_to_camera_extrinsic,
     pose_xyz_rotvec_to_se3,
     se3_to_xyz_rotvec,
-    umi_camera_t0_action_to_base,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def _prepare_camera_img(img: np.ndarray, h: int, w: int, crop_ratio: float = 1.0
         cw = int(iw * crop_ratio)
         y0 = (ih - ch) // 2
         x0 = (iw - cw) // 2
-        img = img[y0:y0 + ch, x0:x0 + cw]
+        img = img[y0 : y0 + ch, x0 : x0 + cw]
     if img.shape[0] != h or img.shape[1] != w:
         img = cv2.resize(img, (w, h))
     if img.dtype != np.uint8:
@@ -78,7 +78,6 @@ class FrankaGenGripper(Robot):
         super().__init__(config)
         self.config = config
 
-        # Build sub-configs and sub-robots
         franka_config = config.build_franka_config()
         gripper_config = config.build_gripper_config()
 
@@ -91,10 +90,6 @@ class FrankaGenGripper(Robot):
         # UMI t₀ 参考法兰位姿（调用 capture_t0() 后写入）
         self._T_BE_t0: np.ndarray | None = None
         self._t0_lock = threading.Lock()
-
-    # ------------------------------------------------------------------
-    # Feature descriptors
-    # ------------------------------------------------------------------
 
     @cached_property
     def observation_features(self) -> dict[str, Any]:
@@ -110,31 +105,19 @@ class FrankaGenGripper(Robot):
         features.update(self._gripper.action_features)
         return features
 
-    # ------------------------------------------------------------------
-    # Connection state
-    # ------------------------------------------------------------------
-
     @property
     def is_connected(self) -> bool:
         return self._franka.is_connected
-        # return self._franka.is_connected and self._gripper.is_connected
 
     @property
     def is_calibrated(self) -> bool:
         return self._franka.is_calibrated
-        # return self._franka.is_calibrated and self._gripper.is_calibrated
 
     def calibrate(self) -> None:
         self._franka.calibrate()
-        # self._gripper.calibrate()
 
     def configure(self) -> None:
         self._franka.configure()
-        # self._gripper.configure()
-
-    # ------------------------------------------------------------------
-    # Connect / Disconnect
-    # ------------------------------------------------------------------
 
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
@@ -142,24 +125,20 @@ class FrankaGenGripper(Robot):
 
         logger.info("Connecting Franka + UMI gripper system ...")
 
-        # Connect Franka arm first
         try:
             self._franka.connect()
             logger.info("Franka arm connected.")
         except Exception as e:
             raise ConnectionError(f"Franka connection failed: {e}") from e
 
-        # Then connect UMI gripper
         try:
             self._gripper.connect(calibrate=calibrate)
             logger.info("UMI gripper connected.")
         except Exception as e:
             # Roll back franka connection on gripper failure
             logger.warning(f"Gripper connection failed: {e}, disconnecting Franka ...")
-            try:
+            with contextlib.suppress(Exception):
                 self._franka.disconnect()
-            except Exception:
-                pass
             raise ConnectionError(f"Gripper connection failed: {e}") from e
 
         logger.info("Franka + UMI gripper system ready.")
@@ -182,21 +161,13 @@ class FrankaGenGripper(Robot):
         else:
             logger.info("Franka + UMI gripper system disconnected.")
 
-    # ------------------------------------------------------------------
-    # Observation / Action
-    # ------------------------------------------------------------------
-
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         obs: dict[str, Any] = {}
-
-        # Franka observations (ee_pose.x/y/z/rx/ry/rz)
         franka_obs = self._franka.get_observation()
         obs.update(franka_obs)
-
-        # Gripper observations (gripper.pos, cam_*, tactile_*)
         gripper_obs = self._gripper.get_observation()
         obs.update(gripper_obs)
 
@@ -215,15 +186,12 @@ class FrankaGenGripper(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         sent_action: dict[str, Any] = {}
-
-        # Split and dispatch Franka action keys
         franka_action = {k: v for k, v in action.items() if k.startswith("ee_pose.")}
         if franka_action:
             franka_sent = self._franka.send_action(franka_action)
             if franka_sent:
                 sent_action.update(franka_sent)
 
-        # Split and dispatch gripper action keys
         gripper_action = {k: v for k, v in action.items() if k.startswith("gripper.")}
         if gripper_action:
             gripper_sent = self._gripper.send_action(gripper_action)
@@ -231,10 +199,6 @@ class FrankaGenGripper(Robot):
                 sent_action.update(gripper_sent)
 
         return sent_action
-
-    # ------------------------------------------------------------------
-    # Convenience methods
-    # ------------------------------------------------------------------
 
     def reset(self) -> None:
         """Move Franka to home position and set gripper to mid-range."""
@@ -244,10 +208,6 @@ class FrankaGenGripper(Robot):
         self._franka.reset()
         self._gripper.send_action({"gripper.pos": 0.05})
         logger.info("System reset to home position.")
-
-    # ------------------------------------------------------------------
-    # Controller lifecycle (forwards to underlying Franka)
-    # ------------------------------------------------------------------
 
     def start_cartesian_impedance(
         self,
@@ -262,12 +222,7 @@ class FrankaGenGripper(Robot):
         self._franka.start_cartesian_impedance(Kx=Kx, Kxd=Kxd, settle_time=settle_time)
 
     def terminate_policy(self) -> None:
-        """Terminate the currently running Franka controller, if any."""
         self._franka.terminate_policy()
-
-    # ------------------------------------------------------------------
-    # UMI ee6d coordinate-transform helpers
-    # ------------------------------------------------------------------
 
     @property
     def umi_camera_extrinsic(self) -> np.ndarray:
@@ -303,13 +258,12 @@ class FrankaGenGripper(Robot):
         self,
         delta_k: np.ndarray,
         T_BE_t0: np.ndarray,
-        reference: str = "camera_t0",
+        reference: str = "ee_at_t0",
     ) -> np.ndarray:
         """将 UMI ee6d 动作转换为基坐标系目标法兰位姿 ᴮT_E(t_k)。
 
         Args:
             delta_k:   (4, 4) 策略/数据集输出的 ee6d SE(3)。语义取决于 ``reference``：
-                       - ``"camera_t0"``：delta_k 必须是原始相机相对运动
                          ``ΔC_k = inv(ᵂT_C(t₀)) · ᵂT_C(t_k)``；
                        - ``"ee_at_t0"``：delta_k 必须是 EE-at-t₀ 法兰相对位姿
                          ``Δ_k = inv(ᵂT_F(t₀)) · ᵂT_F(t_k)``（由
@@ -323,15 +277,11 @@ class FrankaGenGripper(Robot):
         Returns:
             (4, 4) SE(3)，机器人基坐标系下的目标法兰位姿。
         """
-        if reference == "camera_t0":
-            return umi_camera_t0_action_to_base(delta_k, T_BE_t0, self.umi_camera_extrinsic)
         if reference == "ee_at_t0":
             return ee_relative_action_to_base(delta_k, T_BE_t0)
         if reference == "abs_pos_world_rot":
             return absolute_position_world_orientation_to_base(delta_k, T_BE_t0)
-        raise ValueError(
-            f"Unknown UMI reference mode {reference!r}. Expected one of {UMI_REFERENCE_MODES}."
-        )
+        raise ValueError(f"Unknown UMI reference mode {reference!r}. Expected one of {UMI_REFERENCE_MODES}.")
 
     def send_umi_action(
         self,
@@ -360,10 +310,6 @@ class FrankaGenGripper(Robot):
             action["gripper.pos"] = float(gripper_width)
         return self.send_action(action)
 
-    # ------------------------------------------------------------------
-    # UMI 数据集格式接口
-    # ------------------------------------------------------------------
-
     @property
     def umi_observation_features(self) -> dict[str, dict]:
         """返回与数据集（mcap_to_lerobotv3.py world_flange 格式）对齐的 lerobot_features。
@@ -383,8 +329,12 @@ class FrankaGenGripper(Robot):
                 "dtype": "float32",
                 "shape": (6,),
                 "names": [
-                    "pos_x_W", "pos_y_W", "pos_z_W",
-                    "rotvec_x_W", "rotvec_y_W", "rotvec_z_W",
+                    "pos_x_W",
+                    "pos_y_W",
+                    "pos_z_W",
+                    "rotvec_x_W",
+                    "rotvec_y_W",
+                    "rotvec_z_W",
                 ],
             },
         }

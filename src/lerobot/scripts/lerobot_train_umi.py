@@ -1,51 +1,9 @@
 #!/usr/bin/env python3
-"""UMI + Franka 专用训练脚本。
-
-与 lerobot_train.py 的区别：
-1. 每个 batch 在 preprocessor 之前自动应用 apply_umi_sample_relative_transform，
-   将数据集中存储的 world_flange 绝对位姿 action 转换为 sample-relative 增量。
-2. 启动时校验数据集包含 observation.umi_pose（world_flange 格式必需）。
-3. 移除 gym 仿真评估路径（真机策略不使用 gym env）。
-4. 新增 umi_transform 标志，可通过 --umi_transform=false 关闭变换（用于 legacy 格式）。
-
-用法
-----
-单 GPU（推荐先跑验证）::
-
-    python -m lerobot.scripts.lerobot_train_umi \\
-        --dataset.repo_id=yourname/pick_and_place \\
-        --dataset.root=/path/to/output_dataset \\
-        --policy.type=act \\
-        --policy.chunk_size=100 \\
-        --policy.n_action_steps=50 \\
-        --policy.input_features.observation.images.camera0.type=VISUAL \\
-        --policy.input_features.observation.images.camera0.shape='[3,480,640]' \\
-        --policy.input_features.observation.state.type=STATE \\
-        --policy.input_features.observation.state.shape='[1]' \\
-        --policy.output_features.action.type=ACTION \\
-        --policy.output_features.action.shape='[7]' \\
-        --batch_size=16 \\
-        --steps=200000 \\
-        --output_dir=/path/to/checkpoints/act_umi
-
-恢复训练::
-
-    python -m lerobot.scripts.lerobot_train_umi \\
-        --config_path=/path/to/checkpoints/act_umi/checkpoints/000050/pretrained_model/train_config.json \\
-        --resume=true
-
-关闭 UMI 变换（用于旧格式 ee_at_t0_flange 8D 数据集）::
-
-    python -m lerobot.scripts.lerobot_train_umi \\
-        ... \\
-        --umi_transform=false
-"""
-
 import dataclasses
 import logging
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pprint import pformat
 from typing import Any
 
@@ -70,7 +28,6 @@ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
-    get_step_identifier,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
@@ -83,31 +40,12 @@ from lerobot.utils.utils import (
 )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 配置
-# ──────────────────────────────────────────────────────────────────────────────
-
 @dataclass
 class UMITrainConfig(TrainPipelineConfig):
-    """在 TrainPipelineConfig 基础上增加 UMI world_flange 变换开关。
-
-    绝大多数字段与 TrainPipelineConfig 完全相同；唯一新增字段：
-
-    umi_transform (bool):
-        True（默认）：在每个 batch 送入 preprocessor 之前调用
-        ``apply_umi_sample_relative_transform``，将数据集中的绝对法兰位姿
-        action 转为相对推理时刻的增量（sample-relative）。
-        False：跳过变换，适用于已经存储 delta 格式的旧数据集（ee_at_t0_flange）。
-    """
     umi_transform: bool = True
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 验证
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
-    """检查数据集格式是否与 umi_transform 设置相容。"""
     features = dataset.meta.features
     action_shape = features.get("action", {}).get("shape", ())
     state_shape = features.get("observation.state", {}).get("shape", ())
@@ -127,8 +65,7 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
             )
         if state_shape and state_shape[-1] != 1:
             logging.warning(
-                f"observation.state 维度为 {state_shape[-1]}，"
-                "world_flange 格式应为 1D（gripper_width）。"
+                f"observation.state 维度为 {state_shape[-1]}，world_flange 格式应为 1D（gripper_width）。"
             )
         logging.info(
             f"[UMI] 数据集格式验证通过：action={action_shape}，"
@@ -137,8 +74,7 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
     else:
         if has_umi_pose:
             logging.warning(
-                "umi_transform=False，但数据集包含 'observation.umi_pose'。"
-                "该字段将被忽略（不会送入策略）。"
+                "umi_transform=False，但数据集包含 'observation.umi_pose'。该字段将被忽略（不会送入策略）。"
             )
         logging.info(
             f"[UMI] umi_transform=False，跳过 sample-relative 变换。"
@@ -146,9 +82,6 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 单步更新（与 lerobot_train.py 完全相同，便于独立使用）
-# ──────────────────────────────────────────────────────────────────────────────
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -159,7 +92,6 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
 ) -> tuple[MetricsTracker, dict]:
-    """执行单步前向 + 反向 + 优化器更新，返回 metrics 和 policy 输出字典。"""
     start_time = time.perf_counter()
     policy.train()
 
@@ -192,17 +124,14 @@ def update_policy(
     return train_metrics, output_dict
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 训练主函数
-# ──────────────────────────────────────────────────────────────────────────────
-
 @parser.wrap()
 def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
-    """UMI 训练主流程，在标准 lerobot 训练循环基础上注入 sample-relative 变换。"""
+    """UMI 训练主流程：注入 sample-relative 变换的标准 lerobot 训练循环。"""
     cfg.validate()
 
     if accelerator is None:
         from accelerate.utils import DistributedDataParallelKwargs
+
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator(
@@ -235,7 +164,6 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # ── 数据集 ──
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
@@ -243,11 +171,9 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
-    # UMI 专项验证
     if is_main_process:
         _validate_umi_dataset(dataset, cfg)
 
-    # ── 策略 ──
     if is_main_process:
         logging.info("Creating policy")
     policy = make_policy(
@@ -263,7 +189,6 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
 
     accelerator.wait_for_everyone()
 
-    # ── Preprocessor ──
     processor_kwargs: dict = {}
     postprocessor_kwargs: dict = {}
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
@@ -294,7 +219,6 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
         **postprocessor_kwargs,
     )
 
-    # ── 优化器 ──
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -317,7 +241,6 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # ── DataLoader ──
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -349,7 +272,6 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
     dl_iter = cycle(dataloader)
     policy.train()
 
-    # ── Metrics ──
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
@@ -380,13 +302,11 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
             f"effective batch size: {cfg.batch_size * accelerator.num_processes}"
         )
 
-    # ── 训练循环 ──
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
 
         # UMI sample-relative 变换：绝对法兰位姿 → 相对当前 EE 的增量
-        # 必须在 preprocessor（归一化）之前执行，保证 SE(3) 运算基于原始尺度
         if cfg.umi_transform:
             batch = apply_umi_sample_relative_transform(batch)
 
