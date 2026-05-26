@@ -194,7 +194,6 @@ def _get_pi_gemma_decoder_layer_base():
 
     return _PiGemmaDecoderLayerBase
 
-
 class PiGemmaModel(GemmaModel):  # type: ignore[misc]
     """
     GemmaModel extended with AdaRMS (adaptive RMSNorm) and gated residuals when config.use_adarms is True.
@@ -203,6 +202,9 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         super().__init__(config, **kwargs)
         if not getattr(config, "use_adarms", False):
             return
+        # use_adarms=True 时替换为 PiGemmaDecoderLayer（带 AdaRMS 和 gated residual）。
+        # 注意：父类 __init__ 已先构建了标准 GemmaDecoderLayer，此处统一替换。
+        # 由于 PI0 默认 use_adarms=False，这条路径仅在 PI05 等变体中触发，影响有限。
         cond_dim = getattr(config, "adarms_cond_dim", None)
         pi_gemma_decoder_layer_base = _get_pi_gemma_decoder_layer_base()
         self.layers = nn.ModuleList(
