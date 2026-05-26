@@ -42,7 +42,7 @@ t₀ = 推理时刻机器人 EE 当前位姿（滑动刷新，非 episode 固定
 | `observation.umi_pose` | 6D | `[pos_x_W, pos_y_W, pos_z_W, rotvec_x_W, rotvec_y_W, rotvec_z_W]`（同一帧绝对位姿，供 sample-relative processor 使用） |
 | `observation.images.camera0` | H×W×3 | RGB 图像（鱼眼中心镜头） |
 
-> **旧格式（ee_at_t0_flange）**：action/state 均为 8D `[pos_xyz, quat_xyzw, gripper]`，以 episode 首帧为固定 t₀。新项目推荐使用 world_flange 格式。
+[//]: # (> **旧格式（ee_at_t0_flange）**：action/state 均为 8D `[pos_xyz, quat_xyzw, gripper]`，以 episode 首帧为固定 t₀。新项目推荐使用 world_flange 格式。)
 
 ### 坐标系关系
 
@@ -400,26 +400,36 @@ camera_transform:
 2. 确认训练 DataLoader 中调用了 `apply_umi_sample_relative_transform`
 3. 确认推理时 `t0_mode=per_step`
 
-### 回放姿态发散
+[//]: # (### 回放姿态发散)
 
-**根因**：常见两个原因。
+[//]: # ()
+[//]: # (**根因**：常见两个原因。)
 
-1. `world_flange` 绝对位姿被当成 delta 直接发送（坐标系混用）
-2. 循环体未解析当前帧位姿（`_row_to_se3_and_gripper` 调用缺失）
+[//]: # ()
+[//]: # (1. `world_flange` 绝对位姿被当成 delta 直接发送（坐标系混用）)
 
-**排查**：使用 `--dry-run` 检查首帧输出，`pos` 应全为 `[0.0, 0.0, 0.0]`（episode-relative delta 的首帧等于单位变换）。
+[//]: # (2. 循环体未解析当前帧位姿（`_row_to_se3_and_gripper` 调用缺失）)
 
-### `TypeError: only 0-dimensional arrays can be converted to Python scalars`
+[//]: # ()
+[//]: # (**排查**：使用 `--dry-run` 检查首帧输出，`pos` 应全为 `[0.0, 0.0, 0.0]`（episode-relative delta 的首帧等于单位变换）。)
 
-**根因**：LeRobot 将 `shape=(1,)` 特征映射为 HF 标量 `Value`，传入 `np.array([x])` 会失败。
+[//]: # ()
+[//]: # (### `TypeError: only 0-dimensional arrays can be converted to Python scalars`)
 
-**修复**：传入 numpy 标量 `np.float32(x)` 而非 1D 数组。
+[//]: # ()
+[//]: # (**根因**：LeRobot 将 `shape=&#40;1,&#41;` 特征映射为 HF 标量 `Value`，传入 `np.array&#40;[x]&#41;` 会失败。)
 
-参见 `lerobot/datasets/utils.py:581`：`shape == (1,)` → `datasets.Value(dtype=...)`.
+[//]: # ()
+[//]: # (**修复**：传入 numpy 标量 `np.float32&#40;x&#41;` 而非 1D 数组。)
 
-### `'camera_transform' key not found`
+[//]: # ()
+[//]: # (参见 `lerobot/datasets/utils.py:581`：`shape == &#40;1,&#41;` → `datasets.Value&#40;dtype=...&#41;`.)
 
-手眼标定 YAML 格式不正确，确保顶层键为 `camera_transform`，子键包含 `translation`、`rotation`、`parent_frame`、`child_frame`。
+[//]: # ()
+[//]: # (### `'camera_transform' key not found`)
+
+[//]: # ()
+[//]: # (手眼标定 YAML 格式不正确，确保顶层键为 `camera_transform`，子键包含 `translation`、`rotation`、`parent_frame`、`child_frame`。)
 
 ### 推理帧率低于目标
 

@@ -55,7 +55,7 @@ class TrainPipelineConfig(HubMixin):
     cudnn_deterministic: bool = False
     # Number of workers for the dataloader.
     num_workers: int = 4
-    batch_size: int = 8
+    batch_size: int = 4
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
@@ -127,7 +127,7 @@ class TrainPipelineConfig(HubMixin):
         elif not self.output_dir:
             now = dt.datetime.now()
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
-            self.output_dir = Path("outputs/train") / train_dir
+            self.output_dir = Path("outputoutputss/train") / train_dir
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")

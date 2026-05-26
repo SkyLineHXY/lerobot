@@ -69,7 +69,7 @@ from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.robots import so_follower  # noqa: F401
+from lerobot.robots import so100_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2_grpc
@@ -100,7 +100,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
+from learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 
 
 @parser.wrap()

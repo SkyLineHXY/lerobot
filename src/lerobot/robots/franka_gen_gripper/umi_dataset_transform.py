@@ -84,28 +84,24 @@ def apply_umi_sample_relative_transform(
     *,
     remove_umi_pose: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """将 world_flange 绝对位姿 action 转为 sample-relative，就地修改 batch。
-
+    """
+    将 world_flange 绝对位姿 action 转为 sample-relative，就地修改 batch。
     约定
     ----
     - ``batch["action"]``          : shape ``(B, chunk_size, 7)``，最后一维
       ``[pos_x_W, pos_y_W, pos_z_W, rotvec_x_W, rotvec_y_W, rotvec_z_W, gripper]``。
     - ``batch["observation.umi_pose"]`` : shape ``(B, 6)`` 或 ``(B, n_obs, 6)``，
       当前（最后一帧）观测的绝对法兰位姿。
-
     算法
     ----
     设 base = ``umi_pose[..., -1, :]``（最后一帧），对 action chunk 中每步 k::
-
         delta_k = inv(SE3(base)) @ SE3(action_k_pose6)
         action_k_new[:6] = decompose_to_pose6(delta_k)   # pos+rotvec
         action_k_new[6]  = gripper（不变）
-
     Returns
     -------
     修改后的 batch（in-place）。若 ``remove_umi_pose=True``，
     删除 ``observation.umi_pose`` 键（策略不需要它）。
-
     Raises
     ------
     KeyError
@@ -145,8 +141,6 @@ def apply_umi_sample_relative_transform(
     rotvec_base = base_pose6[:, 3:6]      # (B, 3)
     T_base = _build_se3_batch(pos_base, rotvec_base)          # (B, 4, 4)
     T_base_inv = _invert_se3_batch(T_base)                    # (B, 4, 4)
-
-    action_pose6 = action[..., :3].new_empty(B, chunk_size, 7)  # pre-alloc
 
     pos_k = action[:, :, :3]       # (B, chunk, 3)
     rotvec_k = action[:, :, 3:6]   # (B, chunk, 3)

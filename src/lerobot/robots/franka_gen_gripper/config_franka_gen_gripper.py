@@ -10,7 +10,7 @@ from lerobot.robots.gen_gripper.config_umi_gripper import UmiGripperConfig
 @dataclass
 class FrankaGenGripperConfig(RobotConfig):
     # ---- Franka arm settings ----
-    robot_ip: str = "172.20.10.2"
+    robot_ip: str = "192.168.172.134"
     robot_port: int = 4242
     control_mode: str = "cartesian_impedance"
 
@@ -19,7 +19,7 @@ class FrankaGenGripperConfig(RobotConfig):
     gripper_serial_port: Optional[str] = None
     gripper_camera_width: int = 640
     gripper_camera_height: int = 480
-    gripper_camera_count: int = 1
+    gripper_camera_count: int = 3
     gripper_camera_show_preview: bool = False
     gripper_video_devices: Optional[list[str]] = None
     gripper_enable_tactile: bool = False
@@ -41,6 +41,7 @@ class FrankaGenGripperConfig(RobotConfig):
             robot_ip=self.robot_ip,
             robot_port=self.robot_port,
             control_mode=self.control_mode,
+            use_gripper=False,
         )
 
     def build_gripper_config(self) -> UmiGripperConfig:

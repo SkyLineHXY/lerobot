@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -287,8 +288,9 @@ class TimeLimitProcessorStep(TruncatedProcessorStep):
         """
         self.current_step += 1
         if self.current_step >= self.max_episode_steps:
+            if not truncated:  # 只在首次触发时打印
+                logging.info(f"Episode 达到时间限制（{self.max_episode_steps} 步），自动截断")
             truncated = True
-        # TODO (steven): missing an else truncated = False?
         return truncated
 
     def get_config(self) -> dict[str, Any]:

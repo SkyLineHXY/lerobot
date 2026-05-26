@@ -80,7 +80,6 @@ class WandBLogger:
         self.job_name = cfg.job_name
         self.env_fps = cfg.env.fps if cfg.env else None
         self._group = cfg_to_group(cfg)
-
         # Set up WandB.
         os.environ["WANDB_SILENT"] = "True"
         import wandb
@@ -107,6 +106,7 @@ class WandBLogger:
             job_type="train_eval",
             resume="must" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
+            settings=wandb.Settings(init_timeout=300),
         )
         run_id = wandb.run.id
         # NOTE: We will override the cfg.wandb.run_id with the wandb run id.

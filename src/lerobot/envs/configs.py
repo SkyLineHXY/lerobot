@@ -230,7 +230,6 @@ class ResetConfig:
 @dataclass
 class HILSerlProcessorConfig:
     """Configuration for environment processing pipeline."""
-
     control_mode: str = "gamepad"
     observation: ObservationConfig | None = None
     image_preprocessing: ImagePreprocessingConfig | None = None
@@ -249,7 +248,7 @@ class HILSerlRobotEnvConfig(EnvConfig):
     robot: RobotConfig | None = None
     teleop: TeleoperatorConfig | None = None
     processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
-
+    type:str = "gym_manipulator"
     name: str = "real_robot"
 
     @property

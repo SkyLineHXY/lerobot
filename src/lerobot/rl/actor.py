@@ -50,7 +50,7 @@ import logging
 import os
 import time
 from functools import lru_cache
-from queue import Empty
+from rl_queue import Empty
 
 import grpc
 import torch
@@ -64,9 +64,9 @@ from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.processor import TransitionKey
 from lerobot.rl.process import ProcessSignalHandler
-from lerobot.rl.queue import get_last_item_from_queue
-from lerobot.robots import so_follower  # noqa: F401
-from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
+from lerobot.rl.rl_queue import get_last_item_from_queue
+from lerobot.robots import so100_follower
+from lerobot.teleoperators import gamepad, so_leader, spacemouse  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import (
@@ -90,7 +90,7 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from .gym_manipulator import (
+from gym_manipulator import (
     create_transition,
     make_processors,
     make_robot_env,
@@ -348,7 +348,7 @@ def act_with_policy(
         # Update transition for next iteration
         transition = new_transition
 
-        if done or truncated:
+        if done :
             logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
 
             update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)

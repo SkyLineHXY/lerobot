@@ -116,10 +116,10 @@ class FrankaUMIClientConfig:
     )
     use_gripper: bool = field(default=True, metadata={"help": "是否执行策略输出的夹爪动作"})
     t0_mode: str = field(
-        default="per_step",
+        default="per_chunk",
         metadata={
             "help": (
-                "T_BE_t₀ 更新策略：'per_step'（每步刷新，推荐与 world_flange 数据集配合使用）、"
+                "T_BE_t₀ 更新策略：'per_step'（每步刷新，推荐与 world_flange 数据集配合使用）"
                 "'per_chunk'（每块刷新）、'per_episode'（仅 episode 开始时捕获一次）"
             )
         },
@@ -215,6 +215,9 @@ class FrankaUMIClient(RobotClient):
         self.fps_tracker = FPSTracker(target_fps=cfg.fps)
         self.must_go = threading.Event()
         self.must_go.set()
+        # per_chunk 模式下的跨线程信号：receive_actions 线程设旗，控制循环主线程执行捕获，
+        # 避免在非 gevent Hub 线程中调用 capture_t0() 引发 AssertionError。
+        self._pending_t0_capture = threading.Event()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -276,7 +279,6 @@ class FrankaUMIClient(RobotClient):
     # ------------------------------------------------------------------
     # 覆盖：动作执行（UMI 坐标变换）
     # ------------------------------------------------------------------
-
     def control_loop_action(self, verbose: bool = False):
         """覆盖：将策略动作经 UMI SE(3) 变换后发送到 Franka。
 
@@ -293,16 +295,24 @@ class FrankaUMIClient(RobotClient):
         if len(a) == 7:
             # world_flange / sample-relative 格式：7D pos+rotvec+gripper
             pos, rotvec, gripper_width = a[0:3], a[3:6], float(a[6])
+            rotvec = [0.0, 0.0, 0.0]
             delta_k = pose_xyz_rotvec_to_se3(pos, rotvec)
         else:
             # legacy 格式：8D pos+quat+gripper
             pos, quat_xyzw, gripper_width = a[0:3], a[3:7], float(a[7])
             delta_k = pose_xyz_quat_to_se3(pos, quat_xyzw)
 
-        # per_step 模式：每次动作前更新 T_BE_t0 = 当前 FK
+        # per_step：每步刷新；per_chunk：由 receive_actions 设旗，在此统一捕获，
+        # 确保 capture_t0() 始终在主线程（gevent Hub 所在线程）中执行。
         t0_mode = self.config.t0_mode
         if t0_mode == "per_step":
             self.robot.capture_t0()
+        elif self._pending_t0_capture.is_set():
+            self.robot.capture_t0()
+            self._pending_t0_capture.clear()
+            t0_dbg = self.robot.get_t0()
+            if t0_dbg is not None:
+                self.logger.debug(f"per_chunk 更新 T_BE_t0: {t0_dbg[:3, 3].round(4).tolist()}")
 
         T_BE_t0 = self.robot.get_t0()
         if T_BE_t0 is None:
@@ -344,17 +354,16 @@ class FrankaUMIClient(RobotClient):
                 if not timed_actions:
                     continue
 
-                # per_chunk 模式（或 legacy update_t0_per_chunk 选项）
+                # per_chunk 模式（或 legacy update_t0_per_chunk 选项）：
+                # 仅设标志，实际 capture_t0() 延迟到控制循环主线程执行，
+                # 避免在 threading.Thread 中调用 gevent 原语导致 AssertionError。
                 t0_mode = self.config.t0_mode
                 if t0_mode == "per_chunk" or self.config.update_t0_per_chunk:
                     if self.config.update_t0_per_chunk and t0_mode != "per_chunk":
                         self.logger.warning(
                             "update_t0_per_chunk 已废弃，请改用 t0_mode='per_chunk'。"
                         )
-                    self.robot.capture_t0()
-                    t0 = self.robot.get_t0()
-                    if t0 is not None:
-                        self.logger.debug(f"per_chunk 更新 T_BE_t0: {t0[:3, 3].round(4).tolist()}")
+                    self._pending_t0_capture.set()
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)

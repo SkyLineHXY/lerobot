@@ -26,6 +26,7 @@ import torch
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.envs import gym_hil_spacemouse  # noqa: F401  触发 SpaceMouse env 注册
 from lerobot.envs.configs import HILSerlRobotEnvConfig
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import (
@@ -55,10 +56,10 @@ from lerobot.processor.converters import identity_transition
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
-    so_follower,
+    so100_follower,
 )
 from lerobot.robots.robot import Robot
-from lerobot.robots.so_follower.robot_kinematic_processor import (
+from lerobot.robots.so100_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
     EEReferenceAndDelta,
     ForwardKinematicsJointsToEEObservation,
@@ -70,6 +71,7 @@ from lerobot.teleoperators import (
     keyboard,  # noqa: F401
     make_teleoperator_from_config,
     so_leader,  # noqa: F401
+    spacemouse,  # noqa: F401
 )
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
@@ -77,7 +79,7 @@ from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, REWARD
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 
-from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+from joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
 
 logging.basicConfig(level=logging.INFO)
 
@@ -311,20 +313,35 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     """
     # Check if this is a GymHIL simulation environment
     if cfg.name == "gym_hil":
-        assert cfg.robot is None and cfg.teleop is None, "GymHIL environment does not support robot or teleop"
+        assert cfg.robot is None, "GymHIL 仿真环境不支持真实机器人配置"
+        # spacemouse 模式下允许 cfg.teleop 为 SpaceMouseTeleopConfig；其余情况不需要 teleop
+        if cfg.processor.control_mode != "spacemouse":
+            assert cfg.teleop is None, "GymHIL 仿真环境（非 spacemouse 模式）不支持 teleop 配置"
         import gym_hil  # noqa: F401
 
         # Extract gripper settings with defaults
         use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
         gripper_penalty = cfg.processor.gripper.gripper_penalty if cfg.processor.gripper is not None else 0.0
 
-        env = gym.make(
-            f"gym_hil/{cfg.task}",
-            image_obs=True,
-            render_mode="human",
-            use_gripper=use_gripper,
-            gripper_penalty=gripper_penalty,
-        )
+        if cfg.processor.control_mode == "spacemouse":
+            # 使用 SpaceMouse 作为干预设备，cfg.teleop 为 SpaceMouseTeleopConfig（可为 None）
+            env = gym.make(
+                f"gym_hil/{cfg.task}",
+                image_obs=True,
+                render_mode="human",
+                use_gripper=use_gripper,
+                gripper_penalty=gripper_penalty,
+                spacemouse_config=cfg.teleop,
+            )
+        else:
+            env = gym.make(
+                f"gym_hil/{cfg.task}",
+                image_obs=True,
+                render_mode="human",
+                use_gripper=use_gripper,
+                gripper_penalty=gripper_penalty,
+                use_gamepad=cfg.processor.control_mode == "gamepad",
+            )
 
         return env, None
 
@@ -433,10 +450,12 @@ def make_processors(
             )
         )
 
-    # Add time limit processor if reset config exists
-    if cfg.processor.reset is not None:
+    # 只有在 control_time_s > 0 时才添加时间限制，设为 0 或负数表示不限制 episode 时长
+    if cfg.processor.reset is not None and cfg.processor.reset.control_time_s > 0:
+        max_steps = int(cfg.processor.reset.control_time_s * cfg.fps)
+        logging.info(f"Episode 时间限制: {cfg.processor.reset.control_time_s}s ({max_steps} 步)")
         env_pipeline_steps.append(
-            TimeLimitProcessorStep(max_episode_steps=int(cfg.processor.reset.control_time_s * cfg.fps))
+            TimeLimitProcessorStep(max_episode_steps=max_steps)
         )
 
     # Add gripper penalty processor if gripper config exists and enabled
@@ -598,6 +617,7 @@ def control_loop(
     complementary_data = (
         {"raw_joint_positions": info.pop("raw_joint_positions")} if "raw_joint_positions" in info else {}
     )
+
     env_processor.reset()
     action_processor.reset()
 
@@ -665,7 +685,7 @@ def control_loop(
         # Create a neutral action (no movement)
         neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
         if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([0.0])])  # Gripper stay
+            neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay (1=保持, 0=合, 2=开)
 
         # Use the new step function
         transition = step_env_and_process_transition(
@@ -705,7 +725,7 @@ def control_loop(
         episode_step += 1
 
         # Handle episode termination
-        if terminated or truncated:
+        if terminated :
             episode_time = time.perf_counter() - episode_start_time
             logging.info(
                 f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"

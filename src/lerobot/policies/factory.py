@@ -88,32 +88,25 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         return ACTPolicy
     elif name == "vqbet":
         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
-
         return VQBeTPolicy
     elif name == "pi0":
         from lerobot.policies.pi0.modeling_pi0 import PI0Policy
-
         return PI0Policy
     elif name == "pi0_fast":
         from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy
-
         return PI0FastPolicy
     elif name == "pi05":
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
-
         return PI05Policy
     elif name == "sac":
         from lerobot.policies.sac.modeling_sac import SACPolicy
-
         return SACPolicy
-    elif name == "reward_classifier":
-        from lerobot.policies.sac.reward_model.modeling_classifier import Classifier
-
-        return Classifier
     elif name == "smolvla":
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-
         return SmolVLAPolicy
+    elif name == "reward_classifier":
+        from lerobot.policies.sac.reward_model.modeling_classifier import Classifier
+        return Classifier
     elif name == "sarm":
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 

@@ -52,11 +52,10 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
-    bi_so_follower,
+    bi_so100_follower,
     koch_follower,
+    franka_gen_gripper,
     make_robot_from_config,
-    omx_follower,
-    so_follower,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -65,8 +64,8 @@ from lerobot.transport import (
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from .configs import RobotClientConfig
-from .helpers import (
+from lerobot.async_inference.configs import RobotClientConfig
+from helpers import (
     Action,
     FPSTracker,
     Observation,

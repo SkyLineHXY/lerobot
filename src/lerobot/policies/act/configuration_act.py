@@ -83,8 +83,8 @@ class ACTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 100
-    n_action_steps: int = 100
+    chunk_size: int = 50
+    n_action_steps: int = 50
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -96,8 +96,8 @@ class ACTConfig(PreTrainedConfig):
 
     # Architecture.
     # Vision backbone.
-    vision_backbone: str = "resnet18"
-    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    vision_backbone: str = "resnet34"
+    pretrained_backbone_weights: str | None = "ResNet34_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
     pre_norm: bool = False

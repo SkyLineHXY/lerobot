@@ -41,8 +41,6 @@
         --umi_transform=false
 """
 
-from __future__ import annotations
-
 import dataclasses
 import logging
 import time
@@ -151,7 +149,6 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # 单步更新（与 lerobot_train.py 完全相同，便于独立使用）
 # ──────────────────────────────────────────────────────────────────────────────
-
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -389,7 +386,6 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
         batch = next(dl_iter)
 
         # UMI sample-relative 变换：绝对法兰位姿 → 相对当前 EE 的增量
-        # 必须在 preprocessor（归一化）之前执行，保证 SE(3) 运算基于原始尺度
         if cfg.umi_transform:
             batch = apply_umi_sample_relative_transform(batch)
 

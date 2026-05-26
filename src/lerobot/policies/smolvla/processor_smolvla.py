@@ -103,7 +103,7 @@ def make_smolvla_pre_post_processors(
     )
 
 
-@ProcessorStepRegistry.register(name="smolvla_new_line_processor")
+#@ProcessorStepRegistry.register(name="smolvla_new_line_processor")
 class SmolVLANewLineProcessor(ComplementaryDataProcessorStep):
     """
     A processor step that ensures the 'task' description ends with a newline character.

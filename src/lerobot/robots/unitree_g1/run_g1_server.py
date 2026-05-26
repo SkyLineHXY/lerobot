@@ -24,7 +24,6 @@ This server runs on the robot and forwards:
 Uses JSON for secure serialization instead of pickle.
 """
 
-import argparse
 import base64
 import contextlib
 import json
@@ -38,8 +37,6 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublish
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as hg_LowCmd, LowState_ as hg_LowState
 from unitree_sdk2py.utils.crc import CRC
-
-from lerobot.cameras.zmq.image_server import ImageServer
 
 # DDS topic names follow Unitree SDK naming conventions
 # ruff: noqa: N816
@@ -102,12 +99,11 @@ def state_forward_loop(
     lowstate_sub: ChannelSubscriber,
     lowstate_sock: zmq.Socket,
     state_period: float,
-    shutdown_event: threading.Event,
 ) -> None:
     """Read observation from DDS and forward to ZMQ clients."""
     last_state_time = 0.0
 
-    while not shutdown_event.is_set():
+    while True:
         # read from DDS
         msg = lowstate_sub.Read()
         if msg is None:
@@ -132,10 +128,7 @@ def cmd_forward_loop(
 ) -> None:
     """Receive commands from ZMQ and forward to DDS."""
     while True:
-        try:
-            payload = lowcmd_sock.recv()
-        except zmq.ContextTerminated:
-            break
+        payload = lowcmd_sock.recv()
         msg_dict = json.loads(payload.decode("utf-8"))
 
         topic = msg_dict.get("topic", "")
@@ -153,32 +146,6 @@ def cmd_forward_loop(
 
 def main() -> None:
     """Main entry point for the robot server bridge."""
-    parser = argparse.ArgumentParser(description="DDS-to-ZMQ bridge server for Unitree G1")
-    parser.add_argument("--camera", action="store_true", help="Also launch camera server")
-    parser.add_argument("--camera-device", type=int, default=4, help="Camera device ID (default: 4)")
-    parser.add_argument("--camera-fps", type=int, default=30, help="Camera FPS (default: 30)")
-    parser.add_argument("--camera-width", type=int, default=640, help="Camera width (default: 640)")
-    parser.add_argument("--camera-height", type=int, default=480, help="Camera height (default: 480)")
-    parser.add_argument("--camera-port", type=int, default=5555, help="Camera ZMQ port (default: 5555)")
-    args = parser.parse_args()
-
-    # Optionally start camera server in background thread
-    camera_thread = None
-    if args.camera:
-        camera_config = {
-            "fps": args.camera_fps,
-            "cameras": {
-                "head_camera": {
-                    "device_id": args.camera_device,
-                    "shape": [args.camera_height, args.camera_width],
-                }
-            },
-        }
-        camera_server = ImageServer(camera_config, port=args.camera_port)
-        camera_thread = threading.Thread(target=camera_server.run, daemon=True)
-        camera_thread.start()
-        print(f"Camera server started on port {args.camera_port} (device {args.camera_device})")
-
     # initialize DDS
     ChannelFactoryInitialize(0)
 
@@ -215,28 +182,30 @@ def main() -> None:
     lowstate_sock.bind(f"tcp://0.0.0.0:{LOWSTATE_PORT}")
 
     state_period = 0.002  # ~500 hz
-    shutdown_event = threading.Event()
 
-    # start observation forwarding in background thread
+    # start observation forwarding thread
     t_state = threading.Thread(
         target=state_forward_loop,
-        args=(lowstate_sub, lowstate_sock, state_period, shutdown_event),
+        args=(lowstate_sub, lowstate_sock, state_period),
+        daemon=True,
     )
     t_state.start()
 
-    print("bridge running (lowstate -> zmq, lowcmd -> dds)")
+    # start action forwarding thread
+    t_cmd = threading.Thread(
+        target=cmd_forward_loop,
+        args=(lowcmd_sock, lowcmd_pub_debug, crc),
+        daemon=True,
+    )
+    t_cmd.start()
 
-    # run command forwarding in main thread
+    print("bridge running (lowstate -> zmq, lowcmd -> dds)")
+    # keep main thread alive so daemon threads don't exit
     try:
-        cmd_forward_loop(lowcmd_sock, lowcmd_pub_debug, crc)
+        while True:
+            time.sleep(1.0)
     except KeyboardInterrupt:
         print("shutting down bridge...")
-    finally:
-        shutdown_event.set()
-        ctx.term()  # terminates blocking zmq.recv() calls
-        t_state.join(timeout=2.0)
-        if camera_thread is not None:
-            camera_thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":
