@@ -43,7 +43,6 @@ in your configuration.
 For more details on the complete HILSerl training workflow, see:
 https://github.com/michel-aractingi/lerobot-hilserl-guide
 """
-
 import logging
 import os
 import shutil
@@ -74,7 +73,7 @@ from lerobot.rl.learner import (
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.robots import so100_follower  # noqa: F401
-from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
+from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
 from lerobot.transport.utils import (
     bytes_to_transitions,
     state_to_bytes,
@@ -98,11 +97,11 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from .buffer import (
+from lerobot.rl.acfql.buffer import (
     ReplayBufferNSteps as ReplayBuffer,
     concatenate_batch_transitions_nstep as concatenate_batch_transitions,
 )
-from .configs import ACFQLTrainRLServerPipelineConfig as TrainRLServerPipelineConfig
+from lerobot.rl.acfql.configs import ACFQLTrainRLServerPipelineConfig as TrainRLServerPipelineConfig
 
 
 @parser.wrap()

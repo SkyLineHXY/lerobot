@@ -119,7 +119,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Architecture / modeling.
     # Vision backbone.
-    vision_backbone: str = "resnet18"
+    vision_backbone: str = "resnet34"
     resize_shape: tuple[int, int] | None = None
     crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = None

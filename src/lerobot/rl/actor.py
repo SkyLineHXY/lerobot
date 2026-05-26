@@ -50,7 +50,7 @@ import logging
 import os
 import time
 from functools import lru_cache
-from rl_queue import Empty
+from lerobot.rl.rl_queue import Empty
 
 import grpc
 import torch

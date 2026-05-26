@@ -90,8 +90,8 @@ from lerobot.utils.utils import (
     log_say,
 )
 
-from configs import HILSerlRobotEnvConfig
-from utils import get_frequency_stats
+from lerobot.rl.acfql.configs import HILSerlRobotEnvConfig
+from lerobot.rl.acfql.utils import get_frequency_stats
 
 logging.basicConfig(level=logging.INFO)
 
@@ -389,7 +389,7 @@ def make_processors(
 
         env_pipeline_steps = [
             Numpy2TorchActionProcessorStep(),
-            VanillaObservationProcessorStep(device=device),
+            VanillaObservationProcessorStep(),
             AddBatchDimensionProcessorStep(),
             DeviceProcessorStep(device=device),
         ]
