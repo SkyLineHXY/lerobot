@@ -64,7 +64,7 @@ from lerobot.transport import (
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from configs import RobotClientConfig
+from lerobot.async_inference.configs import RobotClientConfig
 from helpers import (
     Action,
     FPSTracker,
