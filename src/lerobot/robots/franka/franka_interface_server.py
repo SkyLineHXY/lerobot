@@ -186,7 +186,6 @@ class FrankaInterfaceServer:
             blocking=blocking,
         )
 
-
 def _parse_args() -> argparse.Namespace:
     # 优先读取与 launch_franka_servers.sh 相同的环境变量，保持默认值一致
     _robot_ip = os.environ.get("ROBOT_IP", "localhost")
@@ -208,7 +207,7 @@ def _parse_args() -> argparse.Namespace:
         help=f"Polymetis gripper server IP（默认 {_gripper_ip}，可用 GRIPPER_IP 覆盖）",
     )
     p.add_argument("--gripper-port", type=int, default=_gripper_port, dest="gripper_port", help=f"Polymetis gripper server 端口（默认 {_gripper_port}，可用 GRIPPER_PORT 覆盖）")
-    p.add_argument("--go-home", action="store_true", dest="go_home", help="启动后执行 go_home")
+    p.add_argument("--go-home", default=True, dest="go_home", help="启动后执行 go_home")
     return p.parse_args()
 
 
@@ -223,12 +222,12 @@ if __name__ == "__main__":
         gripper_ip=args.gripper_ip,
         gripper_port=args.gripper_port,
     )
-    server.robot_go_home()
     print(server.robot_get_ee_pose())
-
+    print(server.robot_get_joint_positions())
+    server.robot_go_home()
     if args.go_home:
         log.info("执行 go_home…")
-        server.robot_go_home()
+        # server.robot_go_home()
 
     s = zerorpc.Server(server)
     bind_addr = f"tcp://{args.bind}:{args.port}"

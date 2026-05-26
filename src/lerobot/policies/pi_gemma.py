@@ -72,14 +72,19 @@ def layernorm_forward(
     cond: torch.Tensor | None = None,
 ):
     """
-    call layernorm and return hidden states and gate
-    if cond is not None, use conditional norm
-    otherwise, use normal gemma norm
+    调用 layernorm 并返回 (hidden_states, gate) 元组。
+    - 若 cond 不为 None，使用条件归一化（AdaRMS）
+    - 若 layernorm 为标准 GemmaRMSNorm（返回单个张量），则 gate 为 None
+    - 若 layernorm 为 PiGemmaRMSNorm（返回元组），则直接透传
     """
     if cond is not None:
-        return layernorm(x, cond=cond)
+        result = layernorm(x, cond=cond)
     else:
-        return layernorm(x)
+        result = layernorm(x)
+    # 统一返回 (hidden_states, gate) 格式，兼容标准 GemmaRMSNorm（返回单张量）
+    if isinstance(result, tuple):
+        return result
+    return result, None
 
 
 class PiGemmaRMSNorm(nn.Module):
@@ -189,16 +194,17 @@ def _get_pi_gemma_decoder_layer_base():
 
     return _PiGemmaDecoderLayerBase
 
-
 class PiGemmaModel(GemmaModel):  # type: ignore[misc]
     """
     GemmaModel extended with AdaRMS (adaptive RMSNorm) and gated residuals when config.use_adarms is True.
     """
-
     def __init__(self, config: GemmaConfig, **kwargs):
         super().__init__(config, **kwargs)
-        # if not getattr(config, "use_adarms", False):
-        #     return
+        if not getattr(config, "use_adarms", False):
+            return
+        # use_adarms=True 时替换为 PiGemmaDecoderLayer（带 AdaRMS 和 gated residual）。
+        # 注意：父类 __init__ 已先构建了标准 GemmaDecoderLayer，此处统一替换。
+        # 由于 PI0 默认 use_adarms=False，这条路径仅在 PI05 等变体中触发，影响有限。
         cond_dim = getattr(config, "adarms_cond_dim", None)
         pi_gemma_decoder_layer_base = _get_pi_gemma_decoder_layer_base()
         self.layers = nn.ModuleList(

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import builtins
+import contextlib
 import copy
 import logging
 import math
@@ -335,9 +336,7 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
         raise ValueError(f"Unknown variant: {variant}")
 
 
-class PaliGemmaWithExpertModel(
-    nn.Module
-):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
+class PaliGemmaWithExpertModel(nn.Module):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
     """PaliGemma model with action expert for PI0."""
 
     def __init__(
@@ -349,6 +348,7 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        device: str | torch.device | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -390,35 +390,43 @@ class PaliGemmaWithExpertModel(
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
-        self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
-        self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
+        # 若指定了 device（如 "cuda"），使用 torch.device 上下文直接在目标设备上分配参数，
+        # 省去后续 CPU→GPU 的大块 tensor 搬运（2.3B 参数 × 4 bytes ≈ 9.2 GB 数据流）。
+        # torch.device 上下文要求 PyTorch >= 2.0。
+        device_ctx = torch.device(device) if device is not None else None
+        ctx = torch.device(device_ctx) if device_ctx is not None else contextlib.nullcontext()
+        with ctx:
+            self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
+            self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
-        if precision == "bfloat16":
-            self.to(dtype=torch.bfloat16)
-        elif precision == "float32":
-            self.to(dtype=torch.float32)
+        if precision == "float32":
+            # 已是 float32，无需任何转换
             return
-        else:
+        elif precision != "bfloat16":
             raise ValueError(f"Invalid precision: {precision}")
 
-        # Keep full vision path in float32 so we never toggle (toggle causes optimizer
-        # "same dtype" error). Align with PI05.
-        params_to_keep_float32 = [
+        # 保持视觉路径和 LayerNorm 为 float32（防止优化器 dtype 不一致报错）。
+        # 使用单遍遍历直接设置目标 dtype，避免先全量转 bfloat16 再部分回滚的两次拷贝。
+        params_to_keep_float32 = {
             "vision_tower",
             "multi_modal_projector",
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
-        ]
+        }
 
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
+                if param.data.dtype != torch.float32:
+                    param.data = param.data.to(dtype=torch.float32)
+            else:
+                if param.data.dtype != torch.bfloat16:
+                    param.data = param.data.to(dtype=torch.bfloat16)
 
     def _set_requires_grad(self):
         if self.freeze_vision_encoder:
@@ -574,6 +582,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            device=config.device,  # 直接在目标设备上分配参数，跳过 CPU→GPU 搬运
         )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
