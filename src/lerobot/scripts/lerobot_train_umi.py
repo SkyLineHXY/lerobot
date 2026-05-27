@@ -148,15 +148,6 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
 
 def _recompute_action_stats_after_umi_transform(dataset, cfg: UMITrainConfig) -> None:
     """在 UMI 变换后重新计算 action 统计量，替换数据集中基于绝对位姿的旧统计量。
-
-    问题根因
-    --------
-    ``dataset.meta.stats["action"]`` 在数据集构建时基于绝对世界系法兰位姿计算。
-    但训练循环中 ``apply_umi_sample_relative_transform`` 会将 action 转为
-    sample-relative delta（值域接近 0），导致 normalizer 用错误的 offset/scale
-    对 delta 值归一化，严重影响 Pi0（flow matching 需要从 N(0,1) 抵达 -10 附近）
-    和 Diffusion Policy（MIN_MAX 将 delta 映射到 [-1,1] 外，被 clip_sample 截断）。
-
     修复方式
     --------
     遍历数据集一遍，对每个 batch 应用 UMI 变换后收集 delta action，
@@ -175,17 +166,19 @@ def _recompute_action_stats_after_umi_transform(dataset, cfg: UMITrainConfig) ->
         drop_last=False,
         pin_memory=False,
     )
-
+    t=0
     all_actions: list[torch.Tensor] = []
     for batch in tqdm(loader, desc="[UMI] 重算 action stats", leave=False):
         # remove_umi_pose=False：保留 observation.umi_pose 供后续 batch 使用
         batch = apply_umi_sample_relative_transform(batch, remove_umi_pose=False)
+        t+=1
         # action shape: (B, chunk_size, 7) 或 (B, 7)
         act = batch["action"]
         if act.dim() == 3:
             act = act.reshape(-1, act.shape[-1])  # -> (B*chunk, 7)
         all_actions.append(act.cpu().float())
-
+        if t == 20:
+            break
     all_actions_t = torch.cat(all_actions, dim=0)  # (N, 7)
 
     quantiles = [0.01, 0.10, 0.50, 0.90, 0.99]
