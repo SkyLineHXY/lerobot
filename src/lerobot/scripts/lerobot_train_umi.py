@@ -106,48 +106,91 @@ def _validate_umi_dataset(dataset, cfg: UMITrainConfig) -> None:
 
 def _recompute_action_stats_after_umi_transform(dataset, cfg: UMITrainConfig) -> None:
     """在 UMI 变换后重新计算 action 统计量，替换数据集中基于绝对位姿的旧统计量。
+
+    问题根因
+    --------
+    ``dataset.meta.stats["action"]`` 在数据集构建时基于绝对世界系法兰位姿计算。
+    但训练循环中 ``apply_umi_sample_relative_transform`` 将 action 转为
+    sample-relative delta（值域接近 0），导致 normalizer 用错误的 offset/scale
+    对 delta 归一化，严重影响 Pi0（flow matching 需从 N(0,1) 抵达 -10 附近）
+    和 Diffusion Policy（MIN_MAX 将 delta 映射到 [-1,1] 外，clip_sample 截断旋转信号）。
+
     修复方式
     --------
-    遍历数据集一遍，对每个 batch 应用 UMI 变换后收集 delta action，
+    直接从 Parquet 文件读取 action / observation.umi_pose（跳过视频解码），
+    按 chunk_size 计算所有可能的 (observation, future_k) 组合对应的 delta，
     重新计算 mean/std/min/max/quantile，覆盖 ``dataset.meta.stats["action"]``。
     同时移除不再送入策略的 ``observation.umi_pose`` 统计量，避免 normalizer 报错。
     """
+    import glob
     import numpy as np
+    import pyarrow.parquet as pq
+    from scipy.spatial.transform import Rotation
 
-    logging.info("[UMI] 开始重算 UMI 变换后的 action 统计量（遍历一次数据集）…")
+    logging.info("[UMI] 开始重算 UMI 变换后的 action 统计量（直接读 Parquet，跳过视频）…")
 
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=64,
-        shuffle=False,
-        num_workers=min(cfg.num_workers, 4),
-        drop_last=False,
-        pin_memory=False,
-    )
-    t=0
-    all_actions: list[torch.Tensor] = []
-    for batch in tqdm(loader, desc="[UMI] 重算 action stats", leave=False):
-        # remove_umi_pose=False：保留 observation.umi_pose 供后续 batch 使用
-        batch = apply_umi_sample_relative_transform(batch, remove_umi_pose=False)
-        t+=1
-        # action shape: (B, chunk_size, 7) 或 (B, 7)
-        act = batch["action"]
-        if act.dim() == 3:
-            act = act.reshape(-1, act.shape[-1])  # -> (B*chunk, 7)
-        all_actions.append(act.cpu().float())
-        if t == 20:
-            break
-    all_actions_t = torch.cat(all_actions, dim=0)  # (N, 7)
+    # 收集数据集所有 Parquet 分片
+    data_root = dataset.root if hasattr(dataset, "root") else dataset.repo_id
+    parquet_files = sorted(glob.glob(str(data_root) + "/data/**/*.parquet", recursive=True))
+    if not parquet_files:
+        # 回退：使用带视频的 DataLoader
+        logging.warning("[UMI] 未找到 Parquet 文件，回退到 DataLoader 模式（速度较慢）")
+        _recompute_action_stats_via_dataloader(dataset, cfg)
+        return
+
+    # 读取全量表格特征（不加载视频）
+    tables = [
+        pq.read_table(f, columns=["action", "observation.umi_pose", "episode_index"])
+        for f in tqdm(parquet_files, desc="[UMI] 读取 Parquet", leave=False)
+    ]
+    import pyarrow as pa
+    df = pa.concat_tables(tables).to_pandas()
+
+    actions   = np.stack(df["action"].to_numpy())              # (N, 7)
+    umi_poses = np.stack(df["observation.umi_pose"].to_numpy()) # (N, 6)
+    episodes  = df["episode_index"].to_numpy()
+
+    # 推断 chunk_size（从 dataset.delta_timestamps 或策略配置）
+    chunk_size = 1
+    if hasattr(dataset, "delta_timestamps") and dataset.delta_timestamps:
+        action_ts = dataset.delta_timestamps.get("action", [])
+        chunk_size = max(len(action_ts), 1)
+    chunk_size = max(chunk_size, 1)
+    logging.info(f"[UMI] chunk_size={chunk_size}，计算 (observation, +k) 组合 delta…")
+
+    # 遍历所有帧，对 chunk 内每一步计算 SE(3) delta
+    all_deltas: list[np.ndarray] = []
+    for i in tqdm(range(len(actions)), desc="[UMI] 计算 delta", leave=False):
+        pos_base = umi_poses[i, :3]
+        rv_base  = umi_poses[i, 3:6]
+        R_base   = Rotation.from_rotvec(rv_base).as_matrix()
+        ep       = episodes[i]
+
+        for k in range(chunk_size):
+            j = i + k
+            if j >= len(actions) or episodes[j] != ep:
+                break
+            pos_k = actions[j, :3]
+            rv_k  = actions[j, 3:6]
+            R_k   = Rotation.from_rotvec(rv_k).as_matrix()
+
+            delta_pos = R_base.T @ (pos_k - pos_base)
+            delta_rv  = Rotation.from_matrix(R_base.T @ R_k).as_rotvec()
+            delta = np.concatenate([delta_pos, delta_rv, [actions[j, 6]]])
+            all_deltas.append(delta)
+
+    all_deltas_arr = np.array(all_deltas, dtype=np.float32)  # (M, 7)
+    all_deltas_t   = torch.from_numpy(all_deltas_arr)
 
     quantiles = [0.01, 0.10, 0.50, 0.90, 0.99]
-    q_values = torch.quantile(all_actions_t, torch.tensor(quantiles), dim=0)
+    q_values  = torch.quantile(all_deltas_t, torch.tensor(quantiles), dim=0)
 
     new_stats: dict[str, np.ndarray] = {
-        "mean":  all_actions_t.mean(dim=0).numpy(),
-        "std":   all_actions_t.std(dim=0).numpy(),
-        "min":   all_actions_t.min(dim=0).values.numpy(),
-        "max":   all_actions_t.max(dim=0).values.numpy(),
-        "count": np.array([float(all_actions_t.shape[0])]),
+        "mean":  all_deltas_arr.mean(axis=0),
+        "std":   all_deltas_arr.std(axis=0),
+        "min":   all_deltas_arr.min(axis=0),
+        "max":   all_deltas_arr.max(axis=0),
+        "count": np.array([float(len(all_deltas_arr))]),
         "q01":   q_values[0].numpy(),
         "q10":   q_values[1].numpy(),
         "q50":   q_values[2].numpy(),
@@ -161,12 +204,55 @@ def _recompute_action_stats_after_umi_transform(dataset, cfg: UMITrainConfig) ->
     dataset.meta.stats.pop("observation.umi_pose", None)
 
     logging.info(
-        f"[UMI] action stats 已更新：\n"
+        f"[UMI] action stats 已更新（共 {len(all_deltas_arr)} 个 delta 样本）：\n"
         f"  旧 mean (绝对位姿): {old_mean}\n"
         f"  新 mean (delta):    {new_stats['mean']}\n"
         f"  新 std  (delta):    {new_stats['std']}\n"
         f"  新 min  (delta):    {new_stats['min']}\n"
         f"  新 max  (delta):    {new_stats['max']}"
+    )
+
+
+def _recompute_action_stats_via_dataloader(dataset, cfg: UMITrainConfig) -> None:
+    """_recompute_action_stats_after_umi_transform 的 DataLoader 回退实现（含视频解码）。"""
+    import numpy as np
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=64,
+        shuffle=False,
+        num_workers=min(cfg.num_workers, 4),
+        drop_last=False,
+        pin_memory=False,
+    )
+    all_actions: list[torch.Tensor] = []
+    for batch in tqdm(loader, desc="[UMI] 重算 action stats (DL)", leave=False):
+        batch = apply_umi_sample_relative_transform(batch, remove_umi_pose=False)
+        act = batch["action"]
+        if act.dim() == 3:
+            act = act.reshape(-1, act.shape[-1])
+        all_actions.append(act.cpu().float())
+    all_actions_t = torch.cat(all_actions, dim=0)
+
+    quantiles = [0.01, 0.10, 0.50, 0.90, 0.99]
+    q_values  = torch.quantile(all_actions_t, torch.tensor(quantiles), dim=0)
+    new_stats: dict[str, np.ndarray] = {
+        "mean":  all_actions_t.mean(dim=0).numpy(),
+        "std":   all_actions_t.std(dim=0).numpy(),
+        "min":   all_actions_t.min(dim=0).values.numpy(),
+        "max":   all_actions_t.max(dim=0).values.numpy(),
+        "count": np.array([float(all_actions_t.shape[0])]),
+        "q01":   q_values[0].numpy(),
+        "q10":   q_values[1].numpy(),
+        "q50":   q_values[2].numpy(),
+        "q90":   q_values[3].numpy(),
+        "q99":   q_values[4].numpy(),
+    }
+    old_mean = dataset.meta.stats["action"]["mean"]
+    dataset.meta.stats["action"] = new_stats
+    dataset.meta.stats.pop("observation.umi_pose", None)
+    logging.info(
+        f"[UMI] action stats 已更新：旧 mean={old_mean}，新 mean={new_stats['mean']}"
     )
 
 
