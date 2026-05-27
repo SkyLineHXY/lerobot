@@ -1,0 +1,68 @@
+# 用法：
+#   python -m lerobot.scripts.lerobot_collect_franka_multicam \
+#       --config_path configs/collect_franka_multicam.yaml
+#
+# 键盘控制：
+#   c      开始 / 继续采集当前 episode
+#   space  暂停采集
+#   s      保存当前 episode
+#   r      清除当前未保存缓存帧
+#   q      finalize 并退出
+robot:
+  robot_ip: 192.168.172.134
+  robot_port: 4242
+teleop:
+  type: spacemouse
+  use_gripper: true
+  use_rotation: true
+  position_scale: 0.003
+  orientation_scale: 0.02
+#  cameras:
+#    cam_top:
+#      type: opencv_zmq
+#      mode: remote
+#      host: 192.168.172.252
+#      port: 4245
+#      topic: cam_top
+#      fps: 30
+#      width: 320
+#      height: 240
+#      index_or_path: 0
+#    cam_left:
+#      type: opencv_zmq
+#      mode: remote
+#      host: 192.168.172.252
+#      port: 4244
+#      topic: cam_left
+#      fps: 30
+#      width: 320
+#      height: 240
+#      index_or_path: 0
+#    cam_right:
+#      type: opencv_zmq
+#      mode: remote
+#      host: 192.168.172.134
+#      port: 4246
+#      topic: cam_right
+#      fps: 15
+#      width: 640
+#      height: 480
+#      index_or_path: 0
+
+dataset:
+  repo_id: zzq/franka_multicam_demo
+  root: /home/zzq/lerobot/datasets/franka_multicam_demo_0516_v1
+  single_task: "franka multicam demo"
+  fps: 15
+  num_episodes: 100
+  episode_time_s: 10
+  push_to_hub: false
+
+collection:
+  max_frames_per_episode: null
+  min_frames_before_save: 1
+  print_every_n_frames: 30
+
+display_data: false
+play_sounds: true
+resume: false

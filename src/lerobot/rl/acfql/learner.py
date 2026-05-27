@@ -43,16 +43,12 @@ in your configuration.
 For more details on the complete HILSerl training workflow, see:
 https://github.com/michel-aractingi/lerobot-hilserl-guide
 """
-
 import logging
 import os
 import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from pprint import pformat
 
-import grpc
 import torch
 from termcolor import colored
 from torch import nn
@@ -61,21 +57,24 @@ from torch.optim.optimizer import Optimizer
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
-from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.factory import make_policy
-from lerobot.policies.sac.modeling_sac import SACPolicy
-from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
+from lerobot.policies.acfql.modeling_acfql import ACFQLPolicy
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.processor.pipeline import PolicyProcessorPipeline
+from lerobot.rl.learner import (
+    check_nan_in_transition,
+    load_training_state,
+    log_training_info,
+    process_interaction_messages,
+    start_learner,
+    use_threads,
+)
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.robots import so100_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
-from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.transport import services_pb2_grpc
 from lerobot.transport.utils import (
-    MAX_MESSAGE_SIZE,
-    bytes_to_python_object,
     bytes_to_transitions,
     state_to_bytes,
 )
@@ -89,18 +88,20 @@ from lerobot.utils.constants import (
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
-    load_training_state as utils_load_training_state,
     save_checkpoint,
     update_last_checkpoint,
 )
 from lerobot.utils.transition import move_state_dict_to_device, move_transition_to_device
 from lerobot.utils.utils import (
-    format_big_number,
     get_safe_torch_device,
     init_logging,
 )
 
-from lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
+from lerobot.rl.acfql.buffer import (
+    ReplayBufferNSteps as ReplayBuffer,
+    concatenate_batch_transitions_nstep as concatenate_batch_transitions,
+)
+from lerobot.rl.acfql.configs import ACFQLTrainRLServerPipelineConfig as TrainRLServerPipelineConfig
 
 
 @parser.wrap()
@@ -270,7 +271,7 @@ def add_actor_information_and_train(
 
     NOTE: This function doesn't have a single responsibility, it should be split into multiple functions
     in the future. The reason why we did that is the  GIL in Python. It's super slow the performance
-    are divided by 200. So we need to have a single thread that does all the work.
+    is divided by 200. So we need to have a single thread that does all the work.
 
     Args:
         cfg (TrainRLServerPipelineConfig): Configuration object containing hyperparameters.
@@ -294,6 +295,7 @@ def add_actor_information_and_train(
     policy_parameters_push_frequency = cfg.policy.actor_learner_config.policy_parameters_push_frequency
     saving_checkpoint = cfg.save_checkpoint
     online_steps = cfg.policy.online_steps
+    offline_steps = cfg.policy.offline_steps
     async_prefetch = cfg.policy.async_prefetch
 
     # Initialize logging for multiprocessing
@@ -306,7 +308,7 @@ def add_actor_information_and_train(
 
     logging.info("Initializing policy")
 
-    policy: SACPolicy = make_policy(
+    policy: ACFQLPolicy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
     )
@@ -315,7 +317,39 @@ def add_actor_information_and_train(
 
     policy.train()
 
-    push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+    # Create processors - only provide dataset_stats if not resuming from saved processors
+    processor_kwargs = {}
+    postprocessor_kwargs = {}
+    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
+        # Only provide dataset_stats when not resuming from saved processor state
+        processor_kwargs["dataset_stats"] = cfg.policy.dataset_stats
+
+    if cfg.policy.pretrained_path is not None:
+        processor_kwargs["preprocessor_overrides"] = {
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
+                "stats": cfg.policy.dataset_stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+        postprocessor_kwargs["postprocessor_overrides"] = {
+            "unnormalizer_processor": {
+                "stats": cfg.policy.dataset_stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=cfg.policy,
+        pretrained_path=cfg.policy.pretrained_path,
+        **processor_kwargs,
+        **postprocessor_kwargs,
+    )
+
+    # This was commented because the policy will be sent to the actor when the online phase starts
+    # push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
 
     last_time_policy_pushed = time.time()
 
@@ -326,30 +360,369 @@ def add_actor_information_and_train(
 
     log_training_info(cfg=cfg, policy=policy)
 
-    replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
     batch_size = cfg.batch_size
+    replay_buffer = None
     offline_replay_buffer = None
 
-    if cfg.dataset is not None:
+    if online_steps > 0:
+        replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
+
+    if cfg.dataset is not None and offline_steps > 0:
         offline_replay_buffer = initialize_offline_replay_buffer(
             cfg=cfg,
             device=device,
             storage_device=storage_device,
         )
-        batch_size: int = batch_size // 2  # We will sample from both replay buffer
+        # batch_size: int = batch_size // 2  # We will sample from both replay buffer
 
     logging.info("Starting learner thread")
     interaction_message = None
     optimization_step = resume_optimization_step if resume_optimization_step is not None else 0
+    offline_step = min(offline_steps, optimization_step) if resume_optimization_step is not None else 0
     interaction_step_shift = resume_interaction_step if resume_interaction_step is not None else 0
 
     dataset_repo_id = None
     if cfg.dataset is not None:
         dataset_repo_id = cfg.dataset.repo_id
 
-    # Initialize iterators
-    online_iterator = None
+    # =============================================================================
+    # PHASE 1: OFFLINE PRETRAINING
+    # =============================================================================
+
     offline_iterator = None
+
+    if offline_steps > 0 and offline_replay_buffer is not None and optimization_step < offline_steps:
+        logging.info(f"[LEARNER] Starting offline pretraining for {offline_steps} steps")
+
+        offline_iterator = offline_replay_buffer.get_iterator_nstep(
+            batch_size=batch_size,
+            n_steps=cfg.policy.chunk_size,
+            gamma=cfg.policy.discount,
+            async_prefetch=async_prefetch,
+            queue_size=2,
+        )
+
+        for _ in range(offline_step, offline_steps):
+            if shutdown_event is not None and shutdown_event.is_set():
+                logging.info("[LEARNER] Shutdown signal received during offline training. Exiting...")
+                return
+
+            time_for_one_optimization_step = time.time()
+            for _ in range(utd_ratio - 1):
+                batch = next(offline_iterator)
+
+                # Extract n-step batch components
+                actions = batch[ACTION]  # [B, h, action_dim]
+                observations = batch["state"]
+                next_observations = batch["next_state"]
+
+                # TODO(jpizarrom): encapsulate this, find a better way to avoid permute many times
+                observations = preprocessor(
+                    {
+                        **{"observation.state": observations["observation.state"]},
+                        # [B, C, H, W] -> [B, H, W, C]
+                        **{
+                            k: v.permute(0, 2, 3, 1)
+                            for k, v in observations.items()
+                            if "observation.images" in k
+                        },
+                        **{"action": actions},
+                    }
+                )
+
+                actions = observations.pop("action")
+
+                # The preprocessor may add extra keys, filter them out
+                observations = {k: v for k, v in observations.items() if k in cfg.policy.input_features}
+
+                observations = {
+                    **{"observation.state": observations["observation.state"]},
+                    # [B, H, W, C] -> [B, C, H, W]
+                    **{
+                        k: v.permute(0, 3, 1, 2) for k, v in observations.items() if "observation.images" in k
+                    },
+                }
+
+                next_observations = preprocessor(
+                    {
+                        **{"observation.state": next_observations["observation.state"]},
+                        # [B, C, H, W] -> [B, H, W, C]
+                        **{
+                            k: v.permute(0, 2, 3, 1)
+                            for k, v in next_observations.items()
+                            if "observation.images" in k
+                        },
+                    }
+                )
+                # The preprocessor may add extra keys, filter them out
+                next_observations = {
+                    k: v for k, v in next_observations.items() if k in cfg.policy.input_features
+                }
+                next_observations = {
+                    **{"observation.state": next_observations["observation.state"]},
+                    # [B, H, W, C] -> [B, C, H, W]
+                    **{
+                        k: v.permute(0, 3, 1, 2)
+                        for k, v in next_observations.items()
+                        if "observation.images" in k
+                    },
+                }
+
+                check_nan_in_transition(
+                    observations=observations,
+                    actions=actions.reshape(actions.shape[0], -1),
+                    next_state=next_observations,
+                )
+
+                observation_features, next_observation_features = get_observation_features(
+                    policy=policy,
+                    observations=observations,
+                    next_observations=next_observations,
+                )
+
+                # Create a batch dictionary with all required elements for the forward method
+                forward_batch = {
+                    "state": observations,
+                    ACTION: actions,
+                    "reward": batch["reward"],
+                    "terminal": batch.get("terminals"),
+                    "mask": batch.get("masks"),
+                    "valid": batch.get("valid"),
+                    "next_state": next_observations,
+                    "observation_feature": observation_features,
+                    "next_observation_feature": next_observation_features,
+                    "complementary_info": batch.get("complementary_info"),
+                }
+
+                # Use the forward method for critic loss
+                critic_output = policy.forward(forward_batch, model="critic")
+
+                # Main critic optimization
+                loss_critic = critic_output["loss_critic"]
+                optimizers["critic"].zero_grad()
+                loss_critic.backward()
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
+                )
+                optimizers["critic"].step()
+
+                # Update target networks
+                policy.update_target_networks()  # keep EMA on critic target as before
+
+            # Sample from the iterators
+            batch = next(offline_iterator)
+
+            # Extract n-step batch components
+            actions = batch[ACTION]  # [B, h, action_dim]
+            observations = batch["state"]
+            next_observations = batch["next_state"]
+
+            observations = preprocessor(
+                {
+                    **{"observation.state": observations["observation.state"]},
+                    # [B, C, H, W] -> [B, H, W, C]
+                    **{
+                        k: v.permute(0, 2, 3, 1) for k, v in observations.items() if "observation.images" in k
+                    },
+                    **{"action": actions},
+                }
+            )
+
+            actions = observations.pop("action")
+
+            # The preprocessor may add extra keys, filter them out
+            observations = {k: v for k, v in observations.items() if k in cfg.policy.input_features}
+
+            observations = {
+                **{"observation.state": observations["observation.state"]},
+                # [B, H, W, C] -> [B, C, H, W]
+                **{k: v.permute(0, 3, 1, 2) for k, v in observations.items() if "observation.images" in k},
+            }
+
+            next_observations = preprocessor(
+                {
+                    **{"observation.state": next_observations["observation.state"]},
+                    # [B, C, H, W] -> [B, H, W, C]
+                    **{
+                        k: v.permute(0, 2, 3, 1)
+                        for k, v in next_observations.items()
+                        if "observation.images" in k
+                    },
+                }
+            )
+            # The preprocessor may add extra keys, filter them out
+            next_observations = {k: v for k, v in next_observations.items() if k in cfg.policy.input_features}
+            next_observations = {
+                **{"observation.state": next_observations["observation.state"]},
+                # [B, H, W, C] -> [B, C, H, W]
+                **{
+                    k: v.permute(0, 3, 1, 2)
+                    for k, v in next_observations.items()
+                    if "observation.images" in k
+                },
+            }
+
+            check_nan_in_transition(
+                observations=observations,
+                actions=actions.reshape(actions.shape[0], -1),
+                next_state=next_observations,
+            )
+
+            observation_features, next_observation_features = get_observation_features(
+                policy=policy,
+                observations=observations,
+                next_observations=next_observations,
+            )
+
+            # Create a batch dictionary with all required elements for the forward method
+            forward_batch = {
+                "state": observations,
+                "action": actions,
+                "reward": batch["reward"],
+                "terminal": batch.get("terminals"),
+                "mask": batch.get("masks"),
+                "valid": batch.get("valid"),
+                "next_state": next_observations,
+                "observation_feature": observation_features,
+                "next_observation_feature": next_observation_features,
+                "complementary_info": batch.get("complementary_info"),
+            }
+
+            critic_output = policy.forward(forward_batch, model="critic")
+
+            loss_critic = critic_output["loss_critic"]
+            optimizers["critic"].zero_grad()
+            loss_critic.backward()
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
+            ).item()
+            optimizers["critic"].step()
+
+            training_infos = {
+                f"critic/{k}": v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in critic_output["info"].items()
+            }
+            training_infos["critic/grad_norm"] = critic_grad_norm
+
+            if optimization_step % policy_update_freq == 0:
+                for _ in range(policy_update_freq):
+                    # Actor BC flow optimization
+                    actor_bc_flow_output = policy.forward(forward_batch, model="actor_bc_flow")
+                    loss_actor_bc_flow = actor_bc_flow_output["loss_actor_bc_flow"]
+                    optimizers["actor_bc_flow"].zero_grad()
+                    loss_actor_bc_flow.backward()
+                    actor_bc_flow_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=policy.actor_bc_flow.parameters(), max_norm=clip_grad_norm_value
+                    ).item()
+                    optimizers["actor_bc_flow"].step()
+
+                    # Add actor info to training info
+                    # training_infos["actor_bc/loss"] = loss_actor_bc_flow.item()
+                    training_infos["actor_bc/grad_norm"] = actor_bc_flow_grad_norm
+
+                    training_infos.update(
+                        {
+                            f"actor_bc/{k}": v.item() if isinstance(v, torch.Tensor) else v
+                            for k, v in actor_bc_flow_output["info"].items()
+                        }
+                    )
+
+                    # Actor onestep flow optimization
+                    actor_onestep_flow_output = policy.forward(forward_batch, model="actor_onestep_flow")
+                    loss_actor_onestep_flow = actor_onestep_flow_output["loss_actor_onestep_flow"]
+                    optimizers["actor_onestep_flow"].zero_grad()
+                    loss_actor_onestep_flow.backward()
+                    actor_onestep_flow_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=policy.actor_onestep_flow.parameters(), max_norm=clip_grad_norm_value
+                    ).item()
+                    optimizers["actor_onestep_flow"].step()
+
+                    # Add actor info to training info
+                    # training_infos["actor_one/loss"] = loss_actor_onestep_flow.item()
+                    training_infos["actor_one/grad_norm"] = actor_onestep_flow_grad_norm
+
+                    training_infos.update(
+                        {
+                            f"actor_one/{k}": v.item() if isinstance(v, torch.Tensor) else v
+                            for k, v in actor_onestep_flow_output["info"].items()
+                        }
+                    )
+
+            # Logging
+            if optimization_step % log_freq == 0:
+                training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
+                training_infos["Optimization step"] = optimization_step
+                training_infos["phase"] = "offline"
+
+                # Calculate and log optimization frequency
+                time_for_one_optimization_step = time.time() - time_for_one_optimization_step
+                frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
+                training_infos["Optimization frequency loop [Hz]"] = frequency_for_one_optimization_step
+                logging.info(
+                    f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}"
+                )
+
+                if wandb_logger:
+                    wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
+
+                logging.info(
+                    f"[LEARNER] Offline step {offline_step}/{offline_steps}, optimization step {optimization_step}"
+                )
+
+            optimization_step += 1
+            offline_step += 1
+
+            # Save checkpoint
+            if saving_checkpoint and (
+                optimization_step % save_freq == 0 or optimization_step == offline_steps
+            ):
+                save_training_checkpoint(
+                    cfg=cfg,
+                    optimization_step=optimization_step,
+                    online_steps=online_steps,
+                    interaction_message=interaction_message,
+                    policy=policy,
+                    optimizers=optimizers,
+                    replay_buffer=replay_buffer if cfg.save_replay_buffer_on_checkpoint else None,
+                    offline_replay_buffer=offline_replay_buffer
+                    if cfg.save_offline_replay_buffer_on_checkpoint
+                    else None,
+                    dataset_repo_id=cfg.dataset.repo_id if cfg.dataset else None,
+                    fps=fps,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                )
+
+        logging.info(f"[LEARNER] Completed offline pretraining after {offline_steps} steps")
+
+    if online_steps == 0:
+        logging.info("[LEARNER] No online steps specified, training complete.")
+        return
+
+    # =============================================================================
+    # PHASE 2: ONLINE FINE-TUNING
+    # =============================================================================
+    logging.info("[LEARNER] Starting online fine-tuning phase")
+    logging.info(f"[LEARNER] Online step before learning steps: {online_step_before_learning}")
+    online_iterator = None
+
+    if cfg.dataset is not None and offline_replay_buffer is None:
+        offline_replay_buffer = initialize_offline_replay_buffer(
+            cfg=cfg,
+            device=device,
+            storage_device=storage_device,
+        )
+
+    if offline_iterator is not None:
+        # TODO(jpizarrom): clean memory used by offline iterator
+        offline_iterator = None
+
+    if dataset_repo_id is not None:
+        batch_size: int = batch_size // 2  # We will sample from both replay buffer
+
+    # Push policy to actors to start collecting transitions
+    push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
+    last_time_policy_pushed = time.time()
 
     # NOTE: THIS IS THE MAIN LOOP OF THE LEARNER
     while True:
@@ -380,33 +753,92 @@ def add_actor_information_and_train(
         if len(replay_buffer) < online_step_before_learning:
             continue
 
-        if online_iterator is None:
-            online_iterator = replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+        if offline_iterator is None and offline_replay_buffer is not None:
+            offline_iterator = offline_replay_buffer.get_iterator_nstep(
+                batch_size=batch_size,
+                n_steps=cfg.policy.chunk_size,
+                gamma=cfg.policy.discount,
+                async_prefetch=async_prefetch,
+                queue_size=2,
             )
 
-        if offline_replay_buffer is not None and offline_iterator is None:
-            offline_iterator = offline_replay_buffer.get_iterator(
-                batch_size=batch_size, async_prefetch=async_prefetch, queue_size=2
+        if online_iterator is None:
+            online_iterator = replay_buffer.get_iterator_nstep(
+                batch_size=batch_size,
+                n_steps=cfg.policy.chunk_size,
+                gamma=cfg.policy.discount,
+                async_prefetch=async_prefetch,
+                queue_size=2,
             )
 
         time_for_one_optimization_step = time.time()
         for _ in range(utd_ratio - 1):
             # Sample from the iterators
             batch = next(online_iterator)
-
             if dataset_repo_id is not None:
                 batch_offline = next(offline_iterator)
+                # Merge both batches
                 batch = concatenate_batch_transitions(
                     left_batch_transitions=batch, right_batch_transition=batch_offline
                 )
 
-            actions = batch[ACTION]
+            # Extract n-step batch components
+            actions = batch[ACTION]  # [B, h, action_dim]
             rewards = batch["reward"]
             observations = batch["state"]
             next_observations = batch["next_state"]
-            done = batch["done"]
-            check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+            # done = batch["done"]
+
+            observations = preprocessor(
+                {
+                    **{"observation.state": observations["observation.state"]},
+                    # [B, C, H, W] -> [B, H, W, C]
+                    **{
+                        k: v.permute(0, 2, 3, 1) for k, v in observations.items() if "observation.images" in k
+                    },
+                    **{"action": actions},
+                }
+            )
+
+            actions = observations.pop("action")
+
+            # The preprocessor may add extra keys, filter them out
+            observations = {k: v for k, v in observations.items() if k in cfg.policy.input_features}
+
+            observations = {
+                **{"observation.state": observations["observation.state"]},
+                # [B, H, W, C] -> [B, C, H, W]
+                **{k: v.permute(0, 3, 1, 2) for k, v in observations.items() if "observation.images" in k},
+            }
+
+            next_observations = preprocessor(
+                {
+                    **{"observation.state": next_observations["observation.state"]},
+                    # [B, C, H, W] -> [B, H, W, C]
+                    **{
+                        k: v.permute(0, 2, 3, 1)
+                        for k, v in next_observations.items()
+                        if "observation.images" in k
+                    },
+                }
+            )
+            # The preprocessor may add extra keys, filter them out
+            next_observations = {k: v for k, v in next_observations.items() if k in cfg.policy.input_features}
+            next_observations = {
+                **{"observation.state": next_observations["observation.state"]},
+                # [B, H, W, C] -> [B, C, H, W]
+                **{
+                    k: v.permute(0, 3, 1, 2)
+                    for k, v in next_observations.items()
+                    if "observation.images" in k
+                },
+            }
+
+            check_nan_in_transition(
+                observations=observations,
+                actions=actions.reshape(actions.shape[0], -1),
+                next_state=next_observations,
+            )
 
             observation_features, next_observation_features = get_observation_features(
                 policy=policy, observations=observations, next_observations=next_observations
@@ -417,8 +849,11 @@ def add_actor_information_and_train(
                 ACTION: actions,
                 "reward": rewards,
                 "state": observations,
+                "terminal": batch["terminals"],
+                "mask": batch["masks"],
+                "valid": batch["valid"],
                 "next_state": next_observations,
-                "done": done,
+                # "done": done,
                 "observation_feature": observation_features,
                 "next_observation_feature": next_observation_features,
                 "complementary_info": batch["complementary_info"],
@@ -436,36 +871,67 @@ def add_actor_information_and_train(
             )
             optimizers["critic"].step()
 
-            # Discrete critic optimization (if available)
-            if policy.config.num_discrete_actions is not None:
-                discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
-                loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
-                optimizers["discrete_critic"].zero_grad()
-                loss_discrete_critic.backward()
-                discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
-                )
-                optimizers["discrete_critic"].step()
-
             # Update target networks (main and discrete)
             policy.update_target_networks()
 
         # Sample for the last update in the UTD ratio
         batch = next(online_iterator)
-
         if dataset_repo_id is not None:
             batch_offline = next(offline_iterator)
+            # Merge both batches
             batch = concatenate_batch_transitions(
                 left_batch_transitions=batch, right_batch_transition=batch_offline
             )
 
-        actions = batch[ACTION]
+        # Extract n-step batch components
+        actions = batch[ACTION]  # [B, h, action_dim]
         rewards = batch["reward"]
         observations = batch["state"]
         next_observations = batch["next_state"]
-        done = batch["done"]
 
-        check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+        observations = preprocessor(
+            {
+                **{"observation.state": observations["observation.state"]},
+                # [B, C, H, W] -> [B, H, W, C]
+                **{k: v.permute(0, 2, 3, 1) for k, v in observations.items() if "observation.images" in k},
+                **{"action": actions},
+            }
+        )
+        actions = observations.pop("action")
+
+        # The preprocessor may add extra keys, filter them out
+        observations = {k: v for k, v in observations.items() if k in cfg.policy.input_features}
+
+        observations = {
+            **{"observation.state": observations["observation.state"]},
+            # [B, H, W, C] -> [B, C, H, W]
+            **{k: v.permute(0, 3, 1, 2) for k, v in observations.items() if "observation.images" in k},
+        }
+
+        next_observations = preprocessor(
+            {
+                **{"observation.state": next_observations["observation.state"]},
+                # [B, C, H, W] -> [B, H, W, C]
+                **{
+                    k: v.permute(0, 2, 3, 1)
+                    for k, v in next_observations.items()
+                    if "observation.images" in k
+                },
+            }
+        )
+        # The preprocessor may add extra keys, filter them out
+        next_observations = {k: v for k, v in next_observations.items() if k in cfg.policy.input_features}
+        next_observations = {
+            **{"observation.state": next_observations["observation.state"]},
+            # [B, H, W, C] -> [B, C, H, W]
+            **{k: v.permute(0, 3, 1, 2) for k, v in next_observations.items() if "observation.images" in k},
+        }
+
+        check_nan_in_transition(
+            observations=observations,
+            actions=actions.reshape(actions.shape[0], -1),
+            next_state=next_observations,
+        )
 
         observation_features, next_observation_features = get_observation_features(
             policy=policy, observations=observations, next_observations=next_observations
@@ -476,8 +942,11 @@ def add_actor_information_and_train(
             ACTION: actions,
             "reward": rewards,
             "state": observations,
+            "terminal": batch.get("terminals"),
+            "mask": batch.get("masks"),
+            "valid": batch.get("valid"),
             "next_state": next_observations,
-            "done": done,
+            # "done": done,
             "observation_feature": observation_features,
             "next_observation_feature": next_observation_features,
         }
@@ -494,56 +963,54 @@ def add_actor_information_and_train(
 
         # Initialize training info dictionary
         training_infos = {
-            "loss_critic": loss_critic.item(),
-            "critic_grad_norm": critic_grad_norm,
+            f"critic/{k}": v.item() if isinstance(v, torch.Tensor) else v
+            for k, v in critic_output["info"].items()
         }
+        training_infos["critic/grad_norm"] = critic_grad_norm
 
-        # Discrete critic optimization (if available)
-        if policy.config.num_discrete_actions is not None:
-            discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
-            loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
-            optimizers["discrete_critic"].zero_grad()
-            loss_discrete_critic.backward()
-            discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
-            ).item()
-            optimizers["discrete_critic"].step()
-
-            # Add discrete critic info to training info
-            training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
-            training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
-
-        # Actor and temperature optimization (at specified frequency)
+        # Actor optimization (at specified frequency)
         if optimization_step % policy_update_freq == 0:
             for _ in range(policy_update_freq):
-                # Actor optimization
-                actor_output = policy.forward(forward_batch, model="actor")
-                loss_actor = actor_output["loss_actor"]
-                optimizers["actor"].zero_grad()
-                loss_actor.backward()
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
+                # Actor BC flow optimization
+                actor_bc_flow_output = policy.forward(forward_batch, model="actor_bc_flow")
+                loss_actor_bc_flow = actor_bc_flow_output["loss_actor_bc_flow"]
+                optimizers["actor_bc_flow"].zero_grad()
+                loss_actor_bc_flow.backward()
+                actor_bc_flow_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.actor_bc_flow.parameters(), max_norm=clip_grad_norm_value
                 ).item()
-                optimizers["actor"].step()
+                optimizers["actor_bc_flow"].step()
 
                 # Add actor info to training info
-                training_infos["loss_actor"] = loss_actor.item()
-                training_infos["actor_grad_norm"] = actor_grad_norm
+                # training_infos["actor_bc/loss"] = loss_actor_bc_flow.item()
+                training_infos["actor_bc/grad_norm"] = actor_bc_flow_grad_norm
 
-                # Temperature optimization
-                temperature_output = policy.forward(forward_batch, model="temperature")
-                loss_temperature = temperature_output["loss_temperature"]
-                optimizers["temperature"].zero_grad()
-                loss_temperature.backward()
-                temp_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=[policy.log_alpha], max_norm=clip_grad_norm_value
+                training_infos.update(
+                    {
+                        f"actor_bc/{k}": v.item() if isinstance(v, torch.Tensor) else v
+                        for k, v in actor_bc_flow_output["info"].items()
+                    }
+                )
+
+                # Actor onestep flow optimization
+                actor_onestep_flow_output = policy.forward(forward_batch, model="actor_onestep_flow")
+                loss_actor_onestep_flow = actor_onestep_flow_output["loss_actor_onestep_flow"]
+                optimizers["actor_onestep_flow"].zero_grad()
+                loss_actor_onestep_flow.backward()
+                actor_onestep_flow_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.actor_onestep_flow.parameters(), max_norm=clip_grad_norm_value
                 ).item()
-                optimizers["temperature"].step()
+                optimizers["actor_onestep_flow"].step()
 
-                # Add temperature info to training info
-                training_infos["loss_temperature"] = loss_temperature.item()
-                training_infos["temperature_grad_norm"] = temp_grad_norm
-                training_infos["temperature"] = policy.temperature
+                # Add actor info to training info
+                training_infos["actor_one/grad_norm"] = actor_onestep_flow_grad_norm
+
+                training_infos.update(
+                    {
+                        f"actor_one/{k}": v.item() if isinstance(v, torch.Tensor) else v
+                        for k, v in actor_onestep_flow_output["info"].items()
+                    }
+                )
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
@@ -559,6 +1026,7 @@ def add_actor_information_and_train(
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
             training_infos["Optimization step"] = optimization_step
+            training_infos["phase"] = "online"
 
             # Log training metrics
             if wandb_logger:
@@ -594,81 +1062,15 @@ def add_actor_information_and_train(
                 interaction_message=interaction_message,
                 policy=policy,
                 optimizers=optimizers,
-                replay_buffer=replay_buffer,
-                offline_replay_buffer=offline_replay_buffer,
+                replay_buffer=replay_buffer if cfg.save_replay_buffer_on_checkpoint else None,
+                offline_replay_buffer=offline_replay_buffer
+                if cfg.save_offline_replay_buffer_on_checkpoint
+                else None,
                 dataset_repo_id=dataset_repo_id,
                 fps=fps,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
             )
-
-
-def start_learner(
-    parameters_queue: Queue,
-    transition_queue: Queue,
-    interaction_message_queue: Queue,
-    shutdown_event: any,  # Event,
-    cfg: TrainRLServerPipelineConfig,
-):
-    """
-    Start the learner server for training.
-    It will receive transitions and interaction messages from the actor server,
-    and send policy parameters to the actor server.
-
-    Args:
-        parameters_queue: Queue for sending policy parameters to the actor
-        transition_queue: Queue for receiving transitions from the actor
-        interaction_message_queue: Queue for receiving interaction messages from the actor
-        shutdown_event: Event to signal shutdown
-        cfg: Training configuration
-    """
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"learner_process_{os.getpid()}.log")
-
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Learner server process logging initialized")
-
-        # Setup process handlers to handle shutdown signal
-        # But use shutdown event from the main process
-        # Return back for MP
-        # TODO: Check if its useful
-        _ = ProcessSignalHandler(False, display_pid=True)
-
-    service = LearnerService(
-        shutdown_event=shutdown_event,
-        parameters_queue=parameters_queue,
-        seconds_between_pushes=cfg.policy.actor_learner_config.policy_parameters_push_frequency,
-        transition_queue=transition_queue,
-        interaction_message_queue=interaction_message_queue,
-        queue_get_timeout=cfg.policy.actor_learner_config.queue_get_timeout,
-    )
-
-    server = grpc.server(
-        ThreadPoolExecutor(max_workers=MAX_WORKERS),
-        options=[
-            ("grpc.max_receive_message_length", MAX_MESSAGE_SIZE),
-            ("grpc.max_send_message_length", MAX_MESSAGE_SIZE),
-        ],
-    )
-
-    services_pb2_grpc.add_LearnerServiceServicer_to_server(
-        service,
-        server,
-    )
-
-    host = cfg.policy.actor_learner_config.learner_host
-    port = cfg.policy.actor_learner_config.learner_port
-
-    server.add_insecure_port(f"{host}:{port}")
-    server.start()
-    logging.info("[LEARNER] gRPC server started")
-
-    shutdown_event.wait()
-    logging.info("[LEARNER] Stopping gRPC server...")
-    server.stop(SHUTDOWN_TIMEOUT)
-    logging.info("[LEARNER] gRPC server stopped")
 
 
 def save_training_checkpoint(
@@ -682,6 +1084,8 @@ def save_training_checkpoint(
     offline_replay_buffer: ReplayBuffer | None = None,
     dataset_repo_id: str | None = None,
     fps: int = 30,
+    preprocessor: PolicyProcessorPipeline | None = None,
+    postprocessor: PolicyProcessorPipeline | None = None,
 ) -> None:
     """
     Save training checkpoint and associated data.
@@ -705,6 +1109,8 @@ def save_training_checkpoint(
         offline_replay_buffer: Optional offline replay buffer to save
         dataset_repo_id: Repository ID for dataset
         fps: Frames per second for dataset
+        preprocessor: Optional preprocessor for dataset
+        postprocessor: Optional postprocessor for dataset
     """
     logging.info(f"Checkpoint policy after step {optimization_step}")
     _num_digits = max(6, len(str(online_steps)))
@@ -721,6 +1127,8 @@ def save_training_checkpoint(
         policy=policy,
         optimizer=optimizers,
         scheduler=None,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
     )
 
     # Save interaction step manually
@@ -741,11 +1149,16 @@ def save_training_checkpoint(
     # Save dataset
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    if replay_buffer is not None and len(replay_buffer) > 0:
+        repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
+        logging.info(f"Saving replay buffer to {dataset_dir} with repo id {repo_id_buffer_save}")
+        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
     if offline_replay_buffer is not None:
         dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+        logging.info(
+            f"Saving offline replay buffer to {dataset_offline_dir} with repo id {cfg.dataset.repo_id}"
+        )
         if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
             shutil.rmtree(dataset_offline_dir)
 
@@ -763,15 +1176,12 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
     Creates and returns optimizers for the actor, critic, and temperature components of a reinforcement learning policy.
 
     This function sets up Adam optimizers for:
-    - The **actor network**, ensuring that only relevant parameters are optimized.
+    - The **actor BC network**, Behavior Cloning actor.
+    - The **actor onestep network**, One-step actor.
     - The **critic ensemble**, which evaluates the value function.
-    - The **temperature parameter**, which controls the entropy in soft actor-critic (SAC)-like methods.
 
     It also initializes a learning rate scheduler, though currently, it is set to `None`.
 
-    NOTE:
-    - If the encoder is shared, its parameters are excluded from the actor's optimization process.
-    - The policy's log temperature (`log_alpha`) is wrapped in a list to ensure proper optimization as a standalone tensor.
 
     Args:
         cfg: Configuration object containing hyperparameters.
@@ -784,29 +1194,23 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
         - `lr_scheduler`: Currently set to `None` but can be extended to support learning rate scheduling.
 
     """
-    optimizer_actor = torch.optim.Adam(
-        params=[
-            p
-            for n, p in policy.actor.named_parameters()
-            if not policy.config.shared_encoder or not n.startswith("encoder")
-        ],
-        lr=cfg.policy.actor_lr,
-    )
-    optimizer_critic = torch.optim.Adam(params=policy.critic_ensemble.parameters(), lr=cfg.policy.critic_lr)
+    optimizer_params = policy.get_optim_params()
 
-    if cfg.policy.num_discrete_actions is not None:
-        optimizer_discrete_critic = torch.optim.Adam(
-            params=policy.discrete_critic.parameters(), lr=cfg.policy.critic_lr
-        )
-    optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.critic_lr)
+    optimizer_actor_bc_flow = torch.optim.Adam(
+        params=optimizer_params["actor_bc_flow"], lr=cfg.policy.actor_lr
+    )
+    optimizer_actor_onestep_flow = torch.optim.Adam(
+        params=optimizer_params["actor_onestep_flow"], lr=cfg.policy.actor_lr
+    )
+    optimizer_critic = torch.optim.Adam(params=optimizer_params["critic"], lr=cfg.policy.critic_lr)
+
     lr_scheduler = None
     optimizers = {
-        "actor": optimizer_actor,
+        "actor_bc_flow": optimizer_actor_bc_flow,
+        "actor_onestep_flow": optimizer_actor_onestep_flow,
         "critic": optimizer_critic,
-        "temperature": optimizer_temperature,
     }
-    if cfg.policy.num_discrete_actions is not None:
-        optimizers["discrete_critic"] = optimizer_discrete_critic
+
     return optimizers, lr_scheduler
 
 
@@ -867,66 +1271,11 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
 
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
+
+    # This is needed to populate pretrained_path and checkpoint_path
+    checkpoint_cfg.validate()
+
     return checkpoint_cfg
-
-
-def load_training_state(
-    cfg: TrainRLServerPipelineConfig,
-    optimizers: Optimizer | dict[str, Optimizer],
-):
-    """
-    Loads the training state (optimizers, step count, etc.) from a checkpoint.
-
-    Args:
-        cfg (TrainRLServerPipelineConfig): Training configuration
-        optimizers (Optimizer | dict): Optimizers to load state into
-
-    Returns:
-        tuple: (optimization_step, interaction_step) or (None, None) if not resuming
-    """
-    if not cfg.resume:
-        return None, None
-
-    # Construct path to the last checkpoint directory
-    checkpoint_dir = os.path.join(cfg.output_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
-
-    logging.info(f"Loading training state from {checkpoint_dir}")
-
-    try:
-        # Use the utility function from train_utils which loads the optimizer state
-        step, optimizers, _ = utils_load_training_state(Path(checkpoint_dir), optimizers, None)
-
-        # Load interaction step separately from training_state.pt
-        training_state_path = os.path.join(checkpoint_dir, TRAINING_STATE_DIR, "training_state.pt")
-        interaction_step = 0
-        if os.path.exists(training_state_path):
-            training_state = torch.load(training_state_path, weights_only=False)  # nosec B614: Safe usage of torch.load
-            interaction_step = training_state.get("interaction_step", 0)
-
-        logging.info(f"Resuming from step {step}, interaction step {interaction_step}")
-        return step, interaction_step
-
-    except Exception as e:
-        logging.error(f"Failed to load training state: {e}")
-        return None, None
-
-
-def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> None:
-    """
-    Log information about the training process.
-
-    Args:
-        cfg (TrainRLServerPipelineConfig): Training configuration
-        policy (nn.Module): Policy model
-    """
-    num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    num_total_params = sum(p.numel() for p in policy.parameters())
-
-    logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
-    logging.info(f"{cfg.env.task=}")
-    logging.info(f"{cfg.policy.online_steps=}")
-    logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
-    logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
 
 def initialize_replay_buffer(
@@ -943,7 +1292,28 @@ def initialize_replay_buffer(
     Returns:
         ReplayBuffer: Initialized replay buffer
     """
-    if not cfg.resume:
+
+    dataset_path = os.path.join(cfg.output_dir, "dataset")
+
+    if cfg.resume and os.path.exists(dataset_path):
+        logging.info("Resume training load the online dataset")
+
+        # NOTE: In RL is possible to not have a dataset.
+        repo_id = None
+        if cfg.dataset is not None:
+            repo_id = cfg.dataset.repo_id
+        dataset = LeRobotDataset(
+            repo_id=repo_id,
+            root=dataset_path,
+        )
+    elif not cfg.resume and cfg.online_dataset is not None:
+        logging.info(f"Load the online dataset from the repo {cfg.online_dataset.repo_id}")
+        dataset = LeRobotDataset(
+            repo_id=cfg.online_dataset.repo_id,
+            # root=cfg.online_dataset.path,
+        )
+    else:
+        logging.info("Make an empty online replay buffer")
         return ReplayBuffer(
             capacity=cfg.policy.online_buffer_capacity,
             device=device,
@@ -952,17 +1322,6 @@ def initialize_replay_buffer(
             optimize_memory=True,
         )
 
-    logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join(cfg.output_dir, "dataset")
-
-    # NOTE: In RL is possible to not have a dataset.
-    repo_id = None
-    if cfg.dataset is not None:
-        repo_id = cfg.dataset.repo_id
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=dataset_path,
-    )
     return ReplayBuffer.from_lerobot_dataset(
         lerobot_dataset=dataset,
         capacity=cfg.policy.online_buffer_capacity,
@@ -988,12 +1347,13 @@ def initialize_offline_replay_buffer(
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
-    if not cfg.resume:
+    dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
+
+    if not cfg.resume or not os.path.exists(dataset_offline_path):
         logging.info("make_dataset offline buffer")
         offline_dataset = make_dataset(cfg)
     else:
         logging.info("load offline dataset")
-        dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
         offline_dataset = LeRobotDataset(
             repo_id=cfg.dataset.repo_id,
             root=dataset_offline_path,
@@ -1015,7 +1375,7 @@ def initialize_offline_replay_buffer(
 
 
 def get_observation_features(
-    policy: SACPolicy, observations: torch.Tensor, next_observations: torch.Tensor
+    policy: ACFQLPolicy, observations: torch.Tensor, next_observations: torch.Tensor
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """
     Get observation features from the policy encoder. It act as cache for the observation features.
@@ -1035,67 +1395,19 @@ def get_observation_features(
         return None, None
 
     with torch.no_grad():
-        observation_features = policy.actor.encoder.get_cached_image_features(observations)
-        next_observation_features = policy.actor.encoder.get_cached_image_features(next_observations)
+        observation_features = policy.actor_onestep_flow.encoder.get_cached_image_features(observations)
+        next_observation_features = policy.actor_onestep_flow.encoder.get_cached_image_features(
+            next_observations
+        )
 
     return observation_features, next_observation_features
-
-
-def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
-    return cfg.policy.concurrency.learner == "threads"
-
-
-def check_nan_in_transition(
-    observations: torch.Tensor,
-    actions: torch.Tensor,
-    next_state: torch.Tensor,
-    raise_error: bool = False,
-) -> bool:
-    """
-    Check for NaN values in transition data.
-
-    Args:
-        observations: Dictionary of observation tensors
-        actions: Action tensor
-        next_state: Dictionary of next state tensors
-        raise_error: If True, raises ValueError when NaN is detected
-
-    Returns:
-        bool: True if NaN values were detected, False otherwise
-    """
-    nan_detected = False
-
-    # Check observations
-    for key, tensor in observations.items():
-        if torch.isnan(tensor).any():
-            logging.error(f"observations[{key}] contains NaN values")
-            nan_detected = True
-            if raise_error:
-                raise ValueError(f"NaN detected in observations[{key}]")
-
-    # Check next state
-    for key, tensor in next_state.items():
-        if torch.isnan(tensor).any():
-            logging.error(f"next_state[{key}] contains NaN values")
-            nan_detected = True
-            if raise_error:
-                raise ValueError(f"NaN detected in next_state[{key}]")
-
-    # Check actions
-    if torch.isnan(actions).any():
-        logging.error("actions contains NaN values")
-        nan_detected = True
-        if raise_error:
-            raise ValueError("NaN detected in actions")
-
-    return nan_detected
 
 
 def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
     logging.debug("[LEARNER] Pushing actor policy to the queue")
 
     # Create a dictionary to hold all the state dicts
-    state_dicts = {"policy": move_state_dict_to_device(policy.actor.state_dict(), device="cpu")}
+    state_dicts = {"policy": move_state_dict_to_device(policy.actor_onestep_flow.state_dict(), device="cpu")}
 
     # Add discrete critic if it exists
     if hasattr(policy, "discrete_critic") and policy.discrete_critic is not None:
@@ -1106,21 +1418,6 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
 
     state_bytes = state_to_bytes(state_dicts)
     parameters_queue.put(state_bytes)
-
-
-def process_interaction_message(
-    message, interaction_step_shift: int, wandb_logger: WandBLogger | None = None
-):
-    """Process a single interaction message with consistent handling."""
-    message = bytes_to_python_object(message)
-    # Shift interaction step for consistency with checkpointed state
-    message["Interaction step"] += interaction_step_shift
-
-    # Log if logger available
-    if wandb_logger:
-        wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
-
-    return message
 
 
 def process_transitions(
@@ -1160,39 +1457,12 @@ def process_transitions(
             replay_buffer.add(**transition)
 
             # Add to offline buffer if it's an intervention
-            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
-                TeleopEvents.IS_INTERVENTION
-            ):
-                offline_replay_buffer.add(**transition)
-
-
-def process_interaction_messages(
-    interaction_message_queue: Queue,
-    interaction_step_shift: int,
-    wandb_logger: WandBLogger | None,
-    shutdown_event: any,
-) -> dict | None:
-    """Process all available interaction messages from the queue.
-
-    Args:
-        interaction_message_queue: Queue for receiving interaction messages
-        interaction_step_shift: Amount to shift interaction step by
-        wandb_logger: Logger for tracking progress
-        shutdown_event: Event to signal shutdown
-
-    Returns:
-        dict | None: The last interaction message processed, or None if none were processed
-    """
-    last_message = None
-    while not interaction_message_queue.empty() and not shutdown_event.is_set():
-        message = interaction_message_queue.get()
-        last_message = process_interaction_message(
-            message=message,
-            interaction_step_shift=interaction_step_shift,
-            wandb_logger=wandb_logger,
-        )
-
-    return last_message
+            # TODO(jpizarrom): single intervention should not be added to offline buffer when using action chunks, but a chunk where there are intervention make sense
+            # TODO(jpizarrom): Review if the enum or the str value is available in the complementary info
+            # if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
+            #     TeleopEvents.IS_INTERVENTION
+            # ):
+            #     offline_replay_buffer.add(**transition)
 
 
 if __name__ == "__main__":

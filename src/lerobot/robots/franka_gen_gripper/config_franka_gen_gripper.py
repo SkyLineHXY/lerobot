@@ -1,5 +1,4 @@
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.franka.config_franka import FrankaConfig
@@ -9,30 +8,32 @@ from lerobot.robots.gen_gripper.config_umi_gripper import UmiGripperConfig
 @RobotConfig.register_subclass("franka_gen_gripper")
 @dataclass
 class FrankaGenGripperConfig(RobotConfig):
-    # ---- Franka arm settings ----
     robot_ip: str = "192.168.172.134"
     robot_port: int = 4242
     control_mode: str = "cartesian_impedance"
 
-    # ---- UMI gripper settings ----
     gripper_side: str = "left"
-    gripper_serial_port: Optional[str] = None
+    gripper_serial_port: str | None = None
     gripper_camera_width: int = 640
     gripper_camera_height: int = 480
     gripper_camera_count: int = 3
     gripper_camera_show_preview: bool = False
-    gripper_video_devices: Optional[list[str]] = None
+    gripper_video_devices: list[str] | None = None
     gripper_enable_tactile: bool = False
     gripper_encoder_freq: float = 30.0
 
-    # ---- UMI ee6d 坐标变换配置 ----
+    # 是否对 camera1/camera2 做中心裁切（与 mcap_to_lerobotv3.py --stereo-crop 行为一致）
+    stereo_crop: bool = False
+    # 裁切后保留的比例（0 < ratio ≤ 1），裁切后 resize 到 gripper_camera_height/width
+    stereo_crop_ratio: float = 0.75
+
     # hand-eye 标定 YAML（parent_frame: panda_link8, child_frame: camera_color_optical_frame）
-    camera_extrinsic_yaml_path: Optional[str] = '/home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml'
+    camera_extrinsic_yaml_path: str | None = (
+        "/home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml"
+    )
 
-    # ---- 笛卡尔阻抗控制增益（None 使用 Franka 类默认值）----
-    Kx: Optional[list[float]] = None
-    Kxd: Optional[list[float]] = None
-
+    Kx: list[float] | None = None  # None 使用 Franka 类默认值
+    Kxd: list[float] | None = None
 
     def build_franka_config(self) -> FrankaConfig:
         """Build a FrankaConfig from the combined config's arm settings."""

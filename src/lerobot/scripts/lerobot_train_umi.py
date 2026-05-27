@@ -1,45 +1,4 @@
 #!/usr/bin/env python3
-"""UMI + Franka 专用训练脚本。
-
-与 lerobot_train.py 的区别：
-1. 每个 batch 在 preprocessor 之前自动应用 apply_umi_sample_relative_transform，
-   将数据集中存储的 world_flange 绝对位姿 action 转换为 sample-relative 增量。
-2. 启动时校验数据集包含 observation.umi_pose（world_flange 格式必需）。
-3. 移除 gym 仿真评估路径（真机策略不使用 gym env）。
-4. 新增 umi_transform 标志，可通过 --umi_transform=false 关闭变换（用于 legacy 格式）。
-
-用法
-----
-单 GPU（推荐先跑验证）::
-
-    python -m lerobot.scripts.lerobot_train_umi \\
-        --dataset.repo_id=yourname/pick_and_place \\
-        --dataset.root=/path/to/output_dataset \\
-        --policy.type=act \\
-        --policy.chunk_size=100 \\
-        --policy.n_action_steps=50 \\
-        --policy.input_features.observation.images.camera0.type=VISUAL \\
-        --policy.input_features.observation.images.camera0.shape='[3,480,640]' \\
-        --policy.input_features.observation.state.type=STATE \\
-        --policy.input_features.observation.state.shape='[1]' \\
-        --policy.output_features.action.type=ACTION \\
-        --policy.output_features.action.shape='[7]' \\
-        --batch_size=16 \\
-        --steps=200000 \\
-        --output_dir=/path/to/checkpoints/act_umi
-
-恢复训练::
-
-    python -m lerobot.scripts.lerobot_train_umi \\
-        --config_path=/path/to/checkpoints/act_umi/checkpoints/000050/pretrained_model/train_config.json \\
-        --resume=true
-
-关闭 UMI 变换（用于旧格式 ee_at_t0_flange 8D 数据集）::
-
-    python -m lerobot.scripts.lerobot_train_umi \\
-        ... \\
-        --umi_transform=false
-"""
 
 import dataclasses
 import logging
@@ -70,7 +29,6 @@ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
-    get_step_identifier,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
@@ -215,6 +173,7 @@ def _recompute_action_stats_after_umi_transform(dataset, cfg: UMITrainConfig) ->
 # ──────────────────────────────────────────────────────────────────────────────
 # 单步更新（与 lerobot_train.py 完全相同，便于独立使用）
 # ──────────────────────────────────────────────────────────────────────────────
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -461,6 +420,7 @@ def train(cfg: UMITrainConfig, accelerator: Accelerator | None = None):
         batch = next(dl_iter)
 
         # UMI sample-relative 变换：绝对法兰位姿 → 相对当前 EE 的增量
+        # 必须在 preprocessor（归一化）之前执行，保证 SE(3) 运算基于原始尺度
         if cfg.umi_transform:
             batch = apply_umi_sample_relative_transform(batch)
 

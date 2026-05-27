@@ -49,40 +49,41 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 import logging
 import os
 import time
-from functools import lru_cache
-from lerobot.rl.rl_queue import Empty
+from pprint import pformat
 
-import grpc
 import torch
 from torch import nn
-from torch.multiprocessing import Event, Queue
+from torch.multiprocessing import Queue
 
 from lerobot.cameras import opencv  # noqa: F401
 from lerobot.configs import parser
-from lerobot.configs.train import TrainRLServerPipelineConfig
-from lerobot.policies.factory import make_policy
-from lerobot.policies.sac.modeling_sac import SACPolicy
+from lerobot.policies.acfql.modeling_acfql import ACFQLPolicy
+from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor import TransitionKey
+from lerobot.rl.actor import (
+    establish_learner_connection,
+    learner_service_client,
+    log_policy_frequency_issue,
+    push_transitions_to_transport_queue,
+    receive_policy,
+    send_interactions,
+    send_transitions,
+    use_threads,
+)
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.rl_queue import get_last_item_from_queue
-from lerobot.robots import so100_follower
-from lerobot.teleoperators import gamepad, so_leader, spacemouse  # noqa: F401
+from lerobot.robots import so100_follower  # noqa: F401
+from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import (
     bytes_to_state_dict,
-    grpc_channel_options,
     python_object_to_bytes,
-    receive_bytes_in_chunks,
-    send_bytes_in_chunks,
-    transitions_to_bytes,
 )
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.transition import (
     Transition,
     move_state_dict_to_device,
-    move_transition_to_device,
 )
 from lerobot.utils.utils import (
     TimerManager,
@@ -90,12 +91,14 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-from gym_manipulator import (
+from lerobot.rl.acfql.configs import ACFQLTrainRLServerPipelineConfig as TrainRLServerPipelineConfig
+from lerobot.rl.acfql.gym_manipulator import (
     create_transition,
     make_processors,
     make_robot_env,
     step_env_and_process_transition,
 )
+from lerobot.rl.acfql.utils import get_frequency_stats
 
 # Main entry point
 
@@ -235,6 +238,7 @@ def act_with_policy(
         init_logging(log_file=log_file, display_pid=True)
         logging.info("Actor policy process logging initialized")
 
+    logging.info(pformat(cfg.to_dict()))
     logging.info("make_env online")
 
     online_env, teleop_device = make_robot_env(cfg=cfg.env)
@@ -249,14 +253,53 @@ def act_with_policy(
     logging.info("make_policy")
 
     ### Instantiate the policy in both the actor and learner processes
-    ### To avoid sending a SACPolicy object through the port, we create a policy instance
+    ### To avoid sending a ACFQLPolicy object through the port, we create a policy instance
     ### on both sides, the learner sends the updated parameters every n steps to update the actor's parameters
-    policy: SACPolicy = make_policy(
+    policy: ACFQLPolicy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
     )
+
     policy = policy.eval()
     assert isinstance(policy, nn.Module)
+
+    # Create processors - only provide dataset_stats if not resuming from saved processors
+    processor_kwargs = {}
+    postprocessor_kwargs = {}
+    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
+        # Only provide dataset_stats when not resuming from saved processor state
+        processor_kwargs["dataset_stats"] = cfg.policy.dataset_stats
+
+    if cfg.policy.pretrained_path is not None:
+        processor_kwargs["preprocessor_overrides"] = {
+            "device_processor": {"device": device.type},
+            "normalizer_processor": {
+                "stats": cfg.policy.dataset_stats,
+                "features": {**policy.config.input_features, **policy.config.output_features},
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+        postprocessor_kwargs["postprocessor_overrides"] = {
+            "unnormalizer_processor": {
+                "stats": cfg.policy.dataset_stats,
+                "features": policy.config.output_features,
+                "norm_map": policy.config.normalization_mapping,
+            },
+        }
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=cfg.policy,
+        pretrained_path=cfg.policy.pretrained_path,
+        **processor_kwargs,
+        **postprocessor_kwargs,
+    )
+
+    # get the initial policy parameters from the learner
+    if cfg.policy.offline_steps > 0:
+        logging.info("[ACTOR] Waiting for initial policy parameters from learner")
+        update_policy_parameters(
+            policy=policy, parameters_queue=parameters_queue, device=device, wait_for_update=True
+        )
 
     obs, info = online_env.reset()
     env_processor.reset()
@@ -275,8 +318,12 @@ def act_with_policy(
     episode_total_steps = 0
 
     policy_timer = TimerManager("Policy inference", log=False)
+    fps_tracker = TimerManager("Episode FPS", log=False)
+    episode_started = True
+    episode_start_time = time.perf_counter()
 
     for interaction_step in range(cfg.policy.online_steps):
+        fps_tracker.start()
         start_time = time.perf_counter()
         if shutdown_event.is_set():
             logging.info("[ACTOR] Shutting down act_with_policy")
@@ -286,11 +333,36 @@ def act_with_policy(
             k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
         }
 
+        observation_for_inference = preprocessor(
+            {
+                **{"observation.state": observation["observation.state"]},
+                # [B, C, H, W] -> [B, H, W, C]
+                **{k: v.permute(0, 2, 3, 1) for k, v in observation.items() if "observation.images" in k},
+            }
+        )
+
+        # The preprocessor may add extra keys, filter them out
+        observation_for_inference = {
+            k: v for k, v in observation_for_inference.items() if k in cfg.policy.input_features
+        }
+
+        observation_for_inference = {
+            **{"observation.state": observation_for_inference["observation.state"]},
+            # [B, H, W, C] -> [B, C, H, W]
+            **{
+                k: v.permute(0, 3, 1, 2)
+                for k, v in observation_for_inference.items()
+                if "observation.images" in k
+            },
+        }
+
         # Time policy inference and check if it meets FPS requirement
         with policy_timer:
             # Extract observation from transition for policy
-            action = policy.select_action(batch=observation)
+            action = policy.select_action(batch=observation_for_inference)
         policy_fps = policy_timer.fps_last
+
+        action = postprocessor(action)
 
         log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
@@ -326,6 +398,8 @@ def act_with_policy(
         if intervention_info.get(TeleopEvents.IS_INTERVENTION, False):
             episode_intervention = True
             episode_intervention_steps += 1
+            # TODO: The policy state should be reset when an intervention occurs when chunking is enabled, to clear the action queue
+            policy.reset()  # Reset policy state if needed
 
         complementary_info = {
             "discrete_penalty": torch.tensor(
@@ -348,10 +422,16 @@ def act_with_policy(
         # Update transition for next iteration
         transition = new_transition
 
-        if done :
-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
+        if done or truncated:
+            episode_time = time.perf_counter() - episode_start_time
+            logging.info(
+                f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}, Episode time: {episode_time:.2f}s"
+            )
 
-            update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
+            stats = get_frequency_stats(policy_timer)
+
+            stats = get_frequency_stats(fps_tracker)
+            logging.info(", ".join([f"{k} : {v:.2f}" for k, v in stats.items()]))
 
             if len(list_transition_to_send_to_learner) > 0:
                 push_transitions_to_transport_queue(
@@ -359,9 +439,6 @@ def act_with_policy(
                     transitions_queue=transitions_queue,
                 )
                 list_transition_to_send_to_learner = []
-
-            stats = get_frequency_stats(policy_timer)
-            policy_timer.reset()
 
             # Calculate intervention rate
             intervention_rate = 0.0
@@ -381,6 +458,12 @@ def act_with_policy(
                 )
             )
 
+            update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
+
+            policy_timer.reset()
+            fps_tracker.reset()
+            episode_started = False
+
             # Reset intervention counters and environment
             sum_reward_episode = 0.0
             episode_intervention = False
@@ -392,265 +475,37 @@ def act_with_policy(
             env_processor.reset()
             action_processor.reset()
 
+            policy.reset()  # Reset policy state if needed
+
+            episode_start_time = time.perf_counter()
+
             # Process initial observation
             transition = create_transition(observation=obs, info=info)
             transition = env_processor(transition)
 
         if cfg.env.fps is not None:
             dt_time = time.perf_counter() - start_time
-            precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
+            precise_sleep(1 / cfg.env.fps - dt_time)
 
-
-#  Communication Functions - Group all gRPC/messaging functions
-
-
-def establish_learner_connection(
-    stub: services_pb2_grpc.LearnerServiceStub,
-    shutdown_event: Event,  # type: ignore
-    attempts: int = 30,
-):
-    """Establish a connection with the learner.
-
-    Args:
-        stub (services_pb2_grpc.LearnerServiceStub): The stub to use for the connection.
-        shutdown_event (Event): The event to check if the connection should be established.
-        attempts (int): The number of attempts to establish the connection.
-    Returns:
-        bool: True if the connection is established, False otherwise.
-    """
-    for _ in range(attempts):
-        if shutdown_event.is_set():
-            logging.info("[ACTOR] Shutting down establish_learner_connection")
-            return False
-
-        # Force a connection attempt and check state
-        try:
-            logging.info("[ACTOR] Send ready message to Learner")
-            if stub.Ready(services_pb2.Empty()) == services_pb2.Empty():
-                return True
-        except grpc.RpcError as e:
-            logging.error(f"[ACTOR] Waiting for Learner to be ready... {e}")
-            time.sleep(2)
-    return False
-
-
-@lru_cache(maxsize=1)
-def learner_service_client(
-    host: str = "127.0.0.1",
-    port: int = 50051,
-) -> tuple[services_pb2_grpc.LearnerServiceStub, grpc.Channel]:
-    """
-    Returns a client for the learner service.
-
-    GRPC uses HTTP/2, which is a binary protocol and multiplexes requests over a single connection.
-    So we need to create only one client and reuse it.
-    """
-
-    channel = grpc.insecure_channel(
-        f"{host}:{port}",
-        grpc_channel_options(),
-    )
-    stub = services_pb2_grpc.LearnerServiceStub(channel)
-    logging.info("[ACTOR] Learner service client created")
-    return stub, channel
-
-
-def receive_policy(
-    cfg: TrainRLServerPipelineConfig,
-    parameters_queue: Queue,
-    shutdown_event: Event,  # type: ignore
-    learner_client: services_pb2_grpc.LearnerServiceStub | None = None,
-    grpc_channel: grpc.Channel | None = None,
-):
-    """Receive parameters from the learner.
-
-    Args:
-        cfg (TrainRLServerPipelineConfig): The configuration for the actor.
-        parameters_queue (Queue): The queue to receive the parameters.
-        shutdown_event (Event): The event to check if the process should shutdown.
-    """
-    logging.info("[ACTOR] Start receiving parameters from the Learner")
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_receive_policy_{os.getpid()}.log")
-
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor receive policy process logging initialized")
-
-        # Setup process handlers to handle shutdown signal
-        # But use shutdown event from the main process
-        _ = ProcessSignalHandler(use_threads=False, display_pid=True)
-
-    if grpc_channel is None or learner_client is None:
-        learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
-        )
-
-    try:
-        iterator = learner_client.StreamParameters(services_pb2.Empty())
-        receive_bytes_in_chunks(
-            iterator,
-            parameters_queue,
-            shutdown_event,
-            log_prefix="[ACTOR] parameters",
-        )
-
-    except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
-
-    if not use_threads(cfg):
-        grpc_channel.close()
-    logging.info("[ACTOR] Received policy loop stopped")
-
-
-def send_transitions(
-    cfg: TrainRLServerPipelineConfig,
-    transitions_queue: Queue,
-    shutdown_event: any,  # Event,
-    learner_client: services_pb2_grpc.LearnerServiceStub | None = None,
-    grpc_channel: grpc.Channel | None = None,
-) -> services_pb2.Empty:
-    """
-    Sends transitions to the learner.
-
-    This function continuously retrieves messages from the queue and processes:
-
-    - Transition Data:
-        - A batch of transitions (observation, action, reward, next observation) is collected.
-        - Transitions are moved to the CPU and serialized using PyTorch.
-        - The serialized data is wrapped in a `services_pb2.Transition` message and sent to the learner.
-    """
-
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_transitions_{os.getpid()}.log")
-
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor transitions process logging initialized")
-
-    if grpc_channel is None or learner_client is None:
-        learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
-        )
-
-    try:
-        learner_client.SendTransitions(
-            transitions_stream(
-                shutdown_event, transitions_queue, cfg.policy.actor_learner_config.queue_get_timeout
-            )
-        )
-    except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
-
-    logging.info("[ACTOR] Finished streaming transitions")
-
-    if not use_threads(cfg):
-        grpc_channel.close()
-    logging.info("[ACTOR] Transitions process stopped")
-
-
-def send_interactions(
-    cfg: TrainRLServerPipelineConfig,
-    interactions_queue: Queue,
-    shutdown_event: Event,  # type: ignore
-    learner_client: services_pb2_grpc.LearnerServiceStub | None = None,
-    grpc_channel: grpc.Channel | None = None,
-) -> services_pb2.Empty:
-    """
-    Sends interactions to the learner.
-
-    This function continuously retrieves messages from the queue and processes:
-
-    - Interaction Messages:
-        - Contains useful statistics about episodic rewards and policy timings.
-        - The message is serialized using `pickle` and sent to the learner.
-    """
-
-    if not use_threads(cfg):
-        # Create a process-specific log file
-        log_dir = os.path.join(cfg.output_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"actor_interactions_{os.getpid()}.log")
-
-        # Initialize logging with explicit log file
-        init_logging(log_file=log_file, display_pid=True)
-        logging.info("Actor interactions process logging initialized")
-
-        # Setup process handlers to handle shutdown signal
-        # But use shutdown event from the main process
-        _ = ProcessSignalHandler(use_threads=False, display_pid=True)
-
-    if grpc_channel is None or learner_client is None:
-        learner_client, grpc_channel = learner_service_client(
-            host=cfg.policy.actor_learner_config.learner_host,
-            port=cfg.policy.actor_learner_config.learner_port,
-        )
-
-    try:
-        learner_client.SendInteractions(
-            interactions_stream(
-                shutdown_event, interactions_queue, cfg.policy.actor_learner_config.queue_get_timeout
-            )
-        )
-    except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
-
-    logging.info("[ACTOR] Finished streaming interactions")
-
-    if not use_threads(cfg):
-        grpc_channel.close()
-    logging.info("[ACTOR] Interactions process stopped")
-
-
-def transitions_stream(shutdown_event: Event, transitions_queue: Queue, timeout: float) -> services_pb2.Empty:  # type: ignore
-    while not shutdown_event.is_set():
-        try:
-            message = transitions_queue.get(block=True, timeout=timeout)
-        except Empty:
-            logging.debug("[ACTOR] Transition queue is empty")
-            continue
-
-        yield from send_bytes_in_chunks(
-            message, services_pb2.Transition, log_prefix="[ACTOR] Send transitions"
-        )
-
-    return services_pb2.Empty()
-
-
-def interactions_stream(
-    shutdown_event: Event,
-    interactions_queue: Queue,
-    timeout: float,  # type: ignore
-) -> services_pb2.Empty:
-    while not shutdown_event.is_set():
-        try:
-            message = interactions_queue.get(block=True, timeout=timeout)
-        except Empty:
-            logging.debug("[ACTOR] Interaction queue is empty")
-            continue
-
-        yield from send_bytes_in_chunks(
-            message,
-            services_pb2.InteractionMessage,
-            log_prefix="[ACTOR] Send interactions",
-        )
-
-    return services_pb2.Empty()
+        if not episode_started:
+            # This is needed to track the fps correctly after reset
+            episode_started = True
+        else:
+            fps_tracker.stop()
 
 
 #  Policy functions
 
 
-def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device):
+def update_policy_parameters(
+    policy: ACFQLPolicy, parameters_queue: Queue, device, wait_for_update: bool = False
+):
     bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
+
+    while bytes_state_dict is None and wait_for_update:
+        # logging.info("[ACTOR] Waiting for updated policy parameters from Learner...")
+        bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
+        time.sleep(2)
     if bytes_state_dict is not None:
         logging.info("[ACTOR] Load new parameters from Learner.")
         state_dicts = bytes_to_state_dict(bytes_state_dict)
@@ -667,71 +522,15 @@ def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device)
 
         # Load actor state dict
         actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
-        policy.actor.load_state_dict(actor_state_dict)
+        policy.actor_onestep_flow.load_state_dict(actor_state_dict, strict=True)
 
-        # Load discrete critic if present
-        if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
-            discrete_critic_state_dict = move_state_dict_to_device(
-                state_dicts["discrete_critic"], device=device
-            )
-            policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
-            logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
-
-
-#  Utilities functions
-
-
-def push_transitions_to_transport_queue(transitions: list, transitions_queue):
-    """Send transitions to learner in smaller chunks to avoid network issues.
-
-    Args:
-        transitions: List of transitions to send
-        message_queue: Queue to send messages to learner
-        chunk_size: Size of each chunk to send
-    """
-    transition_to_send_to_learner = []
-    for transition in transitions:
-        tr = move_transition_to_device(transition=transition, device="cpu")
-        for key, value in tr["state"].items():
-            if torch.isnan(value).any():
-                logging.warning(f"Found NaN values in transition {key}")
-
-        transition_to_send_to_learner.append(tr)
-
-    transitions_queue.put(transitions_to_bytes(transition_to_send_to_learner))
-
-
-def get_frequency_stats(timer: TimerManager) -> dict[str, float]:
-    """Get the frequency statistics of the policy.
-
-    Args:
-        timer (TimerManager): The timer with collected metrics.
-
-    Returns:
-        dict[str, float]: The frequency statistics of the policy.
-    """
-    stats = {}
-    if timer.count > 1:
-        avg_fps = timer.fps_avg
-        p90_fps = timer.fps_percentile(90)
-        logging.debug(f"[ACTOR] Average policy frame rate: {avg_fps}")
-        logging.debug(f"[ACTOR] Policy frame rate 90th percentile: {p90_fps}")
-        stats = {
-            "Policy frequency [Hz]": avg_fps,
-            "Policy frequency 90th-p [Hz]": p90_fps,
-        }
-    return stats
-
-
-def log_policy_frequency_issue(policy_fps: float, cfg: TrainRLServerPipelineConfig, interaction_step: int):
-    if policy_fps < cfg.env.fps:
-        logging.warning(
-            f"[ACTOR] Policy FPS {policy_fps:.1f} below required {cfg.env.fps} at step {interaction_step}"
-        )
-
-
-def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
-    return cfg.policy.concurrency.actor == "threads"
+        # # Load discrete critic if present
+        # if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
+        #     discrete_critic_state_dict = move_state_dict_to_device(
+        #         state_dicts["discrete_critic"], device=device
+        #     )
+        #     policy.discrete_critic.load_state_dict(discrete_critic_state_dict)
+        #     logging.info("[ACTOR] Loaded discrete critic parameters from Learner.")
 
 
 if __name__ == "__main__":

@@ -27,26 +27,18 @@ import torch
 from scipy.spatial.transform import Rotation as R
 
 
-# -------------------------------------------------------------------------
-# SE(3) 辅助（纯 torch，无 scipy 依赖，支持批量）
-# -------------------------------------------------------------------------
-
 def _rotvec_to_rotmat_batch(rotvec: torch.Tensor) -> torch.Tensor:
     """将 (..., 3) axis-angle 转为 (..., 3, 3) 旋转矩阵（scipy 批量版）。"""
     flat = rotvec.reshape(-1, 3).cpu().numpy()
     mats = R.from_rotvec(flat).as_matrix()
-    return torch.as_tensor(mats, dtype=rotvec.dtype, device=rotvec.device).reshape(
-        *rotvec.shape[:-1], 3, 3
-    )
+    return torch.as_tensor(mats, dtype=rotvec.dtype, device=rotvec.device).reshape(*rotvec.shape[:-1], 3, 3)
 
 
 def _rotmat_to_rotvec_batch(rotmat: torch.Tensor) -> torch.Tensor:
     """将 (..., 3, 3) 旋转矩阵转为 (..., 3) axis-angle。"""
     flat = rotmat.reshape(-1, 3, 3).cpu().numpy()
     rvecs = R.from_matrix(flat).as_rotvec()
-    return torch.as_tensor(rvecs, dtype=rotmat.dtype, device=rotmat.device).reshape(
-        *rotmat.shape[:-2], 3
-    )
+    return torch.as_tensor(rvecs, dtype=rotmat.dtype, device=rotmat.device).reshape(*rotmat.shape[:-2], 3)
 
 
 def _build_se3_batch(pos: torch.Tensor, rotvec: torch.Tensor) -> torch.Tensor:
@@ -74,10 +66,6 @@ def _decompose_se3_to_pose6(T: torch.Tensor) -> torch.Tensor:
     rotvec = _rotmat_to_rotvec_batch(T[..., :3, :3])
     return torch.cat([pos, rotvec], dim=-1)
 
-
-# -------------------------------------------------------------------------
-# 核心变换
-# -------------------------------------------------------------------------
 
 def apply_umi_sample_relative_transform(
     batch: dict[str, torch.Tensor],
@@ -117,7 +105,7 @@ def apply_umi_sample_relative_transform(
     if "action" not in batch:
         raise KeyError("'action' 不在 batch 中。")
 
-    action = batch["action"]       # (B, chunk, 7) 或 (chunk, 7)
+    action = batch["action"]  # (B, chunk, 7) 或 (chunk, 7)
     umi_pose = batch["observation.umi_pose"]  # (B, 6) 或 (B, n_obs, 6)
 
     squeezed = action.ndim == 2
@@ -132,18 +120,18 @@ def apply_umi_sample_relative_transform(
 
     # 取最后一帧 obs 作为 sample t₀ 参考
     if umi_pose.ndim == 3:
-        base_pose6 = umi_pose[:, -1, :]   # (B, 6)
+        base_pose6 = umi_pose[:, -1, :]  # (B, 6)
     else:
-        base_pose6 = umi_pose              # (B, 6)
+        base_pose6 = umi_pose  # (B, 6)
 
     B, chunk_size, _ = action.shape
-    pos_base = base_pose6[:, :3]          # (B, 3)
-    rotvec_base = base_pose6[:, 3:6]      # (B, 3)
-    T_base = _build_se3_batch(pos_base, rotvec_base)          # (B, 4, 4)
-    T_base_inv = _invert_se3_batch(T_base)                    # (B, 4, 4)
+    pos_base = base_pose6[:, :3]  # (B, 3)
+    rotvec_base = base_pose6[:, 3:6]  # (B, 3)
+    T_base = _build_se3_batch(pos_base, rotvec_base)  # (B, 4, 4)
+    T_base_inv = _invert_se3_batch(T_base)  # (B, 4, 4)
 
-    pos_k = action[:, :, :3]       # (B, chunk, 3)
-    rotvec_k = action[:, :, 3:6]   # (B, chunk, 3)
+    pos_k = action[:, :, :3]  # (B, chunk, 3)
+    rotvec_k = action[:, :, 3:6]  # (B, chunk, 3)
     gripper_k = action[:, :, 6:7]  # (B, chunk, 1)
 
     T_k = _build_se3_batch(

@@ -1,6 +1,6 @@
 # UMI + Franka 数据集训练指南
 
-本文档描述从 DAS-Gripper mcap 数据到 ACT 策略训练、真机部署的完整流程，基于 UMI（Universal Manipulation Interface）论文的 **sample-relative t₀** 约定实现。
+本文档描述从 DAS-Gripper mcap 数据到 ACT 策略训练、真机部署的完整流程。
 
 ---
 
@@ -22,16 +22,18 @@
 
 ### UMI t₀ 约定（sample-relative）
 
-UMI 论文的关键设计：每次推理窗口的 **最后一帧观测** 作为当前 t₀，动作 chunk 是相对于此时刻 EE 位姿的增量序列。
+UMI 论文的关键设计：每次推理窗口的 **最后一帧观测** 作为当前 t₀，整个动作 chunk（chunk_size 步）共用同一个 t₀，每一步是相对此参考的增量。
 
 ```
-t₀ = 推理时刻机器人 EE 当前位姿（滑动刷新，非 episode 固定值）
-Δ_k = inv(W_T_F(t₀)) @ W_T_F(t₀ + k·dt)
+t₀ = 当次推理时（采集 obs 的时刻）EE 法兰世界位姿（每个 chunk 刷新一次，chunk 内固定）
+Δ_k = inv(W_T_F(t₀)) @ W_T_F(t₀ + k·dt)        for k = 0, 1, ..., chunk_size-1
 ```
 
 **训练/推理必须保持一致**：
-- 训练时：`apply_umi_sample_relative_transform` 将数据集绝对位姿转为 sample-relative
-- 推理时：每步 `capture_t0()` 刷新参考系，策略输出直接作为 delta_k 使用
+- 训练时：`apply_umi_sample_relative_transform` 取 `umi_pose[..., -1, :]`（最后一帧 obs）
+  作为整个 chunk 的统一 base，把数据集绝对位姿转为 sample-relative。
+- 推理时：每收到一个新 chunk 调用一次 `capture_t0()`（`t0_mode=per_chunk`），chunk 内
+  所有动作都用同一个 t₀；策略输出 7D `[pos3, rotvec3, gripper]` 直接作为 Δ_k 使用。
 
 ### world_flange 数据集格式
 
@@ -80,7 +82,7 @@ sample-relative action chunk（7D）→ ACT/Diffusion 训练
      │
      ▼ 策略检查点
      │
-FrankaUMIClient + per_step t₀ 刷新 → 真机推理
+FrankaUMIClient + per_chunk t₀ 刷新 → 真机推理
 ```
 
 ---
@@ -190,8 +192,8 @@ policy:
       shape: [7]          # pos3 + rotvec3 + gripper1
 
   # ACT 超参数
-  chunk_size: 100
-  n_action_steps: 100
+  chunk_size: 15
+  n_action_steps: 15
   n_obs_steps: 1
   dim_model: 512
   n_heads: 8
@@ -234,7 +236,7 @@ def collate_fn(batch_list):
 dataloader = DataLoader(dataset, collate_fn=collate_fn, ...)
 ```
 
-> `apply_umi_sample_relative_transform` 以 `observation.umi_pose`（当前帧绝对位姿）为基准，将 action chunk 各帧转为相对增量，之后从 batch 中删除 `observation.umi_pose` 键（策略不需要此输入）。
+> `apply_umi_sample_relative_transform` 以 `observation.umi_pose`（当前帧绝对位姿）为基准，将 action chunk 各帧转为相对增量，之后从 batch 中删除 `observation.umi_pose` 键。
 
 ### 3.3 启动训练
 
@@ -243,47 +245,18 @@ lerobot-train \
     --policy.type=act \
     --dataset.repo_id=yourname/pick_and_place \
     --dataset.root=/path/to/output_dataset \
-    --policy.chunk_size=100 \
-    --policy.n_action_steps=100 \
+    --policy.chunk_size=15 \
+    --policy.n_action_steps=15 \
     --training.batch_size=16 \
     --output_dir=/path/to/checkpoints/act_umi
 ```
 
-**恢复训练**：
-
-```bash
-lerobot-train \
-    --config_path=/path/to/checkpoints/act_umi/checkpoints/000050/pretrained_model/train_config.json \
-    --resume=true
-```
 
 ---
 
 ## Step 4：真机轨迹回放验证
 
 在策略训练前，先用数据集原始轨迹直接驱动 Franka，确认坐标变换链路正确。
-
-### 4.1 dry-run（不连接机器人）
-
-检查计算出的目标位姿是否合理：
-
-```bash
-python -m lerobot.scripts.lerobot_replay_umi_franka \
-    --dataset-root /path/to/output_dataset \
-    --episode 0 \
-    --dry-run \
-    --camera-extrinsic-yaml /home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml
-```
-
-输出示例（world_flange 格式会自动以首帧为 t₀）：
-
-```
-frame    0: pos=[0.0, 0.0, 0.0] rotvec=[0.0, 0.0, 0.0] grip=0.0850
-frame  150: pos=[0.0412, -0.0081, -0.0234] rotvec=[...] grip=0.0210
-frame  299: pos=[0.0018, 0.0003, -0.0009] rotvec=[...] grip=0.0850
-```
-
-### 4.2 真机回放
 
 ```bash
 python -m lerobot.scripts.lerobot_replay_umi_franka \
@@ -341,7 +314,7 @@ python franka_umi_async_client.py \
     --server_address <GPU_IP>:8081 \
     --robot.robot_ip 192.168.1.104 \
     --robot.camera_extrinsic_yaml_path /home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml \
-    --t0_mode per_step \
+    --t0_mode per_chunk \
     --reference ee_at_t0 \
     --use_gripper \
     --fps 15 \
@@ -350,89 +323,11 @@ python franka_umi_async_client.py \
 
 **关键参数说明**：
 
-| 参数 | 推荐值 | 说明 |
-|---|---|---|
-| `--t0_mode` | `per_step` | 每步刷新 t₀，与 world_flange 数据集对齐 |
-| `--reference` | `ee_at_t0` | world_flange 格式策略输出的 delta 解释方式 |
-| `--fps` | 15 | 控制循环频率，应低于数据集录制帧率 |
-| `--actions_per_chunk` | 50 | 每次从动作队列取出并执行的步数 |
-
-**空跑验证**（不执行运动）：
-
-```bash
-python franka_umi_async_client.py \
-    --pretrained_name_or_path /path/to/checkpoint \
-    --dry_run
-```
+| 参数 | 参考值         | 说明 |
+|---|-------------|---|
+| `--t0_mode` | `per_chunk` | 每收到一个新 chunk 刷新 t₀；chunk 内固定，与训练 collate 一致 |
+| `--reference` | `ee_at_t0`  | world_flange 格式策略输出的 delta 解释方式 |
+| `--fps` | 15          | 控制循环频率，应低于数据集录制帧率 |
+| `--actions_per_chunk` | 15          | 每次从动作队列取出并执行的步数 |
 
 ---
-
-## 手眼标定文件格式
-
-```yaml
-# /home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml
-camera_transform:
-  translation:
-    x: 0.0423
-    y: -0.0310
-    z: 0.0712
-  rotation:
-    x:  0.6532
-    y: -0.6532
-    z:  0.2706
-    w:  0.2706
-  parent_frame: panda_link8          # 必须为此值
-  child_frame:  camera_color_optical_frame
-```
-
-> `parent_frame` 必须是 `panda_link8`。若使用不同法兰连杆，需修改 `load_flange_to_camera_extrinsic` 中的校验逻辑。
-
----
-
-## 常见问题排查
-
-### 策略只在起始位置小幅晃动
-
-**根因**：训练时 t₀ 约定与推理不一致（episode-level vs sample-level）。
-
-**排查**：
-1. 确认数据集使用 `--pose-format=world_flange` 生成（action 首帧不应全为 0）
-2. 确认训练 DataLoader 中调用了 `apply_umi_sample_relative_transform`
-3. 确认推理时 `t0_mode=per_step`
-
-[//]: # (### 回放姿态发散)
-
-[//]: # ()
-[//]: # (**根因**：常见两个原因。)
-
-[//]: # ()
-[//]: # (1. `world_flange` 绝对位姿被当成 delta 直接发送（坐标系混用）)
-
-[//]: # (2. 循环体未解析当前帧位姿（`_row_to_se3_and_gripper` 调用缺失）)
-
-[//]: # ()
-[//]: # (**排查**：使用 `--dry-run` 检查首帧输出，`pos` 应全为 `[0.0, 0.0, 0.0]`（episode-relative delta 的首帧等于单位变换）。)
-
-[//]: # ()
-[//]: # (### `TypeError: only 0-dimensional arrays can be converted to Python scalars`)
-
-[//]: # ()
-[//]: # (**根因**：LeRobot 将 `shape=&#40;1,&#41;` 特征映射为 HF 标量 `Value`，传入 `np.array&#40;[x]&#41;` 会失败。)
-
-[//]: # ()
-[//]: # (**修复**：传入 numpy 标量 `np.float32&#40;x&#41;` 而非 1D 数组。)
-
-[//]: # ()
-[//]: # (参见 `lerobot/datasets/utils.py:581`：`shape == &#40;1,&#41;` → `datasets.Value&#40;dtype=...&#41;`.)
-
-[//]: # ()
-[//]: # (### `'camera_transform' key not found`)
-
-[//]: # ()
-[//]: # (手眼标定 YAML 格式不正确，确保顶层键为 `camera_transform`，子键包含 `translation`、`rotation`、`parent_frame`、`child_frame`。)
-
-### 推理帧率低于目标
-
-- 降低 `--fps`（客户端控制循环频率）
-- 增大 `--actions_per_chunk`（减少 gRPC 请求频次）
-- 关闭 `--gripper-camera-count`（减少串口/USB 负载）
