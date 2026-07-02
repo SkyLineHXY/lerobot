@@ -28,14 +28,14 @@ class PIPERConfig(RobotConfig):
             "cam_left": RealSenseCameraConfig(
                 serial_number_or_name="148522072680",
                 fps=60,
-                width=320,
-                height=180,
+                width=640,
+                height=480,
             ),
             "cam_top": RealSenseCameraConfig(
                 serial_number_or_name="327122074756",
                 fps=60,
-                width=320,
-                height=180,
+                width=640,
+                height=480,
             ),
         }
     )
