@@ -1,176 +1,243 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+[//]: # (<p align="center">)
+
+[//]: # (  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">)
+
+[//]: # (</p>)
 
 <div align="center">
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+[//]: # ([![License]&#40;https://img.shields.io/badge/License-Apache%202.0-blue.svg&#41;]&#40;./LICENSE&#41;)
+[//]: # ([![Python versions]&#40;https://img.shields.io/pypi/pyversions/lerobot&#41;]&#40;https://www.python.org/downloads/&#41;)
 
 </div>
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+# 人手户外采集演示数据到真机策略部署
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+本仓库在 [LeRobot](https://github.com/huggingface/lerobot) 基础上，打通了一条完整链路：
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+> **DAS-Gripper 人手采集数据（mcap）→ LeRobot v3 数据集 → 模仿学习/VLA策略训练 → Franka 真机部署**
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+UMI（Universal Manipulation Interface）通过手持夹爪 + 鱼眼相机 + VIO 采集人手演示，无需真机遥操即可批量获取机器人演示数据。本仓库解决了其中最关键的工程难题——**如何把 VIO 世界系下的相机轨迹，正确转换为机器人的TCP相对增量动作，并保证训练与推理的坐标约定完全一致**。
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+---
 
-## Quick Start
+## 🎬 真机推理演示
 
-LeRobot can be installed directly from PyPI.
+以下为训练好的 ACT 策略在 Franka 上的 **pick and place 真机推理** 演示（异步推理架构，`per_chunk` t₀ 刷新）：
+
+<table>
+  <tr>
+    <td align="center">
+      <video src="https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_1.mp4" controls width="100%"></video>
+      <br><b>Demo 1</b>
+    </td>
+    <td align="center">
+      <video src="https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_2.mp4" controls width="100%"></video>
+      <br><b>Demo 2</b>
+    </td>
+    <td align="center">
+      <video src="https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_3.mp4" controls width="100%"></video>
+      <br><b>Demo 3</b>
+    </td>
+  </tr>
+</table>
+
+[//]: # (> 若视频未内嵌显示，可直接点击查看：)
+
+[//]: # (> [demo_1.mp4]&#40;https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_1.mp4&#41; ·)
+
+[//]: # (> [demo_2.mp4]&#40;https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_2.mp4&#41; ·)
+
+[//]: # (> [demo_3.mp4]&#40;https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_3.mp4&#41;)
+
+[//]: # (>)
+
+[//]: # (> （GitHub 网页端会将上述 raw 链接渲染为视频播放器；本地 Markdown 预览器可能仅显示链接，属正常现象。）)
+
+---
+
+## 核心概念
+
+### UMI t₀ 约定（sample-relative）
+
+UMI 的关键设计：每次推理窗口的 **最后一帧观测** 作为当前 t₀，整个动作 chunk（`chunk_size` 步）共用同一个 t₀，每一步都是相对该参考的增量：
+
+```
+t₀  = 当次推理采集 obs 时刻的 EE 法兰世界位姿（每个 chunk 刷新一次，chunk 内固定）
+Δ_k = inv(W_T_F(t₀)) @ W_T_F(t₀ + k·dt)        k = 0, 1, ..., chunk_size-1
+```
+
+**训练与推理必须保持一致**：
+
+- **训练时**：`apply_umi_sample_relative_transform` 取 `umi_pose[..., -1, :]`（最后一帧 obs）作为整个 chunk 的统一 base，把数据集里的绝对位姿转换为 sample-relative 增量。
+- **推理时**：每收到一个新 chunk 调用一次 `capture_t0()`（`t0_mode=per_chunk`），chunk 内所有动作共用同一 t₀；策略输出的 7D `[pos3, rotvec3, gripper]` 直接作为 Δ_k 使用。
+
+### `world_flange` 数据集格式
+
+| 字段 | 维度 | 内容 |
+|---|---|---|
+| `action` | 7D | `[pos_xyz_W, rotvec_xyz_W, gripper]`（VIO 世界系绝对法兰位姿 + 夹爪宽度） |
+| `observation.state` | 1D | `[gripper_width]`（仅夹爪宽度，避免绝对位姿冗余进入 state） |
+| `observation.umi_pose` | 6D | `[pos_xyz_W, rotvec_xyz_W]`（同帧绝对位姿，供 sample-relative processor 使用） |
+| `observation.images.camera0` | H×W×3 | RGB 图像（鱼眼中心镜头） |
+
+### 坐标系关系
+
+```
+VIO 世界系 W  ──(W_T_C)──▶  相机光学系 C
+                                │
+                           inv(T_FC) = T_CF
+                                │
+                                ▼
+Franka 基座系 B ──(T_BE)──▶  法兰系 F（panda_link8）
+```
+
+- `T_FC`（ᶠT_C）：`panda_link8 → camera_color_optical_frame`，由 `franka_easy_handeye` 标定
+- 法兰绝对位姿：`W_T_F(t) = W_T_C(t) @ inv(T_FC)`
+- **推理目标**：`B_T_E(t_k) = B_T_E(t₀) @ inv(W_T_F(t₀)) @ W_T_F(t_k)`
+
+---
+
+## 系统架构
+
+```
+DAS mcap 文件
+     │
+     ▼ mcap_to_lerobotv3.py (--pose-format=world_flange)
+     │
+LeRobot v3 数据集（Parquet + MP4）
+│  action: 7D abs W_T_F + gripper
+│  observation.umi_pose: 6D abs W_T_F
+│  observation.state: 1D gripper
+│  observation.images.camera0: RGB
+     │
+     ▼ apply_umi_sample_relative_transform（训练 collate）
+     │
+sample-relative action chunk（7D）→ ACT / Diffusion 训练
+     │
+     ▼ 策略检查点
+     │
+FrankaUMIClient + per_chunk t₀ 刷新 → 真机推理
+```
+
+---
+
+## 完整流程（5 步）
+
+> 下面仅列关键命令与要点，完整参数、验证脚本与排错见 **[docs/umi_franka_training.md](./docs/umi_franka_training.md)**。
+
+### Step 1 · 数据集转换
+
+将 DAS `.mcap` 转换为 LeRobot v3 数据集（存绝对法兰位姿）：
 
 ```bash
-pip install lerobot
-lerobot-info
+python mcap_to_lerobotv3.py \
+    --task-dir /path/to/pick_and_place_20260428 \
+    --repo-id  yourname/pick_and_place \
+    --target-dir /path/to/output_dataset \
+    --pose-format world_flange \
+    --camera-extrinsic-yaml /home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml \
+    --fps 30 --task "pick and place"
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+`--camera-extrinsic-yaml` 必须存在且 `parent_frame: panda_link8`。
 
-## Robots & Control
+### Step 2 · 训练前验证
 
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
-
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
+对数据集做 sanity check（action 覆盖 0.3~0.7m 量级、首帧非全零），并验证 sample-relative 变换后基准帧增量近似为零：
 
 ```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
+from lerobot.robots.franka_gen_gripper.umi_dataset_transform import apply_umi_sample_relative_transform
+batch = apply_umi_sample_relative_transform(batch, remove_umi_pose=False)
+print("base delta (应接近零):", batch["action"][0, 0, :6])
 ```
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
+### Step 3 · ACT 策略训练
 
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
-
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
+在 DataLoader 的 collate 中注入 sample-relative 变换，再启动训练：
 
 ```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
+def collate_fn(batch_list):
+    batch = default_collate(batch_list)
+    return apply_umi_sample_relative_transform(batch)   # 变换为 7D 增量，并删除 umi_pose
 ```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
 
 ```bash
 lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+    --policy.type=act \
+    --dataset.repo_id=yourname/pick_and_place \
+    --dataset.root=/path/to/output_dataset \
+    --policy.chunk_size=15 --policy.n_action_steps=15 \
+    --training.batch_size=16 \
+    --output_dir=/path/to/checkpoints/act_umi
 ```
 
-| Category                   | Models                                                                                                                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md)                                                             |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                  |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx) |
+关键约定：`observation.state` 为 1D（gripper），`action` 为 7D（pos3 + rotvec3 + gripper1）。
 
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
+### Step 4 · 真机轨迹回放验证
 
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
+训练前先用数据集原始轨迹直接驱动 Franka，确认坐标变换链路正确：
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+python -m lerobot.scripts.lerobot_replay_umi_franka \
+    --dataset-root /path/to/output_dataset \
+    --episode 0 --robot-ip 192.168.1.104 \
+    --camera-extrinsic-yaml /home/zzq/franka_ws/src/franka_easy_handeye/cfg/camera_transform.yaml \
+    --use-gripper --fps 20
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+`world_flange` 格式回放内部自动以 episode 首帧为固定参考（`ee_at_t0`）。回放前确保工作空间无障碍物。
 
-## Resources
+### Step 5 · 异步推理部署
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+策略服务端（GPU 机器）+ 机器人客户端（NUC）通过 gRPC 通信：
 
-## Citation
+```bash
+# GPU 机器：策略服务端
+python policy_server.py --host 0.0.0.0 --port 8081 --fps 15
 
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
-
-```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
-}
+# NUC：Franka 客户端
+python franka_umi_async_client.py \
+    --pretrained_name_or_path /path/to/checkpoints/act_umi/checkpoints/000500/pretrained_model \
+    --server_address <GPU_IP>:8081 \
+    --robot.robot_ip 192.168.1.104 \
+    --robot.camera_extrinsic_yaml_path /home/zzq/.../camera_transform.yaml \
+    --t0_mode per_chunk --reference ee_at_t0 --use_gripper \
+    --fps 15 --task "pick and place"
 ```
 
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
+`--t0_mode per_chunk` 与训练 collate 保持一致，是坐标约定正确性的关键。
 
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
+---
 
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
-```
+## 关键代码位置
 
-</details>
+| 文件 | 作用 |
+|---|---|
+| [`src/lerobot/robots/franka_gen_gripper/umi_transforms.py`](./src/lerobot/robots/franka_gen_gripper/umi_transforms.py) | UMI 三种坐标变换模式核心实现 |
+| [`src/lerobot/robots/franka_gen_gripper/umi_dataset_transform.py`](./src/lerobot/robots/franka_gen_gripper/umi_dataset_transform.py) | 训练用 sample-relative collate 变换 |
+| [`src/lerobot/robots/franka_gen_gripper/franka_gen_gripper.py`](./src/lerobot/robots/franka_gen_gripper/franka_gen_gripper.py) | Franka gen-gripper 机器人抽象层 |
+| [`src/lerobot/robots/franka_gen_gripper/config_franka_gen_gripper.py`](./src/lerobot/robots/franka_gen_gripper/config_franka_gen_gripper.py) | 机器人配置（含手眼标定路径） |
+| [`src/lerobot/scripts/lerobot_replay_umi_franka.py`](./src/lerobot/scripts/lerobot_replay_umi_franka.py) | 数据集轨迹真机回放 |
+| [`src/lerobot/async_inference/policy_server.py`](./src/lerobot/async_inference/policy_server.py) | 异步推理策略服务端 |
+| [`src/lerobot/async_inference/franka_umi_async_client.py`](./src/lerobot/async_inference/franka_umi_async_client.py) | Franka 异步推理客户端（t₀ 刷新） |
 
-## Contribute
+**三种坐标变换模式**（混用会导致系统性旋转误差）：
 
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](./CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+| 模式 | delta_k 语义 | 推理公式 |
+|---|---|---|
+| `ee_at_t0` | Δ_k = inv(ᵂT_F(t₀))·ᵂT_F(t_k) | `T_BE_t0 @ Δ_k` |
+| `camera_t0` | ΔC_k = inv(ᵂT_C(t₀))·ᵂT_C(t_k) | `T_BE_t0 @ T_FC @ ΔC_k @ inv(T_FC)` |
+| `abs_pos_world_rot` | 位置相对 t₀ + 姿态绝对 | 混合 |
 
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
+---
 
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
+## 相关文档
+
+- 📘 **[docs/umi_franka_training.md](./docs/umi_franka_training.md)** — 从 mcap 到真机部署的完整训练指南
+- 🧮 **[examples/umi_gripper/docs/UMI ee6d 位姿变换推理.md](./examples/umi_gripper/docs/UMI%20ee6d%20位姿变换推理.md)** — 坐标变换数学推导
+---
+
+## 致谢
+
+本仓库基于 [huggingface/lerobot](https://github.com/huggingface/lerobot) 二次开发，遵循 [Apache-2.0](./LICENSE) 许可证。感谢 LeRobot 与 UMI（Chi et al., 2024）开源社区。
