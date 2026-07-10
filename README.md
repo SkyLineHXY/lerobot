@@ -28,7 +28,7 @@ UMI（Universal Manipulation Interface）通过手持夹爪 + 鱼眼相机 + VIO
 <table>
   <tr>
     <td align="center">
-      <video src="https://github.com/SkyLineHXY/lerobot/raw/main/videos/demo_1.mp4" controls width="100%"></video>
+      <video src="/videos/demo_1.mp4" controls width="100%"></video>
       <br><b>Demo 1</b>
     </td>
     <td align="center">
