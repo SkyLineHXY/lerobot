@@ -85,7 +85,7 @@ class Piper(Robot):
     def _cameras_ft(self) -> dict[str, tuple]:
         """用于 record/replay 的相机图像描述"""
         return {
-            f"observation.images.{cam_key}": (cam.height, cam.width, 3)
+            cam_key: (cam.height, cam.width, 3)
             for cam_key, cam in self.cameras.items()
         }
 

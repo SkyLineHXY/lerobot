@@ -153,12 +153,12 @@ def visualize_dataset(
                     rr.log(f"{ACTION}/{dim_idx}", rr.Scalars(val.item()))
 
             # display each dimension of observed state space (e.g. agent position in joint space)
-            # if OBS_STATE in batch:
-            #     for dim_idx, val in enumerate(batch[OBS_STATE][i]):
-            #         rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
             if OBS_STATE in batch:
-                for dim_idx, val in enumerate(batch['observation.umi_pose'][i]):
-                        rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
+                for dim_idx, val in enumerate(batch[OBS_STATE][i]):
+                    rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
+            # if OBS_STATE in batch:
+            #     for dim_idx, val in enumerate(batch['observation.umi_pose'][i]):
+            #             rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))
 

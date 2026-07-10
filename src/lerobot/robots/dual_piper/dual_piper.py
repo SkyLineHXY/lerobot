@@ -117,9 +117,15 @@ class DualPiper(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        """Camera image features for record/replay."""
+        """Camera image features for record/replay.
+
+        Keys are the *bare* camera names (e.g. ``cam_left``); the
+        ``observation.images.`` prefix is added downstream by
+        ``hw_to_dataset_features``. This matches both ``get_observation`` (which
+        stores frames under the bare camera key) and the standard lerobot robots.
+        """
         return {
-            f"observation.images.{cam_key}": (cam.height, cam.width, 3)
+            cam_key: (cam.height, cam.width, 3)
             for cam_key, cam in self.cameras.items()
         }
 
@@ -250,59 +256,15 @@ class DualPiper(Robot):
         #t2 = time.perf_counter()
         #print(f"read Left arm: {(t1 - t0) * 1000:.2f}ms, read Right arm: {(t2 - t1) * 1000:.2f}ms")
 
-        # Read camera images
-
+        # Read camera images.
+        # Use async_read() (latest buffered frame, non-blocking) to match the single-arm
+        # piper. The blocking cam.read() clears the new-frame event and waits for the NEXT
+        # captured frame per camera; with 3 cameras read sequentially that stalled the control
+        # loop by tens of ms every step, which is why dual_piper inference ran slower.
         for name, cam in self.cameras.items():
-            #start = time.perf_counter()
-            obs_dict[f"{name}"] = cam.read()
-            #obs_dict[f"{name}"] = cam.async_read()
-            #dt_ms = (time.perf_counter() - start) * 1e3
-            #logger.info(f"{self} read {name}: {dt_ms:.1f}ms")
-
-        # for name, cam in self.cameras.items():
-        #     start = time.perf_counter()
-        #     frame = cam.async_read()
-        #     # 如果需要，在这里做必要的数据拷贝，避免后续竞争
-        #     if frame is not None:
-        #         obs_dict[f"{name}"] = frame.copy()  # 深拷贝避免数据竞争
-        #     else:
-        #         obs_dict[f"{name}"] = frame
-        #     dt_ms = (time.perf_counter() - start) * 1e3
-        #     logger.info(f"{self} read {name}: {dt_ms:.1f}ms")
-
+            obs_dict[f"{name}"] = cam.async_read()
         return obs_dict
 
-    # def send_action(self, action: dict[str, float]) -> dict[str, float]:
-    #      """Send action commands to both arms.
-    #
-    #      Args:
-    #          action: Dictionary with keys joint_1.pos through joint_14.pos
-    #                 - joint_1 to joint_7: left arm
-    #                 - joint_8 to joint_14: right arm
-    #
-    #      Returns:
-    #          The action dictionary that was sent
-    #      """
-    #
-    #      if not self._is_connected:
-    #          raise DeviceNotConnectedError("Dual Piper is not connected.")
-    #      # Prepare actions for left arm (joints 1-7)
-    #      #t0 = time.perf_counter()
-    #
-    #      left_motor_order = ["joint_1", "joint_2", "joint_3", "joint_4",
-    #                         "joint_5", "joint_6", "joint_7"]
-    #      target_joints_left = [action[f"{motor}.pos"] for motor in left_motor_order]
-    #      self.bus_left.write(target_joints_left)
-    #
-    #      # Prepare actions for right arm (joints 8-14)
-    #      #t1 = time.perf_counter()
-    #      right_motor_order = ["joint_8", "joint_9", "joint_10", "joint_11",
-    #                          "joint_12", "joint_13", "joint_14"]
-    #      target_joints_right = [action[f"{motor}.pos"] for motor in right_motor_order]
-    #      self.bus_right.write(target_joints_right)
-    #      #t2 = time.perf_counter()
-    #      #print(f"Left arm: {(t1 - t0) * 1000:.2f}ms, Right arm: {(t2 - t1) * 1000:.2f}ms")
-    #      return action
     def send_action(self, action: dict[str, float]) -> dict[str, float]:
         """Send action commands to both arms in parallel (non-blocking).
 
@@ -338,10 +300,10 @@ class DualPiper(Robot):
         self._left_future = self._executor.submit(self.bus_left.write, target_joints_left)
         #t2 = time.perf_counter()
         self._right_future = self._executor.submit(self.bus_right.write, target_joints_right)
-        #t3 = time.perf_counter()
         #print(f"Left arm submit: {(t2 - t1) * 1000:.2f}ms, Right arm submit: {(t3 - t2) * 1000:.2f}ms")
-        # Wait 2ms to ensure commands are sent
-        time.sleep(0.005)
+        # No sleep here: the control loop already paces itself to the target fps
+        # (precise_sleep in run_loop). The single-arm piper has no such sleep; the fixed 5ms
+        # was pure per-step overhead absent on single piper.
 
         # Return immediately without waiting
         return action
