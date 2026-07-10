@@ -23,7 +23,7 @@ UMI（Universal Manipulation Interface）通过手持夹爪 + 鱼眼相机 + VIO
 
 ## 🎬 真机推理演示
 
-以下为训练好的 ACT 策略在 Franka 上的 **pick and place 真机推理** 演示（异步推理架构，`per_chunk` t₀ 刷新）：
+以下为训练好的 ACT 策略在 Franka 上的 **pick and place 真机推理** 演示：
 
 <table>
   <tr>
@@ -140,7 +140,7 @@ python mcap_to_lerobotv3.py \
     --fps 30 --task "pick and place"
 ```
 
-`--camera-extrinsic-yaml` 必须存在且 `parent_frame: panda_link8`。
+[//]: # (`--camera-extrinsic-yaml` 必须存在且 `parent_frame: panda_link8`。)
 
 ### Step 2 · 训练前验证
 
@@ -152,7 +152,7 @@ batch = apply_umi_sample_relative_transform(batch, remove_umi_pose=False)
 print("base delta (应接近零):", batch["action"][0, 0, :6])
 ```
 
-### Step 3 · ACT 策略训练
+### Step 3 · 模仿学习/VLA策略训练
 
 在 DataLoader 的 collate 中注入 sample-relative 变换，再启动训练：
 
