@@ -28,7 +28,7 @@ UMI（Universal Manipulation Interface）通过手持夹爪 + 鱼眼相机 + VIO
 <table>
   <tr>
     <td align="center">
-      <video src="[/videos/demo_1.mp4](https://github.com/user-attachments/assets/77523eb7-1138-4baa-b252-0bf5e6698b52)" controls width="100%"></video>
+      <video src="https://github.com/user-attachments/assets/77523eb7-1138-4baa-b252-0bf5e6698b52" controls width="100%"></video>
       <br><b>Demo 1</b>
     </td>
     <td align="center">
