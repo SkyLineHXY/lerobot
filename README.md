@@ -23,7 +23,7 @@ UMI（Universal Manipulation Interface）通过手持夹爪 + 鱼眼相机 + VIO
 
 ## 🎬 真机推理演示
 
-以下为训练好的 ACT 策略在 Franka 上的 **pick and place 真机推理** 演示：
+以下为训练好的pi0在 Franka 上的 **pick and place 真机异步推理** 演示：
 
 <table>
   <tr>
