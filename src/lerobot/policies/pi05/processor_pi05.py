@@ -44,8 +44,8 @@ from lerobot.utils.constants import (
 )
 
 
-@ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
-@dataclass
+# @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
+# @dataclass
 class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     """
     Processor step to prepare the state and tokenize the language input.
