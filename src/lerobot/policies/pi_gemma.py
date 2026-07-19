@@ -16,10 +16,31 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import functools
+import inspect
+
 import torch
 from torch import nn
 
 from lerobot.utils.import_utils import _transformers_available
+
+
+@functools.lru_cache(maxsize=None)
+def _cache_kwarg_name(forward_fn) -> str:
+    """Name of the KV-cache parameter accepted by a decoder-layer / attention ``forward``.
+
+    transformers renamed this across versions: ``past_key_value`` (singular, e.g. 4.53)
+    vs ``past_key_values`` (plural, newer). Passing the wrong name silently drops the
+    cache into ``**kwargs`` — the attention then never updates it, so incremental /
+    cached decoding runs with an EMPTY prefix cache (garbage output). Resolve the right
+    name from the actual signature. Keyed on the unbound class function so the lru_cache
+    stays stable across instances.
+    """
+    try:
+        params = inspect.signature(forward_fn).parameters
+    except (TypeError, ValueError):
+        return "past_key_values"
+    return "past_key_value" if "past_key_value" in params else "past_key_values"
 
 if TYPE_CHECKING or _transformers_available:
     from transformers.cache_utils import DynamicCache
@@ -173,14 +194,17 @@ def _get_pi_gemma_decoder_layer_base():
         ) -> torch.Tensor:
             residual = hidden_states
             hidden_states, gate = self.input_layernorm(hidden_states, cond=adarms_cond)
+            # Pass the cache under the name this transformers' attention actually accepts
+            # (past_key_value vs past_key_values); otherwise it is ignored and never updated.
+            attn_pkv = _cache_kwarg_name(type(self.self_attn).forward)
             hidden_states, _ = self.self_attn(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                **{attn_pkv: past_key_values},
                 **kwargs,
             )
 
@@ -264,14 +288,31 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # A fully-formed 4D additive mask was passed in (pi0/pi05 build a custom
+            # attention pattern upstream). transformers' create_causal_mask returns such
+            # a mask as-is, so use it directly and avoid the version-dependent kwarg
+            # names below (older/newer transformers disagree on input_embeds vs
+            # inputs_embeds / whether position_ids is accepted).
+            causal_mask = attention_mask
+        else:
+            # The create_causal_mask signature changed across transformers versions
+            # (input_embeds vs inputs_embeds; position_ids added later). Build the
+            # kwargs from the actual signature so this works on both.
+            import inspect
+
+            _mask_params = inspect.signature(create_causal_mask).parameters
+            _embeds_kw = "inputs_embeds" if "inputs_embeds" in _mask_params else "input_embeds"
+            _mask_kwargs = {
+                "config": self.config,
+                _embeds_kw: inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+            }
+            if "position_ids" in _mask_params:
+                _mask_kwargs["position_ids"] = position_ids
+            causal_mask = create_causal_mask(**_mask_kwargs)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -294,25 +335,39 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # Pass the cache under the name this decoder layer actually accepts
+            # (stock GemmaDecoderLayer uses past_key_value on 4.53; the custom AdaRMS layer
+            # uses past_key_values). Wrong name → cache silently ignored → empty prefix cache.
+            layer_pkv = _cache_kwarg_name(type(decoder_layer).forward)
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 adarms_cond=adarms_cond,
+                **{layer_pkv: past_key_values},
                 **kwargs,
             )
 
-            hidden_states = layer_outputs
+            # Custom (_PiGemmaDecoderLayerBase, use_adarms=True) layers return a bare
+            # tensor, but the stock GemmaDecoderLayer (kept when use_adarms=False, e.g.
+            # the PaliGemma language model) returns a tuple on transformers 4.53. Handle
+            # both so this forward works regardless of which layer class is in use.
+            if isinstance(layer_outputs, tuple):
+                if output_attentions and len(layer_outputs) > 1:
+                    all_self_attns += (layer_outputs[1],)
+                hidden_states = layer_outputs[0]
+            else:
+                hidden_states = layer_outputs
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states, _ = self.norm(hidden_states, adarms_cond)
+        # self.norm is PiGemmaRMSNorm only when use_adarms=True; for the PaliGemma
+        # language model (use_adarms=False) it is the stock GemmaRMSNorm, whose forward
+        # takes only the hidden state and returns a bare tensor. layernorm_forward
+        # normalizes both signatures to a (hidden_states, gate) tuple.
+        hidden_states, _ = layernorm_forward(self.norm, hidden_states, cond=adarms_cond)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

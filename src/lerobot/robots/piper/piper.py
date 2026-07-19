@@ -35,7 +35,13 @@ class Piper(Robot):
                     "joint_5": (5, "agilex_piper"),
                     "joint_6": (6, "agilex_piper"),
                     "joint_7": (7, "agilex_piper"),
-                }
+                },
+                reset_hz=self.config.reset_hz,
+                reset_duration_s=self.config.reset_duration_s,
+                max_joint_step_rad=self.config.max_joint_step_rad,
+                open_gripper_on_init=self.config.open_gripper_on_init,
+                gripper_open_range=self.config.gripper_open_range,
+                home_position=list(self.config.home_position),
             )
         )
         self.logs = {}

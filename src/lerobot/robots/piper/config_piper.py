@@ -23,6 +23,16 @@ from lerobot.robots.config import RobotConfig
 class PIPERConfig(RobotConfig):
     can_port: str = 'can_left'
     joint_names: list[str] = field(default_factory=lambda: [f"joint_{i + 1}" for i in range(7)])
+
+    # --- 复位/安全相关（MIT 模式下从未知位置直冲原点会很剧烈，用平滑插值复位）---
+    home_position: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    )  # 6 关节 + 夹爪 的初始位置
+    reset_hz: float = 100.0            # 平滑复位下发频率
+    reset_duration_s: float = 4.0      # 平滑复位期望总时长
+    max_joint_step_rad: float = 0.01   # 单步最大关节增量（限速）
+    open_gripper_on_init: bool = True  # 初始化复位时是否张开夹爪
+    gripper_open_range: float = 0.07   # 夹爪张开开度（米，范围 0~0.08）
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "cam_left": RealSenseCameraConfig(
