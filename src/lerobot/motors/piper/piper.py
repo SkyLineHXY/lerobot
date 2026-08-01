@@ -208,7 +208,6 @@ class PiperMotorsBus:
         self.piper.MotionCtrl_2(0x01, 0x01, 100, 0xAD)
         self.piper.JointCtrl(j0, j1, j2, j3, j4, j5)
         self.piper.GripperCtrl(abs(gripper_range), 1000, 0x01, 0)
-
     def read(self) -> Dict:
         """
             - 机械臂关节消息,单位0.001度

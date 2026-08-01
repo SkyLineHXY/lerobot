@@ -103,6 +103,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .spacemouse import SpaceMouseTeleop
 
         return SpaceMouseTeleop(config)
+    elif config.type == "piper_leader":
+        from .piper_leader import PiperLeader
+
+        return PiperLeader(config)
+    elif config.type == "piperx_leader":
+        from .piper_leader import PiperXLeader
+
+        return PiperXLeader(config)
     else:
         try:
             return cast("Teleoperator", make_device_from_device_class(config))
