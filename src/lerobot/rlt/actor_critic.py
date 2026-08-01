@@ -1,0 +1,187 @@
+"""Chunk-level actor-critic for RLT (paper Sec. IV-B, Eq. 3-5, App. B).
+* Actor: Gaussian over action chunks with small fixed std, conditioned on the
+  RL state x = (z_rl, s^p) and the VLA reference chunk (pass-through), with
+  50% reference dropout during training (zeros on the input pathway only).
+* Critic: ensemble of two Q functions; TD3-style target networks, min over
+  the ensemble for target values; chunk-level C-step backup.
+"""
+from __future__ import annotations
+
+import copy
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from .configs import ActorCriticConfig, OnlineRLConfig
+
+def _mlp(in_dim: int, hidden_dim: int, out_dim: int, n_layers: int) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    d = in_dim
+    for _ in range(n_layers):
+        layers += [nn.Linear(d, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU()]
+        d = hidden_dim
+    layers.append(nn.Linear(d, out_dim))
+    return nn.Sequential(*layers)
+
+class ChunkActor(nn.Module):
+    """pi_theta(a_{1:C} | x, a~_{1:C}) = N(mu_theta(x, a~), sigma^2 I)  (Eq. 4)."""
+    def __init__(self, cfg: ActorCriticConfig):
+        super().__init__()
+        self.cfg = cfg
+        chunk_dim = cfg.chunk_len * cfg.action_dim
+        in_dim = cfg.rl_token_dim + cfg.proprio_dim + chunk_dim
+        self.net = _mlp(in_dim, cfg.hidden_dim, chunk_dim, cfg.n_layers)
+
+    def mu(self,x: Tensor, ref_chunk: Tensor) -> Tensor:
+        """x: (B, rl_token_dim + proprio_dim); ref_chunk: (B, C, d) or zeros."""
+        ref_flat = ref_chunk.reshape(ref_chunk.shape[0], -1)
+        out = self.net(torch.cat([x,ref_flat], dim=-1))
+        return out.reshape(-1, self.cfg.chunk_len, self.cfg.action_dim)
+
+    def sample(self, x:Tensor, ref_chunk: Tensor, deterministic: bool = False) -> Tensor:
+        mu = self.mu(x, ref_chunk)
+        if deterministic:
+            return mu
+        return mu + self.cfg.action_std * torch.randn_like(mu)
+
+    def apply_ref_dropout(self, ref_chunk: Tensor) -> Tensor:
+        """Zero the reference for a random subset of the batch (training only)."""
+        if self.cfg.ref_dropout <= 0:
+            return ref_chunk
+        keep = (
+                torch.rand(ref_chunk.shape[0], 1, 1, device=ref_chunk.device)
+                >= self.cfg.ref_dropout
+        ).float()
+        return ref_chunk * keep
+
+class ChunkCritic(nn.Module):
+    """Ensemble of Q_psi(x, a_{1:C}) heads."""
+    def __init__(self, cfg: ActorCriticConfig):
+        super().__init__()
+        chunk_dim = cfg.chunk_len * cfg.action_dim
+        in_dim = cfg.rl_token_dim + cfg.proprio_dim + chunk_dim
+        self.qs = nn.ModuleList(
+            [_mlp(in_dim, cfg.hidden_dim, 1, cfg.n_layers) for _ in range(cfg.n_critics)]
+        )
+    def forward(self, x: Tensor, action_chunk: Tensor) -> Tensor:
+        """Returns (n_critics, B)."""
+        a_flat = action_chunk.reshape(action_chunk.shape[0], -1)
+        inp = torch.cat([x, a_flat], dim=-1)
+        return torch.stack([q(inp).squeeze(-1) for q in self.qs], dim=0)
+    def min_q(self, x: Tensor, action_chunk: Tensor) -> Tensor:
+        return self.forward(x, action_chunk).min(dim=0).values
+
+
+class RLTAgent:
+    """Owns actor/critic/targets and implements the Algorithm 1 updates."""
+    def __init__(self, cfg: OnlineRLConfig, device: str | torch.device = "cuda"):
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self.actor = ChunkActor(cfg.ac).to(self.device)
+        self.critic = ChunkCritic(cfg.ac).to(self.device)
+        self.critic_target = copy.deepcopy(self.critic).requires_grad_(False)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
+
+        self._update_count = 0
+
+    # ------------------------------------------------------------------ act
+    @torch.no_grad()
+    def act(self, x: Tensor, ref_chunk: Tensor, deterministic: bool = False) -> Tensor:
+        """Inference: the reference is always provided (no dropout)."""
+        self.actor.eval()
+        a = self.actor.sample(x, ref_chunk, deterministic=deterministic)
+        self.actor.train()
+        return a
+
+    # -------------------------------------------------------------- updates
+    def update_critic(self, batch: dict[str, Tensor]) -> dict[str, float]:
+        cfg = self.cfg
+        x, a, r, x_next, ref_next, done = (
+            batch["x"],
+            batch["action"],
+            batch["reward_disc"],  # sum_{t'=1}^{C} gamma^{t'-1} r_{t'}
+            batch["x_next"],
+            batch["ref_next"],
+            batch["done"],
+        )
+        with torch.no_grad():
+            # a' ~ pi_theta(. | x', a~'); dropout also applies here so the
+            # policy used in the backup matches the trained one in expectation.
+            ref_in = self.actor.apply_ref_dropout(ref_next)
+            a_next = self.actor.sample(x_next, ref_in)
+            q_next = self.critic_target.min_q(x_next, a_next)
+            gamma_c = cfg.discount ** cfg.ac.chunk_len
+            target = r + gamma_c * (1.0 - done) * q_next
+
+        q = self.critic(x, a)  # (n_critics, B)
+        critic_loss = F.mse_loss(q, target.unsqueeze(0).expand_as(q))
+
+        self.critic_opt.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        self.critic_opt.step()
+
+        with torch.no_grad():
+            for p, pt in zip(
+                self.critic.parameters(), self.critic_target.parameters(), strict=True
+            ):
+                pt.lerp_(p, cfg.tau)
+
+
+        return {
+            "critic_loss": critic_loss.item(),
+            "q_mean": q.mean().item(),
+            "target_mean": target.mean().item(),
+        }
+
+    def update_actor(self, batch: dict[str, Tensor]) -> dict[str, float]:
+        cfg = self.cfg
+        x,ref = batch["x"], batch["ref"]
+
+        # Reference dropout on the input pathway only (Eq. 5 still uses the
+        # true reference as the BC target).
+        ref_in = self.actor.apply_ref_dropout(ref)
+        mu = self.actor.mu(x, ref_in)
+        a = mu + cfg.ac.action_std * torch.randn_like(mu)  # reparameterized
+
+        q = self.critic.min_q(x, a)
+        bc = (a - ref).pow(2).mean(dim=(1, 2))
+        actor_loss = (-q + cfg.bc_beta * bc).mean()
+
+        self.actor_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.actor_opt.step()
+
+        return {
+            "actor_loss": actor_loss.item(),
+            "actor_q": q.mean().item(),
+            "bc_dist": bc.mean().item(),
+        }
+
+    def update(self, sample_batch_fn) -> dict[str, float]:
+        """One gradient step; actor updated every `critic_updates_per_actor_update`."""
+        metrics = self.update_critic(sample_batch_fn())
+        self._update_count += 1
+        if self._update_count % self.cfg.critic_updates_per_actor_update == 0:
+            metrics.update(self.update_actor(sample_batch_fn()))
+        return metrics
+
+    # ------------------------------------------------------------------- io
+    def state_dict(self) -> dict:
+        return {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "critic_target": self.critic_target.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "critic_opt": self.critic_opt.state_dict(),
+            "update_count": self._update_count,
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.actor.load_state_dict(sd["actor"])
+        self.critic.load_state_dict(sd["critic"])
+        self.critic_target.load_state_dict(sd["critic_target"])
+        self.actor_opt.load_state_dict(sd["actor_opt"])
+        self.critic_opt.load_state_dict(sd["critic_opt"])
+        self._update_count = sd.get("update_count", 0)
