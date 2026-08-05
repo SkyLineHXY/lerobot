@@ -177,3 +177,10 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# ...except the bundled robot descriptions, which are loaded at runtime and so
+# have to ship with the package (piper_leader gravity compensation).
+!src/lerobot/assets/**/*.urdf
+!src/lerobot/assets/**/*.STL
+!src/lerobot/assets/**/*.stl
+!src/lerobot/assets/**/*.xml

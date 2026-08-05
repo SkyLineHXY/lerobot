@@ -1,10 +1,17 @@
 """Environment interface for RLT online training + a mock env for smoke tests.
 
-A real deployment would wrap a robot (or simulator) behind :class:`ChunkEnv`.
+A real deployment wraps a robot behind :class:`ChunkEnv` (see
+``piper_env.PiperChunkEnv``) or a simulator (``libero_env.LiberoChunkEnv``).
+
 The mock environment is a 6-DoF abstract reaching task (SO-100-like action
-space, matching ``smolvla_base``) with three synthetic camera views; it
-exists to exercise the full RLT pipeline (frozen VLA forward, RL token,
-actor-critic, replay, updates) without a robot.
+space, matching ``smolvla_base``) with three synthetic camera views. It exists
+purely to exercise the plumbing — frozen VLA forward, RL token, actor-critic,
+replay, updates — without a robot.
+
+It is **not** a validation signal for the algorithm: its reward depends only on
+the first 2 of 6 state dims, `done == success` so episodes never terminate on
+failure, and it treats normalized actions as physical quantities (no
+un-normalisation boundary at all). Use LIBERO for evidence that RLT works.
 """
 from __future__ import annotations
 
@@ -18,6 +25,8 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
 )
+
+from .intervention import InterventionResult
 
 SMOLVLM_TOKENIZER = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 
@@ -38,8 +47,15 @@ class ChunkEnv(Protocol):
         """Convert raw observations to a SmolVLA-preprocessed model batch."""
         ...
 
-    def get_intervention(self) -> Tensor | None:
-        """Optional human intervention chunk (C, action_dim), else None."""
+    def run_intervention(self, chunk_len: int) -> InterventionResult | None:
+        """Let a human drive the next chunk, if one is taking over right now.
+
+        Interventions are decided *during* execution on a real robot, and the
+        teleoperator has to step the arm itself to produce the commands. So the
+        manager runs the whole chunk and hands back everything the rollout
+        worker would otherwise have collected; returning None means "no human,
+        execute the policy chunk normally".
+        """
         ...
 
 def _tokenize_prompt(prompt: str, max_length: int = 48) -> tuple[Tensor, Tensor]:
@@ -115,7 +131,7 @@ class MockManipEnv:
         reward = 1.0 if success else 0.0
         return self._obs(), reward, success
 
-    def get_intervention(self) -> Tensor | None:
+    def run_intervention(self, chunk_len: int) -> InterventionResult | None:
         return None
 
     def _obs(self) -> dict:

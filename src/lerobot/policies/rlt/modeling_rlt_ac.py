@@ -1,9 +1,15 @@
 """Chunk-level actor-critic for RLT (paper Sec. IV-B, Eq. 3-5, App. B).
+
 * Actor: Gaussian over action chunks with small fixed std, conditioned on the
   RL state x = (z_rl, s^p) and the VLA reference chunk (pass-through), with
   50% reference dropout during training (zeros on the input pathway only).
+  The mean is parameterised as ``mu = a~ + clamp(residual, +-max_residual)``
+  with a zero-initialised output layer, so before any gradient step the RL
+  policy *is* the base VLA. This keeps the very first real-robot chunk safe
+  and turns online RL into the local action editing the paper describes.
 * Critic: ensemble of two Q functions; TD3-style target networks, min over
-  the ensemble for target values; chunk-level C-step backup.
+  the ensemble for target values; chunk-level C-step backup with an exponent
+  of gamma^k where k is the number of steps actually executed in the window.
 """
 from __future__ import annotations
 
@@ -13,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .configs import ActorCriticConfig, OnlineRLConfig
+from .configuration_rlt import ActorCriticConfig, OnlineRLConfig
 
 def _mlp(in_dim: int, hidden_dim: int, out_dim: int, n_layers: int) -> nn.Sequential:
     layers: list[nn.Module] = []
@@ -25,7 +31,15 @@ def _mlp(in_dim: int, hidden_dim: int, out_dim: int, n_layers: int) -> nn.Sequen
     return nn.Sequential(*layers)
 
 class ChunkActor(nn.Module):
-    """pi_theta(a_{1:C} | x, a~_{1:C}) = N(mu_theta(x, a~), sigma^2 I)  (Eq. 4)."""
+    """pi_theta(a_{1:C} | x, a~_{1:C}) = N(mu_theta(x, a~), sigma^2 I)  (Eq. 4).
+
+    ``mu = clamp(a~ + clamp(f(x, a~_masked), +-max_residual), +-action_clip)``.
+    Reference dropout masks the *input* pathway only: the residual is still
+    added to the full reference, so a dropped sample forces the network to
+    produce a correction from the RL token alone rather than to regenerate the
+    whole chunk from scratch.
+    """
+
     def __init__(self, cfg: ActorCriticConfig):
         super().__init__()
         self.cfg = cfg
@@ -33,17 +47,42 @@ class ChunkActor(nn.Module):
         in_dim = cfg.rl_token_dim + cfg.proprio_dim + chunk_dim
         self.net = _mlp(in_dim, cfg.hidden_dim, chunk_dim, cfg.n_layers)
 
-    def mu(self,x: Tensor, ref_chunk: Tensor) -> Tensor:
-        """x: (B, rl_token_dim + proprio_dim); ref_chunk: (B, C, d) or zeros."""
-        ref_flat = ref_chunk.reshape(ref_chunk.shape[0], -1)
-        out = self.net(torch.cat([x,ref_flat], dim=-1))
-        return out.reshape(-1, self.cfg.chunk_len, self.cfg.action_dim)
+        # Zero-init the output layer => residual == 0 => mu == reference.
+        last = [m for m in self.net if isinstance(m, nn.Linear)][-1]
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
-    def sample(self, x:Tensor, ref_chunk: Tensor, deterministic: bool = False) -> Tensor:
-        mu = self.mu(x, ref_chunk)
+    def residual(self, x: Tensor, ref_in: Tensor) -> Tensor:
+        """Bounded correction predicted from x and the (possibly masked) ref."""
+        ref_flat = ref_in.reshape(ref_in.shape[0], -1)
+        out = self.net(torch.cat([x, ref_flat], dim=-1))
+        out = out.reshape(-1, self.cfg.chunk_len, self.cfg.action_dim)
+        if self.cfg.max_residual > 0:
+            out = out.clamp(-self.cfg.max_residual, self.cfg.max_residual)
+        return out
+
+    def mu(self, x: Tensor, ref_chunk: Tensor, ref_in: Tensor | None = None) -> Tensor:
+        """x: (B, rl_token_dim + proprio_dim); ref_chunk: (B, C, d).
+
+        `ref_in` is the (dropout-masked) reference fed to the network; it
+        defaults to `ref_chunk`, i.e. inference behaviour where the reference
+        is always provided (paper App. B).
+        """
+        res = self.residual(x, ref_chunk if ref_in is None else ref_in)
+        return (ref_chunk + res).clamp(-self.cfg.action_clip, self.cfg.action_clip)
+
+    def sample(
+        self,
+        x: Tensor,
+        ref_chunk: Tensor,
+        deterministic: bool = False,
+        ref_in: Tensor | None = None,
+    ) -> Tensor:
+        mu = self.mu(x, ref_chunk, ref_in=ref_in)
         if deterministic:
             return mu
-        return mu + self.cfg.action_std * torch.randn_like(mu)
+        noisy = mu + self.cfg.action_std * torch.randn_like(mu)
+        return noisy.clamp(-self.cfg.action_clip, self.cfg.action_clip)
 
     def apply_ref_dropout(self, ref_chunk: Tensor) -> Tensor:
         """Zero the reference for a random subset of the batch (training only)."""
@@ -85,6 +124,11 @@ class RLTAgent:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
 
         self._update_count = 0
+        # Sparse binary rewards => Q in [0, 1/(1-gamma^C)]. Clamping the
+        # bootstrap to that range is a hard guard against value divergence at
+        # UTD 5 (paper cites Hussing et al. 2024 for exactly this failure).
+        gamma_c = cfg.discount**cfg.ac.chunk_len
+        self.q_max = cfg.target_q_clip_scale / max(1.0 - gamma_c, 1e-6)
 
     # ------------------------------------------------------------------ act
     @torch.no_grad()
@@ -106,20 +150,35 @@ class RLTAgent:
             batch["ref_next"],
             batch["done"],
         )
+        # Windows that ran fewer than C steps must bootstrap with gamma^k, not
+        # gamma^C, or the critic discounts a gap that never elapsed.
+        steps = batch.get("actual_steps")
+
         with torch.no_grad():
-            # a' ~ pi_theta(. | x', a~'); dropout also applies here so the
-            # policy used in the backup matches the trained one in expectation.
-            ref_in = self.actor.apply_ref_dropout(ref_next)
-            a_next = self.actor.sample(x_next, ref_in)
-            q_next = self.critic_target.min_q(x_next, a_next)
-            gamma_c = cfg.discount ** cfg.ac.chunk_len
-            target = r + gamma_c * (1.0 - done) * q_next
+            # a' ~ pi_theta(. | x', a~') with the reference *always* provided:
+            # that is the policy actually deployed (App. B), so it is the one
+            # the backup must evaluate. TD3 target smoothing replaces the
+            # actor's own exploration noise here.
+            a_next = self.actor.mu(x_next, ref_next)
+            noise = (cfg.target_noise_std * torch.randn_like(a_next)).clamp(
+                -cfg.target_noise_clip, cfg.target_noise_clip
+            )
+            a_next = (a_next + noise).clamp(-cfg.ac.action_clip, cfg.ac.action_clip)
+
+            q_next = self.critic_target.min_q(x_next, a_next).clamp(0.0, self.q_max)
+            if steps is None:
+                gamma_k = cfg.discount**cfg.ac.chunk_len
+            else:
+                gamma_k = cfg.discount**steps
+            target = r + gamma_k * (1.0 - done) * q_next
 
         q = self.critic(x, a)  # (n_critics, B)
         critic_loss = F.mse_loss(q, target.unsqueeze(0).expand_as(q))
 
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
+        if cfg.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip_norm)
         self.critic_opt.step()
 
         with torch.no_grad():
@@ -137,20 +196,29 @@ class RLTAgent:
 
     def update_actor(self, batch: dict[str, Tensor]) -> dict[str, float]:
         cfg = self.cfg
-        x,ref = batch["x"], batch["ref"]
+        x, ref = batch["x"], batch["ref"]
 
         # Reference dropout on the input pathway only (Eq. 5 still uses the
-        # true reference as the BC target).
+        # true reference as the BC target, and the residual is still applied
+        # on top of the unmasked reference).
         ref_in = self.actor.apply_ref_dropout(ref)
-        mu = self.actor.mu(x, ref_in)
-        a = mu + cfg.ac.action_std * torch.randn_like(mu)  # reparameterized
+        a = self.actor.mu(x, ref, ref_in=ref_in)
 
+        # Only the actor is being optimised; freezing the critic here avoids a
+        # pointless gradient accumulation over its parameters.
+        self.critic.requires_grad_(False)
         q = self.critic.min_q(x, a)
-        bc = (a - ref).pow(2).mean(dim=(1, 2))
+        self.critic.requires_grad_(True)
+
+        # Paper Eq. 5 uses the squared L2 *norm* over the whole chunk. Summing
+        # (not averaging) over C x d keeps beta on the paper's scale.
+        bc = (a - ref).pow(2).sum(dim=(1, 2))
         actor_loss = (-q + cfg.bc_beta * bc).mean()
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
+        if cfg.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.grad_clip_norm)
         self.actor_opt.step()
 
         return {
@@ -159,12 +227,17 @@ class RLTAgent:
             "bc_dist": bc.mean().item(),
         }
 
-    def update(self, sample_batch_fn) -> dict[str, float]:
-        """One gradient step; actor updated every `critic_updates_per_actor_update`."""
-        metrics = self.update_critic(sample_batch_fn())
+    def update(self, batch: dict[str, Tensor], allow_actor: bool = True) -> dict[str, float]:
+        """One gradient step; actor updated every `critic_updates_per_actor_update`.
+
+        Critic and actor share the batch, as in TD3. `allow_actor=False` keeps
+        the critic learning while the actor is held at the VLA reference (used
+        during the warmup phase).
+        """
+        metrics = self.update_critic(batch)
         self._update_count += 1
-        if self._update_count % self.cfg.critic_updates_per_actor_update == 0:
-            metrics.update(self.update_actor(sample_batch_fn()))
+        if allow_actor and self._update_count % self.cfg.critic_updates_per_actor_update == 0:
+            metrics.update(self.update_actor(batch))
         return metrics
 
     # ------------------------------------------------------------------- io

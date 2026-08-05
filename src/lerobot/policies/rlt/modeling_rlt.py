@@ -19,8 +19,8 @@ from torch import Tensor
 
 from lerobot.utils.constants import OBS_STATE
 
-from .actor_critic import RLTAgent
-from .rl_token import RLTokenModule, SmolVLAPrefixExtractor
+from .modeling_rlt_ac import RLTAgent
+from .modeling_rlt_token import RLTokenModule, SmolVLAPrefixExtractor
 
 class RLTController:
     def __init__(
@@ -31,7 +31,8 @@ class RLTController:
         chunk_len: int,
         action_dim: int,
         proprio_dim: int,
-        image_only: bool = True,
+        drop_language: bool = True,
+        image_only: bool = False,
         num_inference_steps: int | None = None,
     ):
         self.policy = smolvla_policy
@@ -41,20 +42,36 @@ class RLTController:
         self.chunk_len = chunk_len
         self.action_dim = action_dim
         self.proprio_dim = proprio_dim
+        self.drop_language = drop_language
         self.image_only = image_only
         self.num_inference_steps = num_inference_steps
 
     def _proprio(self, batch: dict[str, Tensor]) -> Tensor:
+        """s^p = joint positions, optionally concatenated with joint velocities.
+
+        The paper feeds the actor and critic "proprioceptive position and
+        velocity" (App. B). The Piper bus only reports positions, so the env
+        supplies finite-difference velocities under `rlt_velocity`; when they
+        are absent (mock env, sim) the positions alone are used.
+        """
         sp = batch[OBS_STATE]
         if sp.ndim == 3:  # (B, 1, D) from delta_timestamps=[0.0]
             sp = sp.squeeze(1)
-        return sp[:, : self.proprio_dim].float()
+        sp = sp.float()
+        vel = batch.get("rlt_velocity")
+        if vel is not None:
+            if vel.ndim == 3:
+                vel = vel.squeeze(1)
+            sp = torch.cat([sp, vel.float().to(sp.device)], dim=-1)
+        return sp[:, : self.proprio_dim]
 
     @torch.no_grad()
     def compute_x(self, batch: dict[str, Tensor]) -> Tensor:
         """RL state x = (z_rl, s^p) for a (batched) observation."""
         feats = self.extractor.extract(batch)
-        z, m = self.extractor.select_tokens(feats, self.image_only)
+        z, m = self.extractor.select_tokens(
+            feats, drop_language=self.drop_language, image_only=self.image_only
+        )
         z_rl = self.rl_token.rl_token(z, m)
         return torch.cat([z_rl, self._proprio(batch)], dim=-1)
 
@@ -71,7 +88,9 @@ class RLTController:
         and action_chunk (B, C, d) to execute.
         """
         feats = self.extractor.extract(batch)
-        z, m = self.extractor.select_tokens(feats, self.image_only)
+        z, m = self.extractor.select_tokens(
+            feats, drop_language=self.drop_language, image_only=self.image_only
+        )
         z_rl = self.rl_token.rl_token(z, m)
         x = torch.cat([z_rl, self._proprio(batch)], dim=-1)
 

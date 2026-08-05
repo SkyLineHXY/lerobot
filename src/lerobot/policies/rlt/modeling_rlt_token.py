@@ -14,18 +14,17 @@ Two pieces:
 """
 
 from __future__ import annotations
-import math
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
+
 from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
 from lerobot.utils.constants import (
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
 )
 
-from .configs import RLTokenConfig
+from .configuration_rlt import RLTokenConfig
 
 class SmolVLAPrefixExtractor:
     """Frozen-VLA feature extraction mirroring ``VLAFlowMatching.sample_actions``.
@@ -66,27 +65,51 @@ class SmolVLAPrefixExtractor:
             fill_kv_cache=True,
         )
         prefix_out = outputs_embeds[0]
-        # Prefix = [img tokens x cameras, lang tokens, state token]; language
-        # and state tokens sit at the end (no prefix_length padding in
-        # smolvla_base: prefix_length <= 0).
-        n_state = 1
         n_lang = tokens.shape[1]
-        n_img = prefix_out.shape[1] - n_lang - n_state
+        att = prefix_att_masks[0].bool()
+        state_pos = att.nonzero()
+        if state_pos.numel() == 0:
+            raise RuntimeError(
+                "No state token found in the SmolVLA prefix attention mask; "
+                "the prefix layout assumed by the RL token extractor changed."
+            )
+        state_start = int(state_pos[0])
+        n_state = int(att.sum())
+        lang_start = state_start - n_lang
+        if lang_start < 0:
+            raise RuntimeError(
+                f"Inconsistent SmolVLA prefix: state token at {state_start} but "
+                f"{n_lang} language tokens expected before it."
+            )
 
         return {
             "z": prefix_out.to(torch.float32),  # (B, M_total, vla_width)
             "pad_mask": prefix_pad_masks.bool(),  # (B, M_total)
-            "n_img_tokens": n_img,
+            "lang_start": lang_start,  # == number of image-region tokens
+            "state_start": state_start,
+            "n_state": n_state,
             "past_key_values": past_key_values,
             "prefix_pad_masks": prefix_pad_masks,
         }
 
-    def select_tokens(self, feats: dict, image_only: bool) -> tuple[Tensor, Tensor]:
-        """Return (z, mask) restricted to image tokens if requested."""
+    def select_tokens(
+        self, feats: dict, drop_language: bool = True, image_only: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """Select which VLA embeddings the RL token has to compress.
+
+        Paper footnote 1 drops the *language* embeddings when the task
+        instruction is fixed. Everything else is kept — for SmolVLA that means
+        the image tokens plus the single state token, which is the only
+        proprioceptive entry point in the VLM prefix. `image_only` reproduces
+        the stricter variant that drops the state token too.
+        """
         z, mask = feats["z"], feats["pad_mask"]
+        n_img, s0, ns = feats["lang_start"], feats["state_start"], feats["n_state"]
         if image_only:
-            n = feats["n_img_tokens"]
-            z, mask = z[:, :n], mask[:, :n]
+            return z[:, :n_img], mask[:, :n_img]
+        if drop_language:
+            z = torch.cat([z[:, :n_img], z[:, s0 : s0 + ns]], dim=1)
+            mask = torch.cat([mask[:, :n_img], mask[:, s0 : s0 + ns]], dim=1)
         return z, mask
 
 
@@ -154,6 +177,35 @@ class RLTokenModule(nn.Module):
         nn.init.trunc_normal_(self.enc_pos, std=0.02)
         nn.init.trunc_normal_(self.dec_pos, std=0.02)
 
+        # SmolVLA multiplies image embeddings by sqrt(width) (~31) inside
+        # embed_prefix, so raw-MSE reconstruction is dominated by whichever
+        # channels happen to be large. Standardising per channel with running
+        # dataset statistics makes L_ro measure information instead of scale.
+        # The buffers travel with the checkpoint, so stage 2 sees the same
+        # normalisation as stage 1.
+        self.register_buffer("z_mean", torch.zeros(cfg.vla_width))
+        self.register_buffer("z_var", torch.ones(cfg.vla_width))
+        self.register_buffer("z_stats_count", torch.zeros(()))
+
+    @torch.no_grad()
+    def _update_z_stats(self, z: Tensor, mask: Tensor, momentum: float = 0.01) -> None:
+        flat = z[mask]  # (N_valid, vla_width)
+        if flat.numel() == 0:
+            return
+        mean, var = flat.mean(0), flat.var(0, unbiased=False)
+        if self.z_stats_count == 0:  # first batch: initialise rather than blend
+            self.z_mean.copy_(mean)
+            self.z_var.copy_(var)
+        else:
+            self.z_mean.lerp_(mean, momentum)
+            self.z_var.lerp_(var, momentum)
+        self.z_stats_count += 1
+
+    def normalize_z(self, z: Tensor) -> Tensor:
+        if not self.cfg.normalize_targets:
+            return z
+        return (z - self.z_mean) / (self.z_var + 1e-6).sqrt()
+
     def _subsample(self, z: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         m = z.shape[1]
         if m <= self.cfg.max_recon_tokens:
@@ -161,13 +213,21 @@ class RLTokenModule(nn.Module):
         idx = torch.linspace(0, m - 1, self.cfg.max_recon_tokens, device=z.device).long()
         return z[:,idx] , mask[:,idx]
 
-    def encode(self, z: Tensor, mask: Tensor | None = None) -> Tensor:
+    def encode(
+        self, z: Tensor, mask: Tensor | None = None, already_prepared: bool = False
+    ) -> Tensor:
         """Eq. 1: z_rl = g_phi([z_{1:M}, e_rl])_{M+1}.
+
         z: (B, M, vla_width); mask: (B, M) bool, True = valid token.
+        `already_prepared` skips subsampling/normalisation for callers that
+        did it themselves (the reconstruction loss shares both with the
+        decoder targets).
         """
         if mask is None:
             mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
-        z, mask = self._subsample(z, mask)
+        if not already_prepared:
+            z, mask = self._subsample(z, mask)
+            z = self.normalize_z(z)
         b, m, _ = z.shape
         h = self.enc_in_proj(z)
         h = torch.cat([h, self.e_rl.expand(b, 1, -1)], dim=1)
@@ -179,20 +239,26 @@ class RLTokenModule(nn.Module):
 
         return out[:, -1]
 
-    def reconstruction_loss(self, z: Tensor, mask: Tensor | None = None) -> Tensor:
+    def reconstruction_loss(
+        self, z: Tensor, mask: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, dict[str, float]]:
         """Eq. 2 with teacher forcing (parallel autoregressive training).
+
         Targets and decoder inputs use stop-gradient embeddings z_bar; the
         encoder also consumes z_bar since the VLA is frozen w.r.t. L_ro.
-        Returns (loss, z_rl).
+        Returns (loss, z_rl, metrics).
         """
         if mask is None:
             mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
         z_bar = z.detach()
         z_bar, mask = self._subsample(z_bar, mask)
+        if self.training and self.cfg.normalize_targets:
+            self._update_z_stats(z_bar, mask)
+        z_bar = self.normalize_z(z_bar)
 
         b, m, _ = z_bar.shape
 
-        z_rl = self.encode(z_bar, mask)
+        z_rl = self.encode(z_bar, mask, already_prepared=True)
         # Decoder input: [z_rl, proj(z_bar_1), ..., proj(z_bar_{M-1})]
         dec_in = torch.cat(
             [z_rl.unsqueeze(1), self.dec_in_proj(z_bar[:, :-1])], dim=1
@@ -201,10 +267,21 @@ class RLTokenModule(nn.Module):
         out = self.decoder(dec_in, mask=_causal_mask(m, z.device))
         pred = self.out_proj(out)  # predicts z_bar_1 .. z_bar_M
 
-        err = (pred - z_bar).pow(2).mean(dim=-1)  # (B, M)
         w = mask.float()
-        loss = (err * w).sum() / w.sum().clamp(min=1.0)
-        return loss, z_rl
+        denom = w.sum().clamp(min=1.0)
+        err = (pred - z_bar).pow(2).mean(dim=-1)  # (B, M)
+        loss = (err * w).sum() / denom
+
+        with torch.no_grad():
+            # Relative error tells you whether the bottleneck is too tight far
+            # better than the raw loss does, and z_rl's spread tells you
+            # whether the token has collapsed to a constant.
+            target_energy = (z_bar.pow(2).mean(dim=-1) * w).sum() / denom
+            metrics = {
+                "recon_rel_err": (loss / target_energy.clamp(min=1e-8)).item(),
+                "z_rl_std": z_rl.std(dim=0).mean().item(),
+            }
+        return loss, z_rl, metrics
 
 
     @torch.no_grad()

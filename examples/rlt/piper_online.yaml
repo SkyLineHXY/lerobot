@@ -1,0 +1,78 @@
+# 阶段 2：真实 Piper 机械臂 + human-in-the-loop 在线 RL（L3）
+#
+# 上机顺序不可跳级：
+#   1) 主臂遥操作单独验证（lerobot-teleoperate，piper_leader -> piper）
+#   2) dry-run：只跑观测→推理→反归一化→限幅，不下发动作
+#        python -m lerobot.rlt.train_online --config_path examples/rlt/piper_online.yaml \
+#          --env.dry_run=true
+#   3) warmup-only：把 warmup_env_steps 设成等于 total_env_steps，只跑 base VLA
+#   4) 正式在线 RL（本文件默认）
+#
+# 操作员按键：
+#   s 成功(+1,结束)  f 失败(0,结束)  r 交接给 RL policy  空格 切换主臂干预
+#   ← 丢弃当前 episode   Esc 停止训练
+#
+# 依赖：pip install -e ".[piper,smolvla]"
+
+rl_token: outputs/rl_token          # 必须是用 Piper 自己的演示数据训出来的
+checkpoint: outputs/vla_ft          # 在 Piper 数据上微调过的 SmolVLA
+out: outputs/rlt_online_piper
+device: cuda
+seed: 0
+
+env:
+  type: piper
+  can_port: can0
+  task: "insert the connector"      # 与阶段 1 数据集里的任务描述保持一致
+  control_hz: 30.0
+  # 反归一化后的每步关节限速。超限时整条 chunk 按比例缩放而不是逐关节裁剪，
+  # 这样限幅不会改变动作方向。
+  max_joint_step_rad: 0.05
+  # 复位位姿；null 表示用 PIPERConfig.home_position
+  reset_pose: null
+  # 论文的 "slightly randomized set of initial configurations"
+  reset_noise_rad: 0.02
+  max_episode_steps: 400
+  dry_run: false
+
+  # 留空则沿用 PIPERConfig 自带的 RealSense 默认相机。
+  # 相机集合必须和 VLA 微调时用的完全一致。
+  cameras: []
+  # 示例：
+  # cameras:
+  #   - name: cam_left
+  #     serial: "148522072680"
+  #   - name: cam_top
+  #     serial: "327122074756"
+
+  # 主臂遥操作干预；置为 null 则只有稀疏成功标签、没有动作干预
+  teleop:
+    port: can1
+    id: piper_leader
+
+rl:
+  ac:
+    chunk_len: 10
+    action_dim: 7                   # 6 关节 + 夹爪开度
+    # 位置(7) + 有限差分速度(7)：论文 App. B 用的是 position 和 velocity
+    proprio_dim: 14
+    hidden_dim: 256
+    n_layers: 2
+    action_std: 0.05
+    ref_dropout: 0.5
+    # 真机安全包围盒：actor 只能在 VLA 参考动作的邻域内修正。
+    # 配合零初始化的 residual，第一条真机动作严格等于 base VLA。
+    max_residual: 0.2
+  discount: 0.97
+  bc_beta: 0.3
+  utd: 5
+  batch_size: 256
+  warmup_env_steps: 2000
+  total_env_steps: 50000
+  buffer_capacity: 200000
+
+# 论文 Sec. V：episode 先跑 base VLA，操作员在关键阶段按 `r` 交接给 RL policy
+critical_phase: true
+resume_buffer: null                 # 中断续跑时指向 <out>/replay_buffer.pt
+log_freq: 200
+save_freq: 1000

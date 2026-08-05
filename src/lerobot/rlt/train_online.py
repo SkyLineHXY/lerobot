@@ -1,35 +1,69 @@
 """Stage 2: online RL with the RL token (Algorithm 1).
 
 Rollout-and-update loop:
-  * warmup: execute the base VLA reference chunks for N_warm env steps,
+  * warmup: execute the base VLA reference chunks for N_warm env steps while
+    the learner already trains the critic on that data,
   * afterwards the actor refines the VLA chunks; every executed chunk is
-    stored with stride-2 subsampling, and `utd * (C / stride)` gradient steps
-    are performed per chunk (2 critic updates per actor update),
-  * optional human interventions replace both the executed action and the
-    stored reference (paper Sec. V).
+    stored with stride-2 subsampling and the learner paces itself at
+    `utd` gradient steps per stored transition (2 critic updates per actor
+    update),
+  * a human may take over at any chunk boundary; the taken-over actions
+    replace both the executed action and the stored reference (paper Sec. V),
+  * with `--critical-phase` the episode starts under the base VLA and the
+    operator presses `r` to hand control to the RL policy, so data collection
+    concentrates on the precise segment that decides success.
 
-Example (mock env smoke run):
-  python -m rlt.train_online --checkpoint smolvla_base \
-    --rl-token outputs/rl_token/rl_token.pt --mock-env \
-    --total-env-steps 2000 --warmup-env-steps 400
+Rollout and learning run concurrently: the learner owns the agent in its own
+thread and publishes actor weights, the rollout thread reads them through a
+mirror at chunk boundaries. A synchronous loop would stall a real arm for the
+whole gradient burst at every boundary.
+
+Configuration is a draccus YAML tree (see `examples/rlt/`); any field can be
+overridden on the command line:
+
+  # mock smoke run
+  python -m lerobot.rlt.train_online --config_path examples/rlt/mock_online.yaml
+
+  # LIBERO simulation, pre-hardware validation
+  python -m lerobot.rlt.train_online --config_path examples/rlt/libero_online.yaml \
+    --env.task_id=3
+
+  # real Piper arm, leader-arm interventions
+  python -m lerobot.rlt.train_online --config_path examples/rlt/piper_online.yaml \
+    --env.dry_run=true
 """
 from __future__ import annotations
 
-import argparse
 import time
 from pathlib import Path
 
 import torch
 
-from .actor_critic import RLTAgent
-from .configs import ActorCriticConfig,OnlineRLConfig,RLTokenConfig
+from lerobot.configs import parser
+from lerobot.policies.rlt import (
+    LiberoEnvConfig,
+    MockEnvConfig,
+    PiperEnvConfig,
+    RLTAgent,
+    RLTController,
+    RLTokenConfig,
+    RLTokenModule,
+    RLTOnlineTrainConfig,
+    load_smolvla_policy,
+    load_stage1_processors,
+)
+
 from .envs import MockManipEnv
+from .intervention import KeyboardEventListener
+from .learner import ActorMirror, LearnerThread
 from .replay_buffer import ChunkRecord, ChunkReplayBuffer
-from .rl_token import RLTokenModule
-from .rlt_policy import RLTController
-from .smolvla_compat import load_smolvla_policy
+
 
 def load_rl_token(path: str | Path, device: str) -> tuple[RLTokenModule, RLTokenConfig]:
+    """Load the stage-1 RL token from either its directory or the .pt itself."""
+    path = Path(path)
+    if path.is_dir():
+        path = path / "rl_token.pt"
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = RLTokenConfig(**{
         k: v for k, v in ckpt["config"].items() if k in RLTokenConfig.__dataclass_fields__
@@ -42,65 +76,103 @@ def load_rl_token(path: str | Path, device: str) -> tuple[RLTokenModule, RLToken
 
 class RolloutWorker:
     """Executes chunks in a single env and assembles ChunkRecords."""
-    def __init__(self, env, controller: RLTController, buffer: ChunkReplayBuffer, stride: int):
+
+    def __init__(
+        self,
+        env,
+        controller: RLTController,
+        buffer: ChunkReplayBuffer,
+        stride: int,
+        keys: KeyboardEventListener | None = None,
+    ):
         self.env = env
         self.controller = controller
         self.buffer = buffer
         self.stride = stride
+        self.keys = keys
         self.device = next(controller.rl_token.parameters()).device
         self.obs = None
         self.ep_steps = 0
         self.ep_return = 0.0
+        self.ep_interventions = 0
+        # Critical-phase mode starts every episode under the base VLA and only
+        # switches to the RL policy when the operator says so.
+        self.rl_engaged = True
 
-    def reset(self) -> None:
+    def reset(self, critical_phase: bool = False) -> None:
         self.obs = self.env.reset()
         self.ep_steps = 0
         self.ep_return = 0.0
+        self.ep_interventions = 0
+        self.rl_engaged = not critical_phase
         self.buffer.start_episode()
+
+    def _states_for(self, obs_list: list[dict]) -> list[torch.Tensor]:
+        if not obs_list:
+            return []
+        batch = self.env.obs_to_batch(obs_list, self.device)
+        return list(self.controller.compute_x(batch).cpu())
 
     def run_chunk(self, use_actor: bool, deterministic: bool = False):
         """Plan at the chunk boundary, execute up to C steps, store the record.
 
-        Returns (n_steps, episode_done, episode_success).
+        Returns (n_steps, episode_done, episode_success, intervened).
         """
         c = self.controller.chunk_len
         batch = self.env.obs_to_batch([self.obs], self.device)
-        plan = self.controller.plan_chunk(batch, use_actor=use_actor, deterministic=deterministic)
+        plan = self.controller.plan_chunk(
+            batch, use_actor=use_actor, deterministic=deterministic
+        )
 
-        intervention = self.env.get_intervention()
+        intervention = self.env.run_intervention(c)
 
         if intervention is not None:
-            actions = intervention.to(plan["action_chunk"][0])
+            # Human corrections replace the VLA reference too, so the actor's
+            # BC term pulls toward the correction rather than toward the failed
+            # VLA attempt (paper Sec. V, "Rollout").
+            actions = intervention.action_chunk.to(plan["action_chunk"][0])
             ref_full = actions[-1:].repeat(plan["ref_full"].shape[1], 1).clone()
             ref_full[:c] = actions
+            rewards = intervention.rewards
+            step_obs = intervention.obs_list
+            n_exec = intervention.n_steps
+            success, truncated = intervention.done, intervention.truncated
+            if step_obs:
+                self.obs = step_obs[-1]
+            self.ep_steps += n_exec
+            self.ep_return += float(rewards.sum())
+            self.ep_interventions += 1
         else:
             actions = plan["action_chunk"][0]
             ref_full = plan["ref_full"][0]
+            rewards = torch.zeros(c)
+            step_obs = []
+            success = truncated = False
+            n_exec = 0
+            for j in range(c):
+                self.obs, r, success = self.env.step(actions[j])
+                rewards[j] = r
+                step_obs.append(self.obs)
+                n_exec = j + 1
+                self.ep_steps += 1
+                self.ep_return += r
+                if success:
+                    break
+                if self.ep_steps >= self.env.max_episode_steps:
+                    truncated = True
+                    break
 
-        rewards = torch.zeros(c)
-        inter_obs: list[dict] = []
+        done_step = n_exec if (success or truncated or n_exec < c) else None
 
-        success, truncated, done_step = False, False, None
-        for j in range(c):
-            self.obs, r, success = self.env.step(actions[j])
-            rewards[j] = r
-            self.ep_steps += 1
-            self.ep_return += r
-            if success:
-                done_step = j + 1
-                break
-            if self.ep_steps >= self.env.max_episode_steps:
-                truncated = True
-                done_step = j + 1
-                break
-            if (j + 1) % self.stride == 0 and (j + 1) < c:
-                inter_obs.append(self.obs)
-
-        xs = [plan["x"][0].cpu()]
-        if inter_obs:
-            xb = self.env.obs_to_batch(inter_obs, self.device)
-            xs.extend(self.controller.compute_x(xb).cpu())
-
+        # RL states at offsets 0, stride, 2*stride, ... The offset-0 state came
+        # for free with the plan; the rest are recomputed in a single batched
+        # VLM forward after execution so they never sit in the control loop.
+        # step_obs[j] is the observation *after* step j+1, so offset o lives at
+        # index o-1 and is only available if the chunk ran that far.
+        inter_obs = [
+            step_obs[o - 1] for o in range(self.stride, c, self.stride) if o <= len(step_obs)
+        ]
+        xs = [plan["x"][0].cpu()] + self._states_for(inter_obs)
 
         rec = ChunkRecord(
             xs=torch.stack(xs),
@@ -112,141 +184,250 @@ class RolloutWorker:
         )
         self.buffer.add_chunk(rec)
         if truncated and not success:
-            self.buffer.end_episode()
+            # A truncated window still bootstraps, so it needs the real state
+            # observed after the last executed step.
+            x_last = self._states_for([step_obs[-1]]) if step_obs else []
+            self.buffer.end_episode(x_last[0] if x_last else None)
 
-        n_steps = done_step if done_step is not None else c
-        return n_steps, success or truncated, success
+        return n_exec, success or truncated, success, intervention is not None
 
-def train(args):
-    device = args.device
-    cfg = OnlineRLConfig(
-        ac=ActorCriticConfig(
-            chunk_len=args.chunk_len,
-            action_dim=args.action_dim,
-            proprio_dim=args.proprio_dim,
-            hidden_dim=args.hidden_dim,
-            n_layers=args.n_layers,
-            action_std=args.action_std,
-        ),
-        bc_beta=args.bc_beta,
-        utd=args.utd,
-        batch_size=args.batch_size,
-        warmup_env_steps=args.warmup_env_steps,
-        total_env_steps=args.total_env_steps,
-        max_episode_steps=args.max_episode_steps,
-        device=device,
-        seed=args.seed,
-    )
-    torch.manual_seed(cfg.seed)
 
-    print(f"[stage2] loading SmolVLA from {args.checkpoint} ...")
-    policy = load_smolvla_policy(args.checkpoint, device=device, dtype=args.dtype)
-    rl_token, rt_cfg = load_rl_token(args.rl_token, device)
-    cfg.ac.rl_token_dim = rt_cfg.d_model
+def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
+    device = cfg.device
+    print(f"[stage2] loading SmolVLA from {cfg.checkpoint} ...")
+    policy = load_smolvla_policy(cfg.checkpoint, device=device, dtype=cfg.dtype)
+    rl_token, rt_cfg = load_rl_token(cfg.rl_token, device)
+    cfg.rl.ac.rl_token_dim = rt_cfg.d_model
 
-    agent = RLTAgent(cfg, device=device)
+    agent = RLTAgent(cfg.rl, device=device)
     controller = RLTController(
         policy,
         rl_token,
         agent,
-        chunk_len=cfg.ac.chunk_len,
-        action_dim=cfg.ac.action_dim,
-        proprio_dim=cfg.ac.proprio_dim,
-        num_inference_steps=args.num_inference_steps,
+        chunk_len=cfg.rl.ac.chunk_len,
+        action_dim=cfg.rl.ac.action_dim,
+        proprio_dim=cfg.rl.ac.proprio_dim,
+        drop_language=rt_cfg.drop_language_tokens,
+        image_only=rt_cfg.use_image_tokens_only,
+        num_inference_steps=cfg.num_inference_steps,
     )
+    return policy, agent, controller
 
-    if not args.mock_env:
-        raise NotImplementedError(
-            "Only --mock-env is wired up in this repo; implement ChunkEnv for a "
-            "real robot or simulator and pass it here."
+
+def _build_piper_cameras(specs, control_hz: float):
+    """Only override PIPERConfig's own camera defaults when cameras are named.
+
+    The camera set has to match the one the VLA was fine-tuned on, so an empty
+    list means "use whatever the robot config already declares".
+    """
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+
+    cameras: dict = {}
+    for spec in specs:
+        if spec.serial:
+            cameras[spec.name] = RealSenseCameraConfig(
+                serial_number_or_name=spec.serial,
+                width=spec.width,
+                height=spec.height,
+                fps=spec.fps or int(control_hz),
+            )
+        elif spec.index_or_path is not None:
+            idx = spec.index_or_path
+            cameras[spec.name] = OpenCVCameraConfig(
+                index_or_path=int(idx) if str(idx).isdigit() else idx,
+                width=spec.width,
+                height=spec.height,
+                fps=spec.fps or int(control_hz),
+            )
+        else:
+            raise ValueError(f"Camera {spec.name!r} needs either `serial` or `index_or_path`.")
+    return cameras
+
+
+def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener):
+    env_cfg, ac = cfg.env, cfg.rl.ac
+
+    if isinstance(env_cfg, MockEnvConfig):
+        return MockManipEnv(
+            action_dim=ac.action_dim,
+            max_episode_steps=env_cfg.max_episode_steps,
+            image_size=env_cfg.image_size,
+            success_eps=env_cfg.success_eps,
+            prompt=env_cfg.prompt,
+            seed=cfg.seed,
         )
 
-    env = MockManipEnv(
-        action_dim=cfg.ac.action_dim,
-        max_episode_steps=cfg.max_episode_steps,
+    # Everything below runs the policy for real, so it must use exactly the
+    # normalisation stage 1 was trained with.
+    preprocessor, postprocessor = load_stage1_processors(cfg.rl_token, device=cfg.device)
+
+    if isinstance(env_cfg, LiberoEnvConfig):
+        from .libero_env import LiberoChunkEnv
+
+        return LiberoChunkEnv(
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            task_suite_name=env_cfg.suite,
+            task_id=env_cfg.task_id,
+            action_dim=ac.action_dim,
+            max_episode_steps=env_cfg.max_episode_steps,
+            control_mode=env_cfg.control_mode,
+            observation_size=env_cfg.observation_size,
+            camera_name=env_cfg.camera_name,
+            seed=cfg.seed,
+        )
+
+    if not isinstance(env_cfg, PiperEnvConfig):
+        raise NotImplementedError(f"Unsupported env type {env_cfg.type!r}.")
+
+    from lerobot.robots.piper.config_piper import PIPERConfig
+    from lerobot.robots.piper.piper import Piper
+
+    from .intervention import PiperLeaderIntervention
+    from .piper_env import PiperChunkEnv
+
+    robot_cfg = PIPERConfig(can_port=env_cfg.can_port)
+    if env_cfg.cameras:
+        robot_cfg.cameras = _build_piper_cameras(env_cfg.cameras, env_cfg.control_hz)
+    robot_cfg.max_joint_step_rad = env_cfg.max_joint_step_rad
+    robot = Piper(robot_cfg)
+
+    env = PiperChunkEnv(
+        robot=robot,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        task=env_cfg.task,
+        action_dim=ac.action_dim,
+        max_episode_steps=env_cfg.max_episode_steps,
+        control_hz=env_cfg.control_hz,
+        max_joint_step_rad=env_cfg.max_joint_step_rad,
+        reset_pose=env_cfg.reset_pose,
+        reset_noise_rad=env_cfg.reset_noise_rad,
+        keys=keys,
+        dry_run=env_cfg.dry_run,
         seed=cfg.seed,
     )
-    x_dim = cfg.ac.rl_token_dim + cfg.ac.proprio_dim
-    buffer = ChunkReplayBuffer(
-        capacity=cfg.buffer_capacity,
-        x_dim=x_dim,
-        chunk_len=cfg.ac.chunk_len,
-        action_dim=cfg.ac.action_dim,
-        discount=cfg.discount,
-        stride=cfg.subsample_stride,
-        device=device,
-    )
-    worker = RolloutWorker(env, controller, buffer, stride=cfg.subsample_stride)
 
-    updates_per_chunk = cfg.utd * (cfg.ac.chunk_len // cfg.subsample_stride)
-    out_dir = Path(args.out)
+    if env_cfg.teleop is not None:
+        from lerobot.teleoperators.piper_leader import PiperLeader, PiperLeaderConfig
+
+        leader = PiperLeader(
+            PiperLeaderConfig(port=env_cfg.teleop.port, id=env_cfg.teleop.id)
+        )
+        leader.connect()
+        env.intervention = PiperLeaderIntervention(leader, env, keys)
+    return env
+
+
+def train(cfg: RLTOnlineTrainConfig):
+    device = cfg.device
+    rl = cfg.rl
+    torch.manual_seed(cfg.seed)
+
+    _policy, agent, controller = build_agent_and_controller(cfg)
+
+    out_dir = Path(cfg.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
-    env_steps, episodes, ep_results = 0, 0, []
-    worker.reset()
-    t0 = time.time()
-    metrics: dict[str, float] = {}
-    
-    while env_steps < cfg.total_env_steps:
-        warmup = env_steps < cfg.warmup_env_steps
-        prev_steps = env_steps
-        n_steps, ep_done, ep_success = worker.run_chunk(use_actor=not warmup)
-        env_steps += n_steps
-        
-        if ep_done:
-            episodes += 1
-            ep_results.append(1.0 if ep_success else 0.0)
-            worker.reset()
 
-        if not warmup and len(buffer) >= cfg.batch_size:
-            for _ in range(updates_per_chunk):
-                metrics = agent.update(lambda: buffer.sample(cfg.batch_size))
+    x_dim = rl.ac.rl_token_dim + rl.ac.proprio_dim
+    buffer = ChunkReplayBuffer(
+        capacity=rl.buffer_capacity,
+        x_dim=x_dim,
+        chunk_len=rl.ac.chunk_len,
+        action_dim=rl.ac.action_dim,
+        discount=rl.discount,
+        stride=rl.subsample_stride,
+        device=device,
+        seed=cfg.seed,
+    )
+    if cfg.resume_buffer:
+        buffer.load(cfg.resume_buffer)
+        print(f"[stage2] resumed buffer with {len(buffer)} transitions")
 
-        
-        if env_steps // args.log_freq != prev_steps // args.log_freq:
-            recent = ep_results[-20:]
-            sr = sum(recent) / max(len(recent), 1)
-            speed = env_steps / (time.time() - t0)
-            m = " ".join(f"{k}={v:.4f}" for k, v in metrics.items())
-            print(
-                f"[stage2] steps={env_steps} eps={episodes} buffer={len(buffer)} "
-                f"success20={sr:.2f} {m} ({speed:.1f} steps/s)",
-                flush=True,
-            )
-            
-        if env_steps // args.save_freq != prev_steps // args.save_freq:
-            torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
+    keys = KeyboardEventListener()
+    keys.start()
+    try:
+        env = build_env(cfg, keys)
+        mirror = ActorMirror(rl, device)
+        controller.agent = mirror  # rollout reads published weights, not live ones
+        worker = RolloutWorker(env, controller, buffer, rl.subsample_stride, keys=keys)
 
-        
+        learner = LearnerThread(agent, buffer, rl)
+        mirror.sync(learner)
+        learner.start()
+
+        env_steps, episodes, ep_results = 0, 0, []
+        worker.reset(critical_phase=cfg.critical_phase)
+        t0 = time.time()
+
+        while env_steps < rl.total_env_steps:
+            if keys.should_quit():
+                print("[stage2] operator requested stop.")
+                break
+
+            warmup = env_steps < cfg.warmup_env_steps
+            learner.allow_actor_updates = not warmup
+
+            # Critical-phase handover: run the base VLA until the operator
+            # presses `r`, then let the RL policy take over for the rest of the
+            # episode (paper Sec. V, "Targeted improvement of critical phases").
+            if cfg.critical_phase and not worker.rl_engaged and keys.poll_handover():
+                worker.rl_engaged = True
+                print("[stage2] handover -> RL policy")
+
+            use_actor = (not warmup) and worker.rl_engaged
+            mirror.sync(learner)
+            prev_steps = env_steps
+            n_steps, ep_done, ep_success, intervened = worker.run_chunk(use_actor=use_actor)
+            env_steps += n_steps
+
+            if keys.poll_discard():
+                buffer.start_episode()  # drop the pending chunk, keep the rest
+                print("[stage2] episode discarded by operator")
+                worker.reset(critical_phase=cfg.critical_phase)
+                continue
+
+            if ep_done:
+                episodes += 1
+                ep_results.append(1.0 if ep_success else 0.0)
+                worker.reset(critical_phase=cfg.critical_phase)
+
+            if env_steps // cfg.log_freq != prev_steps // cfg.log_freq:
+                recent = ep_results[-20:]
+                sr = sum(recent) / max(len(recent), 1)
+                speed = env_steps / (time.time() - t0)
+                m = " ".join(f"{k}={v:.4f}" for k, v in learner.metrics().items())
+                print(
+                    f"[stage2] steps={env_steps} eps={episodes} buffer={len(buffer)} "
+                    f"success20={sr:.2f} {'(warmup) ' if warmup else ''}"
+                    f"{'(interv) ' if intervened else ''}{m} ({speed:.1f} steps/s)",
+                    flush=True,
+                )
+
+            if env_steps // cfg.save_freq != prev_steps // cfg.save_freq:
+                torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
+                buffer.save(out_dir / "replay_buffer.pt")
+    finally:
+        keys.stop()
+        try:
+            learner.stop()
+            learner.join(timeout=5.0)
+        except (NameError, RuntimeError):
+            pass
+        try:
+            env.close()
+        except (NameError, AttributeError):
+            pass
+
     torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
-    print(f"[stage2] done; {episodes} episodes, saved to {out_dir/'rlt_agent.pt'}")
+    buffer.save(out_dir / "replay_buffer.pt")
+    print(f"[stage2] done; {episodes} episodes, saved to {out_dir / 'rlt_agent.pt'}")
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default="smolvla_base")
-    p.add_argument("--rl-token", default="outputs/rl_token/rl_token.pt")
-    p.add_argument("--out", default="outputs/rlt_online")
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--dtype", default=None, choices=[None, "float32", "bfloat16"])
-    p.add_argument("--mock-env", action="store_true")
-    p.add_argument("--chunk-len", type=int, default=10)
-    p.add_argument("--action-dim", type=int, default=6)
-    p.add_argument("--proprio-dim", type=int, default=6)
-    p.add_argument("--hidden-dim", type=int, default=256)
-    p.add_argument("--n-layers", type=int, default=2)
-    p.add_argument("--action-std", type=float, default=0.05)
-    p.add_argument("--bc-beta", type=float, default=1.0)
-    p.add_argument("--utd", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--warmup-env-steps", type=int, default=2000)
-    p.add_argument("--total-env-steps", type=int, default=100_000)
-    p.add_argument("--max-episode-steps", type=int, default=400)
-    p.add_argument("--num-inference-steps", type=int, default=None)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--log-freq", type=int, default=200)
-    p.add_argument("--save-freq", type=int, default=2000)
-    train(p.parse_args())
+@parser.wrap()
+def main(cfg: RLTOnlineTrainConfig):
+    train(cfg)
 
 
 if __name__ == "__main__":
