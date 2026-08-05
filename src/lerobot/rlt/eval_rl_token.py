@@ -32,8 +32,6 @@ Usage:
   python -m lerobot.rlt.eval_rl_token --config_path examples/rlt/rl_token.yaml \
     --eval.n_episodes 20
 """
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from pathlib import Path
 

@@ -32,8 +32,6 @@ overridden on the command line:
   python -m lerobot.rlt.train_online --config_path examples/rlt/piper_online.yaml \
     --env.dry_run=true
 """
-from __future__ import annotations
-
 import time
 from pathlib import Path
 

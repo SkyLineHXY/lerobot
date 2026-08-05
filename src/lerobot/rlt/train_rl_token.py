@@ -10,8 +10,6 @@ overridden on the command line:
   python -m lerobot.rlt.train_rl_token --config_path examples/rlt/rl_token.yaml \
     --dataset_root ~/data/lerobot/libero_10 --rl_token.steps 8000
 """
-from __future__ import annotations
-
 import time
 from pathlib import Path
 
@@ -102,11 +100,7 @@ def train(train_cfg: RLTokenTrainConfig):
     extractor = SmolVLAPrefixExtractor(policy)
     finetune_vla = cfg.vla_sft_alpha > 0
     policy.requires_grad_(finetune_vla)
-    # The VLA stays in eval mode for feature extraction even when alpha > 0:
-    # the reconstruction targets z_bar must be a deterministic function of the
-    # current VLA weights, or dropout turns L_ro into a moving target on top of
-    # the drift the SFT updates already cause. Train mode is entered only for
-    # the SFT forward below.
+
     policy.eval()
 
     rl_token = RLTokenModule(cfg).to(device)

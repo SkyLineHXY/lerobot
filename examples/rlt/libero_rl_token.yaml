@@ -13,10 +13,10 @@
 #     --checkpoint <同上> --rl_token outputs/rl_token_libero
 
 # 你已有的 SmolVLA LIBERO 微调权重（本地目录或 HF repo id）
-checkpoint: lerobot-rlt-train-token
+checkpoint: lerobot/smolvla_libero
 dataset: lerobot/libero_10
 dataset_root: null
-out: outputs/rl_token_libero
+out: outputs/rl_token/libero
 device: cuda
 dtype: null
 num_workers: 4
@@ -42,7 +42,5 @@ rl_token:
   steps: 5000
   batch_size: 8
 
-  # VLA 已经在 LIBERO 上微调过了，这里保持冻结（论文 Algorithm 1 的 alpha=0 分支）。
-  # 联合微调只会让 RL token 编码器去追一个漂移的 z 分布。
   vla_sft_alpha: 0.0
   vla_lr: 1.0e-5
