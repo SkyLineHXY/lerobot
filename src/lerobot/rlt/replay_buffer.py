@@ -79,6 +79,8 @@ class ChunkReplayBuffer:
         self.size = 0
         self.total_added = 0  # monotone counter, used to pace the learner
         self._ptr = 0
+        self._episode_ptr = 0  # write pointer when the current episode started
+        self._episode_added = 0  # transitions stored since then
         self._pending: ChunkRecord | None = None
         self._gammas = discount ** torch.arange(chunk_len).float()
         self._gen = torch.Generator().manual_seed(seed)
@@ -89,6 +91,34 @@ class ChunkReplayBuffer:
             # Previous episode ended without an explicit terminal/truncation
             # signal; we have no trustworthy next state, so drop it.
             self._pending = None
+        self._episode_ptr = self._ptr
+        self._episode_added = 0
+
+    def discard_episode(self) -> int:
+        """Drop everything the current episode has stored. Returns the count.
+
+        The operator's discard key means "that episode was garbage" (a bad
+        reset, a mislabelled outcome, an object knocked over), so dropping only
+        the un-paired pending chunk would leave exactly the transitions they
+        wanted gone. Rewinding the write pointer is only sound while the buffer
+        has never wrapped: once it is full, the slots ahead of the rewound
+        pointer hold valid older data, so shrinking `size` would delete the
+        wrong transitions. In that case we keep them and say so — a real run
+        (200k capacity, ~10^2 transitions per episode) never gets there.
+        """
+        self._pending = None
+        n = self._episode_added
+        if n == 0:
+            return 0
+        if self.size >= self.capacity or n > self.size:
+            self._episode_ptr = self._ptr
+            self._episode_added = 0
+            return 0
+        self._ptr = self._episode_ptr
+        self.size -= n
+        self.total_added -= n  # keep the learner's UTD pacing honest
+        self._episode_added = 0
+        return n
 
     def add_chunk(self, rec: ChunkRecord) -> None:
         """Feed one executed chunk; emits transitions for the previous one."""
@@ -203,6 +233,7 @@ class ChunkReplayBuffer:
         self._ptr = (p + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
         self.total_added += 1
+        self._episode_added += 1
 
     # ------------------------------------------------------------- sampling
     def sample(self, batch_size: int) -> dict[str, Tensor]:
@@ -252,4 +283,6 @@ class ChunkReplayBuffer:
             getattr(self, key)[:n] = sd[key][:n]
         self.size = n
         self._ptr = n % self.capacity
+        self._episode_ptr = self._ptr
+        self._episode_added = 0
         self.total_added = int(sd.get("total_added", n))

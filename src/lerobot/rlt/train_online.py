@@ -111,6 +111,11 @@ class RolloutWorker:
         batch = self.env.obs_to_batch(obs_list, self.device)
         return list(self.controller.compute_x(batch).cpu())
 
+    def _plan(self, batch, use_actor: bool, deterministic: bool):
+        return self.controller.plan_chunk(
+            batch, use_actor=use_actor, deterministic=deterministic
+        )
+
     def run_chunk(self, use_actor: bool, deterministic: bool = False):
         """Plan at the chunk boundary, execute up to C steps, store the record.
 
@@ -118,8 +123,14 @@ class RolloutWorker:
         """
         c = self.controller.chunk_len
         batch = self.env.obs_to_batch([self.obs], self.device)
-        plan = self.controller.plan_chunk(
-            batch, use_actor=use_actor, deterministic=deterministic
+        # If the operator is already holding the leader, the VLA's action chunk
+        # is guaranteed to be discarded; compute only the RL state x and skip
+        # the flow-matching sampling the human would otherwise wait through.
+        taking_over = self.env.intervention_pending()
+        plan = (
+            {"x": self.controller.compute_x(batch)}
+            if taking_over
+            else self._plan(batch, use_actor, deterministic)
         )
 
         intervention = self.env.run_intervention(c)
@@ -128,39 +139,49 @@ class RolloutWorker:
             # Human corrections replace the VLA reference too, so the actor's
             # BC term pulls toward the correction rather than toward the failed
             # VLA attempt (paper Sec. V, "Rollout").
-            actions = intervention.action_chunk.to(plan["action_chunk"][0])
-            ref_full = actions[-1:].repeat(plan["ref_full"].shape[1], 1).clone()
+            actions = intervention.action_chunk.to(plan["x"])
+            # The buffer only ever reads ref_full[o : o+C] for o < C, so a 2C
+            # horizon is all a human-authored reference needs.
+            ref_full = actions[-1:].repeat(2 * c, 1).clone()
             ref_full[:c] = actions
             rewards = intervention.rewards
             step_obs = intervention.obs_list
             n_exec = intervention.n_steps
-            success, truncated = intervention.done, intervention.truncated
+            terminated, truncated = intervention.done, intervention.truncated
+            # Sparse reward model: +1 only on operator-judged success. `done`
+            # also fires on the failure key, which must NOT count as a success.
+            success = bool(rewards.sum() > 0)
             if step_obs:
                 self.obs = step_obs[-1]
             self.ep_steps += n_exec
             self.ep_return += float(rewards.sum())
             self.ep_interventions += 1
         else:
+            if taking_over:
+                # Pre-check said "human", but they let go before the chunk
+                # started; fall back to a full plan.
+                plan = self._plan(batch, use_actor, deterministic)
             actions = plan["action_chunk"][0]
             ref_full = plan["ref_full"][0]
             rewards = torch.zeros(c)
             step_obs = []
-            success = truncated = False
+            terminated = truncated = False
             n_exec = 0
             for j in range(c):
-                self.obs, r, success = self.env.step(actions[j])
+                self.obs, r, terminated = self.env.step(actions[j])
                 rewards[j] = r
                 step_obs.append(self.obs)
                 n_exec = j + 1
                 self.ep_steps += 1
                 self.ep_return += r
-                if success:
+                if terminated:
                     break
                 if self.ep_steps >= self.env.max_episode_steps:
                     truncated = True
                     break
+            success = bool(rewards.sum() > 0)
 
-        done_step = n_exec if (success or truncated or n_exec < c) else None
+        done_step = n_exec if (terminated or truncated or n_exec < c) else None
 
         # RL states at offsets 0, stride, 2*stride, ... The offset-0 state came
         # for free with the plan; the rest are recomputed in a single batched
@@ -177,17 +198,20 @@ class RolloutWorker:
             actions=actions.detach().cpu(),
             rewards=rewards,
             ref_full=ref_full.detach().cpu(),
-            done=success,
+            # Terminal — success *or* operator-declared failure. Both end the
+            # episode with no further reward available, so both mask the
+            # bootstrap; only `success` carries the +1.
+            done=terminated,
             done_step=done_step,
         )
         self.buffer.add_chunk(rec)
-        if truncated and not success:
+        if truncated and not terminated:
             # A truncated window still bootstraps, so it needs the real state
             # observed after the last executed step.
             x_last = self._states_for([step_obs[-1]]) if step_obs else []
             self.buffer.end_episode(x_last[0] if x_last else None)
 
-        return n_exec, success or truncated, success, intervention is not None
+        return n_exec, terminated or truncated, success, intervention is not None
 
 
 def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
@@ -210,37 +234,6 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
         num_inference_steps=cfg.num_inference_steps,
     )
     return policy, agent, controller
-
-
-def _build_piper_cameras(specs, control_hz: float):
-    """Only override PIPERConfig's own camera defaults when cameras are named.
-
-    The camera set has to match the one the VLA was fine-tuned on, so an empty
-    list means "use whatever the robot config already declares".
-    """
-    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-    from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
-
-    cameras: dict = {}
-    for spec in specs:
-        if spec.serial:
-            cameras[spec.name] = RealSenseCameraConfig(
-                serial_number_or_name=spec.serial,
-                width=spec.width,
-                height=spec.height,
-                fps=spec.fps or int(control_hz),
-            )
-        elif spec.index_or_path is not None:
-            idx = spec.index_or_path
-            cameras[spec.name] = OpenCVCameraConfig(
-                index_or_path=int(idx) if str(idx).isdigit() else idx,
-                width=spec.width,
-                height=spec.height,
-                fps=spec.fps or int(control_hz),
-            )
-        else:
-            raise ValueError(f"Camera {spec.name!r} needs either `serial` or `index_or_path`.")
-    return cameras
 
 
 def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener):
@@ -283,11 +276,11 @@ def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener):
     from lerobot.robots.piper.piper import Piper
 
     from .intervention import PiperLeaderIntervention
-    from .piper_env import PiperChunkEnv
+    from .piper_env import PiperChunkEnv, build_piper_cameras
 
     robot_cfg = PIPERConfig(can_port=env_cfg.can_port)
     if env_cfg.cameras:
-        robot_cfg.cameras = _build_piper_cameras(env_cfg.cameras, env_cfg.control_hz)
+        robot_cfg.cameras = build_piper_cameras(env_cfg.cameras, env_cfg.control_hz)
     robot_cfg.max_joint_step_rad = env_cfg.max_joint_step_rad
     robot = Piper(robot_cfg)
 
@@ -314,7 +307,16 @@ def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener):
             PiperLeaderConfig(port=env_cfg.teleop.port, id=env_cfg.teleop.id)
         )
         leader.connect()
-        env.intervention = PiperLeaderIntervention(leader, env, keys)
+        env.intervention = PiperLeaderIntervention(
+            leader,
+            env,
+            keys,
+            use_calibrated_offsets=env_cfg.teleop.use_calibrated_offsets,
+            max_takeover_delta_rad=env_cfg.teleop.max_takeover_delta_rad,
+        )
+        # The leader entered gravity compensation on connect; park it on the
+        # follower's pose so the first takeover has a defined starting point.
+        env.intervention.align()
     return env
 
 
@@ -344,9 +346,14 @@ def train(cfg: RLTOnlineTrainConfig):
         print(f"[stage2] resumed buffer with {len(buffer)} transitions")
 
     keys = KeyboardEventListener()
-    keys.start()
+    env = None
     try:
+        # Build the env *before* putting stdin in cbreak mode: connecting the
+        # leader can drop into the interactive calibration flow, whose `input()`
+        # and Enter-detection do not work once the terminal is raw.
         env = build_env(cfg, keys)
+        keys.start()
+
         mirror = ActorMirror(rl, device)
         controller.agent = mirror  # rollout reads published weights, not live ones
         worker = RolloutWorker(env, controller, buffer, rl.subsample_stride, keys=keys)
@@ -381,8 +388,10 @@ def train(cfg: RLTOnlineTrainConfig):
             env_steps += n_steps
 
             if keys.poll_discard():
-                buffer.start_episode()  # drop the pending chunk, keep the rest
-                print("[stage2] episode discarded by operator")
+                # `env_steps` is not rolled back: the arm really did move, and
+                # the budget is a wear/time budget, not a data counter.
+                dropped = buffer.discard_episode()
+                print(f"[stage2] episode discarded by operator ({dropped} transitions dropped)")
                 worker.reset(critical_phase=cfg.critical_phase)
                 continue
 
@@ -413,10 +422,8 @@ def train(cfg: RLTOnlineTrainConfig):
             learner.join(timeout=5.0)
         except (NameError, RuntimeError):
             pass
-        try:
+        if env is not None:
             env.close()
-        except (NameError, AttributeError):
-            pass
 
     torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
     buffer.save(out_dir / "replay_buffer.pt")

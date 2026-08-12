@@ -126,6 +126,9 @@ class LiberoChunkEnv:
     def run_intervention(self, chunk_len: int) -> InterventionResult | None:
         return None  # no human in the loop in simulation
 
+    def intervention_pending(self) -> bool:
+        return False
+
     # ------------------------------------------------------------------ reset
     def reset(self) -> dict:
         obs, _info = self._env.reset(seed=self.seed + self._episode)

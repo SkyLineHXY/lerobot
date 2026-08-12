@@ -287,7 +287,9 @@ class PiperLeader(Teleoperator):
         if getattr(gripper_ctrl_msg, "time_stamp", 0.0) <= 0:
             return None
         gripper_ctrl = getattr(gripper_ctrl_msg, "gripper_ctrl", None)
-        return abs(float(getattr(gripper_state, "grippers_angle", 0)) / 1000000)
+        if gripper_ctrl is None:
+            return None
+        return abs(float(getattr(gripper_ctrl, "grippers_angle", 0)) / 1000000)
 
     def _read_gripper_from_feedback(self) -> float | None:
         gripper_msg = self.arm.GetArmGripperMsgs()
@@ -400,6 +402,20 @@ class PiperLeader(Teleoperator):
             move_cursor_up(len(PIPER_CALIB_KEYS) + 3)
 
         return mins, maxes
+
+    @check_if_not_connected
+    def get_raw_action(self) -> RobotAction:
+        """未经标定映射的**绝对**关节读数（弧度 / 夹爪米）。
+
+        `get_action()` 在标定后返回的是相对 neutral 位姿的偏移量，适合"主臂零位
+        对齐从臂零位"的遥操作约定；但在线 RL 的干预动作必须与阶段 1 数据集的动作
+        空间（绝对关节角）一致，否则 BC 项会被系统性偏置拉偏。需要绝对量的调用方
+        （如 `rlt.intervention.PiperLeaderIntervention`）用这个方法。
+        """
+        action: RobotAction = dict(self._read_raw_action())
+        if not self.config.sync_gripper:
+            action["gripper.pos"] = 0.0
+        return action
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:

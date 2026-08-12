@@ -49,6 +49,13 @@ env:
   teleop:
     port: can1
     id: piper_leader
+    # 干预动作必须落在阶段 1 数据集的绝对关节角空间里。get_action() 返回的是
+    # 相对标定 neutral 的偏移，除非主臂 neutral 就是跟随臂零位，否则会给 BC 项
+    # 引入系统性偏置 —— 所以默认读绝对值。
+    use_calibrated_offsets: false
+    # 接管瞬间主从关节差的上限。主臂在两次干预之间一直保持跟随臂位姿，差得多说明
+    # 人在主臂泄力时把它挪走了，此时释放会让跟随臂去追主臂。0 表示不检查。
+    max_takeover_delta_rad: 0.15
 
 rl:
   ac:

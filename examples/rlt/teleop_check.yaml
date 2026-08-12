@@ -1,0 +1,55 @@
+# 遥操作链路验证（上机第 0 步）—— 不训练、不加载 VLA、不写数据集
+#
+# 目的：在跑 train_online.py 之前，单独确认
+#   1) 重力补偿主臂 -> 跟随臂这条链路能不能稳定跑到 control_hz
+#   2) 键名映射 / 限速 / 按键语义 / 主从对齐这套流程是不是对的
+#
+# 建议顺序：
+#   a) 先 dry-run，只读不下发，确认主臂读数正常、耗时在预算内
+#        python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml \
+#          --dry_run=true
+#   b) 关掉相机，单独看机械臂 CAN 链路的极限
+#        ... --use_cameras=false
+#   c) 打开相机做真实跟随（本文件默认），按空格握住主臂拖动 20~30 秒
+#   d) 带上阶段 1 输出，连带验证归一化边界
+#        ... --rl_token=outputs/rl_token
+#
+# 操作员按键（与 train_online.py 完全一致）：
+#   空格 握住/交还主臂   s 成功   f 失败   ← 打标记   Esc 结束
+
+can_port: can0
+
+leader:
+  port: can1
+  id: piper_leader
+  # 干预动作必须与阶段 1 数据集的绝对关节角空间一致，默认读绝对值而非标定偏移
+  use_calibrated_offsets: false
+  # 验证脚本默认不强制标定，避免连上就掉进交互式标定流程
+  require_calibration: false
+  # 接管瞬间主从关节差的上限，超过就拒绝释放主臂并重新对齐
+  max_takeover_delta_rad: 0.15
+
+control_hz: 30.0
+duration_s: 30.0
+# 与 piper_online.yaml 保持一致，否则测出来的限速余量没有参考价值
+max_joint_step_rad: 0.05
+
+# 相机是控制回路里最贵的一环，必须计入实时性预算。
+# 留空则沿用 PIPERConfig 自带的相机；改 use_cameras 可整体关掉。
+use_cameras: true
+cameras: []
+# 示例：
+# cameras:
+#   - name: cam_left
+#     serial: "148522072680"
+#   - name: cam_top
+#     serial: "327122074756"
+
+dry_run: false
+engage_on_start: false
+
+# 给了就额外验证「人的关节读数 -> 归一化 -> 反归一化」能否原样回来
+rl_token: null
+device: cpu
+
+out: outputs/teleop_check

@@ -204,6 +204,18 @@ class PiperLeaderTeleopConfig:
 
     port: str = "can1"
     id: str = "piper_leader"
+    # `PiperLeader.get_action()` returns offsets from the calibrated neutral
+    # pose. Stage-1 dataset actions are *absolute* joint angles, so the default
+    # reads the leader's absolute joints instead — otherwise every human
+    # correction is shifted by the leader's neutral pose and the actor's BC term
+    # is pulled toward a biased target. Only set this when the leader's neutral
+    # pose is deliberately the follower's zero.
+    use_calibrated_offsets: bool = False
+    # Refuse a takeover if the leader is further than this from the follower.
+    # The leader holds the follower's pose between interventions, so a large
+    # gap means the operator moved it while it was limp; releasing then would
+    # make the follower chase it. 0 disables the check.
+    max_takeover_delta_rad: float = 0.15
 
 
 @ChunkEnvConfig.register_subclass("piper")

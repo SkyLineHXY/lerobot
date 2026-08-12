@@ -58,6 +58,14 @@ class ChunkEnv(Protocol):
         """
         ...
 
+    def intervention_pending(self) -> bool:
+        """Is a human about to take over the next chunk?
+
+        Cheap, side-effect free probe: the rollout worker uses it to skip the
+        VLA action sampling whose result an intervention would discard.
+        """
+        ...
+
 def _tokenize_prompt(prompt: str, max_length: int = 48) -> tuple[Tensor, Tensor]:
     """Tokenize with the SmolVLM2 tokenizer if cached, else dummy ids.
 
@@ -133,6 +141,9 @@ class MockManipEnv:
 
     def run_intervention(self, chunk_len: int) -> InterventionResult | None:
         return None
+
+    def intervention_pending(self) -> bool:
+        return False
 
     def _obs(self) -> dict:
         return {"state": self._state.clone(), "t": self._t}

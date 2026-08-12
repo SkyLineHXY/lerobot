@@ -34,6 +34,84 @@ logger = logging.getLogger(__name__)
 
 JOINT_ORDER = [f"joint_{i}.pos" for i in range(1, 8)]
 
+# 主臂（PiperLeader）与跟随臂（Piper）的键名约定不同：主臂沿用 PIPER_ACTION_KEYS，
+# 把夹爪叫 `gripper.pos`；跟随臂把夹爪当作第 7 个关节 `joint_7.pos`。两边的物理量
+# 完全一致（关节弧度 / 夹爪开度米），只是名字不同，所以只需要改名，不需要换算。
+LEADER_KEY_FOR_FOLLOWER = {
+    **{key: key for key in JOINT_ORDER[:6]},
+    JOINT_ORDER[6]: "gripper.pos",
+}
+
+
+def rate_limit_joints(
+    target: np.ndarray, current: np.ndarray, max_joint_step_rad: float
+) -> tuple[np.ndarray, bool]:
+    """Scale the whole step so no arm joint exceeds the per-step limit.
+
+    Scaling uniformly (rather than clipping each joint) preserves the direction
+    of the commanded motion; per-joint clipping would silently bend the
+    trajectory. Returns the limited target and whether limiting kicked in.
+    """
+    delta = target[:6] - current[:6]
+    peak = float(np.abs(delta).max()) if delta.size else 0.0
+    saturated = peak > max_joint_step_rad > 0
+    if saturated:
+        delta = delta * (max_joint_step_rad / peak)
+    limited = target.copy()
+    limited[:6] = current[:6] + delta
+    return limited, saturated
+
+
+def build_piper_cameras(specs, control_hz: float) -> dict:
+    """Only override PIPERConfig's own camera defaults when cameras are named.
+
+    The camera set has to match the one the VLA was fine-tuned on, so an empty
+    list means "use whatever the robot config already declares".
+    """
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+    from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+
+    cameras: dict = {}
+    for spec in specs:
+        if spec.serial:
+            cameras[spec.name] = RealSenseCameraConfig(
+                serial_number_or_name=spec.serial,
+                width=spec.width,
+                height=spec.height,
+                fps=spec.fps or int(control_hz),
+            )
+        elif spec.index_or_path is not None:
+            idx = spec.index_or_path
+            cameras[spec.name] = OpenCVCameraConfig(
+                index_or_path=int(idx) if str(idx).isdigit() else idx,
+                width=spec.width,
+                height=spec.height,
+                fps=spec.fps or int(control_hz),
+            )
+        else:
+            raise ValueError(f"Camera {spec.name!r} needs either `serial` or `index_or_path`.")
+    return cameras
+
+
+def leader_action_to_follower(raw: dict[str, float]) -> dict[str, float]:
+    """主臂动作 dict -> 跟随臂键名（joint_1..joint_7.pos）。"""
+    missing = [k for k in LEADER_KEY_FOR_FOLLOWER.values() if k not in raw]
+    if missing:
+        raise KeyError(
+            f"主臂动作缺少键 {missing}；拿到的是 {sorted(raw)}。"
+            "PiperLeader 应返回 joint_1..joint_6.pos + gripper.pos。"
+        )
+    return {follower: raw[leader] for follower, leader in LEADER_KEY_FOR_FOLLOWER.items()}
+
+
+def follower_action_to_leader(action: dict[str, float]) -> dict[str, float]:
+    """跟随臂关节 dict -> 主臂键名（joint_1..joint_6.pos + gripper.pos）。
+
+    交接回位时必须带上 `gripper.pos`，否则 `PiperLeader.send_feedback` 会静默跳过
+    夹爪，主臂夹爪停在人松手时的开度上。
+    """
+    return {leader: action[follower] for follower, leader in LEADER_KEY_FOR_FOLLOWER.items()}
+
 
 class PiperChunkEnv:
     """Single real Piper arm behind the :class:`ChunkEnv` protocol."""
@@ -143,18 +221,7 @@ class PiperChunkEnv:
         return np.asarray(out[0].detach().cpu(), dtype=np.float32)[: len(JOINT_ORDER)]
 
     def _rate_limit(self, target: np.ndarray, current: np.ndarray) -> np.ndarray:
-        """Scale the whole step so no joint exceeds the per-step limit.
-
-        Scaling uniformly (rather than clipping each joint) preserves the
-        direction of the commanded motion; per-joint clipping would silently
-        bend the trajectory.
-        """
-        delta = target[:6] - current[:6]
-        peak = float(np.abs(delta).max()) if delta.size else 0.0
-        if peak > self.max_joint_step_rad > 0:
-            delta = delta * (self.max_joint_step_rad / peak)
-        limited = target.copy()
-        limited[:6] = current[:6] + delta
+        limited, _saturated = rate_limit_joints(target, current, self.max_joint_step_rad)
         return limited
 
     def apply_action(self, action: Tensor) -> tuple[dict, float, bool, bool]:
@@ -189,6 +256,16 @@ class PiperChunkEnv:
     def run_intervention(self, chunk_len: int) -> InterventionResult | None:
         return self.intervention.run_chunk(chunk_len)
 
+    def intervention_pending(self) -> bool:
+        """Is the operator holding the leader right now? (cheap, non-blocking)
+
+        The rollout worker uses this to skip the VLA's flow-matching sampling
+        for a chunk whose actions would be thrown away anyway — on hardware
+        that sampling is dead time the operator has to wait through at every
+        chunk boundary of a takeover.
+        """
+        return self.intervention.check()
+
     # ------------------------------------------------------------------ reset
     def reset(self) -> dict:
         target = list(self.reset_pose) if self.reset_pose else list(self.robot.config.home_position)
@@ -206,15 +283,16 @@ class PiperChunkEnv:
         self.keys.clear_intervention()
         obs = self._observe()
         self._last_joints = obs["joints"]  # first velocity estimate is zero
+        # Re-align the leader with the follower's fresh reset pose, so the first
+        # takeover of the episode cannot drag the arm across the workspace.
+        self.intervention.on_reset()
         return obs
 
     def close(self) -> None:
         self.intervention.close()
-        try:
-            if not self.dry_run:
-                self.robot.bus.safe_disconnect()
-        finally:
-            self.robot.disconnect()
+        # `Piper.disconnect()` already runs `bus.safe_disconnect()`; calling it
+        # here too would drive the arm to the safe pose twice.
+        self.robot.disconnect()
 
     # ------------------------------------------------------ teleop conversion
     def raw_action_to_normalized(self, raw: dict[str, float]) -> Tensor:
