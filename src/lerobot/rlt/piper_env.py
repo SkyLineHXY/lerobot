@@ -62,6 +62,22 @@ def rate_limit_joints(
     return limited, saturated
 
 
+def jitter_rms(traj: np.ndarray, dt: float) -> float:
+    """轨迹的抖动度量：二阶差分的 RMS，单位 rad/s²。
+
+    一阶差分是速度，正常运动本来就有，拿它衡量抖动会把"动得快"误判成"抖"。
+    二阶差分（加速度）才反映方向反复翻转的高频成分，也就是手上感觉到的抖。
+
+    分别对"下发指令"和"跟随臂实测"各算一次，两者的关系能直接定位责任方：
+    实测远大于指令 -> 跟随臂自己在振（该调 kp/kd 或换控制模式）；
+    两者相当且都高 -> 输入本身就抖（主臂那端的问题）。
+    """
+    if traj.ndim != 2 or traj.shape[0] < 3:
+        return float("nan")
+    accel = np.diff(traj, n=2, axis=0) / (dt * dt)
+    return float(np.sqrt((accel**2).mean()))
+
+
 def build_piper_cameras(specs, control_hz: float) -> dict:
     """Only override PIPERConfig's own camera defaults when cameras are named.
 

@@ -36,6 +36,7 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -47,11 +48,16 @@ from lerobot.rlt.piper_env import (
     JOINT_ORDER,
     build_piper_cameras,
     follower_action_to_leader,
+    jitter_rms,
     leader_action_to_follower,
     rate_limit_joints,
 )
 
 logger = logging.getLogger(__name__)
+
+# 抖动的可察觉量级 (rad/s²)。参考：30Hz 下 ±0.002 rad 的交替振荡约 7 rad/s²，
+# 那已经是手上摸得到、耳朵听得见的嗡鸣。低于这个值就没必要再追责到哪一侧。
+JITTER_NOTICEABLE = 5.0
 
 
 @dataclass
@@ -95,6 +101,31 @@ class LeaderCheckConfig:
 
 
 @dataclass
+class FollowerMitConfig:
+    """跟随臂 MIT 阻抗控制参数（follower_control="mit" 时生效）。
+
+    调参顺序：先把重力前馈调对（手臂能自己托住不下垂），再加 kp 到跟手，
+    最后加 kd 压抖动。反过来调会互相掩盖。
+    """
+
+    # 刚度。太低 + 重力前馈不准 = 手臂垮下来；太高会自激振荡。从小往大加。
+    kp: float = 30.0
+    # 阻尼 —— 抖动的主要旋钮。位置模式根本没有这一项。SDK 范围 [-5, 5]。
+    kd: float = 1.0
+    # t_ref 限幅（SDK 硬件范围 ±18 N·m）
+    torque_limit: float = 8.0
+    # 重力前馈系数。1.0 = 完全补偿自重，让 kp 不必靠刚度硬扛。
+    gravity_ratio: float = 1.0
+    # 跟随臂的重力模型。跟随臂末端装了夹爪就必须指明，否则 t_ref 偏小、手臂下垂。
+    gravity_urdf: str | None = None
+    gravity_payload_mass: float = 0.0
+    gravity_payload_com: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    gravity_base_rpy_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    # 是否把主臂的速度反馈作为 vel_ref 前馈。关掉它可以单独看前馈的贡献。
+    use_velocity_feedforward: bool = True
+
+
+@dataclass
 class CameraCheckSpec:
     name: str = "cam"
     index_or_path: str | None = None
@@ -118,6 +149,15 @@ class TeleopCheckConfig:
     # 自带的相机；`use_cameras=false` 可以关掉相机单独看机械臂链路。
     cameras: list[CameraCheckSpec] = field(default_factory=list)
     use_cameras: bool = True
+
+    # 跟随臂控制方式：
+    #   "position" —— 原有路径，每拍 JointCtrl 位置阶跃 + 速度比例 100。没有任何可调
+    #      阻尼，30Hz 下每拍全速冲到点再停，加减速反复，表现为明显抖动。
+    #   "mit" —— MIT 阻抗控制 τ = kp(pos_ref−q) + kd(vel_ref−q̇) + t_ref。kd 提供
+    #      真正的阻尼，vel_ref 用主臂自身的速度反馈做前馈，t_ref 放跟随臂的重力补偿。
+    #      ⚠ 这是把跟随臂从位置控制换成力矩控制，务必先读 mit_follower.py 的安全须知。
+    follower_control: str = "position"
+    follower_mit: FollowerMitConfig = field(default_factory=lambda: FollowerMitConfig())
 
     # 只读不下发。第一次上机永远先用它。
     dry_run: bool = False
@@ -194,6 +234,7 @@ class TeleopChecker:
         self.robot = None
         self.leader = None
         self.normalizer = None
+        self.mit = None  # follower_control="mit" 时的阻抗控制器
 
         # 打点缓冲
         self.t_leader: list[float] = []
@@ -278,8 +319,70 @@ class TeleopChecker:
                 "若感觉「重力补偿没起作用」，先往上调这个值。"
             )
 
+        if cfg.follower_control == "mit":
+            self._setup_mit_follower()
+
         if cfg.rl_token:
             self._load_normalizer()
+
+    def _setup_mit_follower(self) -> None:
+        """给跟随臂建 MIT 阻抗控制器（此时还没切模式，切换在接管时才发生）。"""
+        from lerobot.teleoperators.piper_leader.gravity_compensation import (
+            PiperGravityCompensationLoop,
+        )
+
+        from lerobot.rlt.mit_follower import PiperMitFollower
+
+        mit = self.cfg.follower_mit
+        arm = self.robot.bus.piper
+
+        gravity_model = None
+        if mit.gravity_ratio > 0:
+            from lerobot.teleoperators.piper_leader.piper_leader import (
+                DEFAULT_PIPER_GRAVITY_URDF,
+                PiperLeader,
+            )
+
+            stub = SimpleNamespace(
+                config=SimpleNamespace(gravity_comp_urdf=mit.gravity_urdf),
+                gravity_comp_urdf_relpath=DEFAULT_PIPER_GRAVITY_URDF,
+            )
+            # 只当模型用：绝不 start()，那会起一个和我们抢着发 MIT 帧的线程。
+            gravity_model = PiperGravityCompensationLoop(
+                arm=arm,
+                urdf_path=PiperLeader._resolve_gravity_urdf(stub),
+                control_hz=200.0,
+                tx_ratio=(1.0,) * 6,
+                torque_limit=mit.torque_limit,
+                mit_kp=0.0,
+                mit_kd=0.0,
+                base_rpy_deg=tuple(mit.gravity_base_rpy_deg),
+                mode_refresh_interval_s=1.0,
+                move_speed_ratio=100,
+                payload_mass=mit.gravity_payload_mass,
+                payload_com=tuple(mit.gravity_payload_com),
+            )
+
+        self.mit = PiperMitFollower(
+            arm=arm,
+            kp=mit.kp,
+            kd=mit.kd,
+            torque_limit=mit.torque_limit,
+            gravity_model=gravity_model,
+            gravity_ratio=mit.gravity_ratio,
+        )
+        print(
+            f"[check] 跟随臂控制方式: MIT 阻抗  kp={mit.kp} kd={mit.kd} "
+            f"重力前馈={mit.gravity_ratio} 速度前馈={mit.use_velocity_feedforward}"
+        )
+        print(
+            f"[check]   跟随臂重力模型: {mit.gravity_urdf or '内置 piper_no_gripper_description.urdf'}"
+            + (f"  负载 {mit.gravity_payload_mass}kg" if mit.gravity_payload_mass else "  无负载")
+        )
+        if mit.gravity_payload_mass <= 0 and not mit.gravity_urdf:
+            print(
+                "[check]   ⚠ 跟随臂未配置末端负载：t_ref 会偏小，kp 若不够高手臂会下垂。"
+            )
 
     def _load_normalizer(self) -> None:
         """加载阶段 1 的 preprocessor，取出动作 normalizer 用于往返验证。"""
@@ -332,6 +435,28 @@ class TeleopChecker:
             "接管可能被安全门拒绝；检查主臂是否使能、或调大 align_settle_s。",
             settle_s,
             self.takeover_delta(),
+        )
+
+    def _send_to_follower(self, limited: np.ndarray) -> None:
+        """把一拍的关节目标下发给跟随臂。
+
+        position 模式走原来的 `send_action`（JointCtrl 位置阶跃）；
+        mit 模式走阻抗控制，并把主臂的速度反馈作为 vel_ref 前馈 —— 跟随臂因此
+        跟着"指令速度"走，而不是每拍去追一个阶跃，加减速的反复随之消失。
+        """
+        if self.mit is None:
+            self.robot.send_action(dict(zip(JOINT_ORDER, limited.tolist(), strict=True)))
+            return
+
+        from lerobot.rlt.mit_follower import read_joint_velocity
+
+        vel = None
+        if self.cfg.follower_mit.use_velocity_feedforward:
+            vel = read_joint_velocity(self.leader.arm)
+        self.mit.send(limited[:6], vel)
+        # 夹爪不参与 MIT，仍由位置指令单独控制。
+        self.robot.bus.piper.GripperCtrl(
+            abs(round(float(limited[6]) * 1e6)), 1000, 0x01, 0
         )
 
     def takeover_delta(self) -> float:
@@ -407,7 +532,7 @@ class TeleopChecker:
                 # 4) 下发
                 t0 = time.perf_counter()
                 if engaged and not cfg.dry_run:
-                    self.robot.send_action(dict(zip(JOINT_ORDER, limited.tolist(), strict=True)))
+                    self._send_to_follower(limited)
                 self.t_write.append(time.perf_counter() - t0)
 
                 # 5) 归一化往返（可选）
@@ -448,10 +573,16 @@ class TeleopChecker:
             return False
         print(f"\n[check] 接管开始（主从差 {delta:.4f} rad）")
         self.leader.set_manual_control(True)
+        # 跟随臂切 MIT 只在接管期间：不接管时留在位置模式，手臂由位置环托着更安全。
+        if self.mit is not None and not self.cfg.dry_run:
+            self.mit.start()
         return True
 
     def _on_disengage(self) -> None:
         t0 = time.perf_counter()
+        if self.mit is not None:
+            # 先把跟随臂交回位置环，再去动主臂 —— 顺序反了会让跟随臂空悬一段时间。
+            self.mit.stop()
         self.align()
         print(f"[check] 交还主臂，对齐耗时 {1e3 * (time.perf_counter() - t0):.0f} ms")
 
@@ -516,6 +647,17 @@ class TeleopChecker:
                 "busy_total": _stats_ms(self.t_busy),
                 "loop_period": _stats_ms(self.t_loop),
             },
+            "follower_control": cfg.follower_control,
+            "jitter_rms_rad_s2": {
+                "commanded": (
+                    jitter_rms(np.stack(self.cmd_hist), self.dt) if len(self.cmd_hist) > 2
+                    else float("nan")
+                ),
+                "measured": (
+                    jitter_rms(np.stack(self.meas_hist), self.dt) if len(self.meas_hist) > 2
+                    else float("nan")
+                ),
+            },
             "ratelimit_saturation_rate": float(np.mean(self.saturated)) if self.saturated else 0.0,
             "leader_stale_feedback_rate": (
                 float(np.mean(self.stale_leader)) if self.stale_leader else 0.0
@@ -576,6 +718,43 @@ class TeleopChecker:
                 f"{self.cfg.max_joint_step_rad}). 持续饱和说明跟随臂追不上人手，"
                 "干预时会有明显拖滞",
             )
+
+        jit = rep["jitter_rms_rad_s2"]
+        cmd_j, meas_j = jit["commanded"], jit["measured"]
+        mode = rep["follower_control"]
+        if not np.isfinite(meas_j):
+            add("跟随臂抖动", None, "接管样本不足，无法评估")
+        elif meas_j < JITTER_NOTICEABLE:
+            # 先过绝对阈值：指令本身几乎不抖时（匀速拖动）比值会爆到几万倍，
+            # 拿它下结论只会制造假阳性。抖动小就是小，不必再看比值。
+            add(
+                "跟随臂抖动",
+                True,
+                f"实测 {meas_j:.2f} rad/s²，低于可察觉量级 {JITTER_NOTICEABLE:.0f}（控制方式={mode}）",
+            )
+        else:
+            # 过了阈值才追责：实测远大于指令 = 跟随臂自己在振（控制方式/增益问题）；
+            # 两者相当 = 输入本身就抖（主臂那端）。这一区分决定该去调哪一侧。
+            ratio = meas_j / cmd_j if np.isfinite(cmd_j) and cmd_j > 1e-6 else float("inf")
+            blames_follower = ratio > 2.0
+            if blames_follower:
+                fix = (
+                    "位置模式没有可调阻尼，每拍都是全速冲向位置阶跃；"
+                    "建议改 follower_control=mit 并加 kd。"
+                    if mode == "position"
+                    else "提高 follower_mit.kd（阻尼），必要时降低 kp。"
+                )
+                ratio_txt = "≫" if not np.isfinite(ratio) else f"{ratio:.1f} 倍"
+                detail = (
+                    f"实测 {meas_j:.2f} rad/s²，是下发指令 {cmd_j:.2f} 的 {ratio_txt}"
+                    f" —— 跟随臂自身在振荡（控制方式={mode}）。{fix}"
+                )
+            else:
+                detail = (
+                    f"实测 {meas_j:.2f} rad/s²，下发指令 {cmd_j:.2f}（比值 {ratio:.1f}）"
+                    " —— 跟随臂忠实跟随，抖动来自输入侧（主臂重力补偿/人手）"
+                )
+            add("跟随臂抖动", not blames_follower, detail)
 
         lag_ms = rep["tracking"]["lag_ms"]
         moved = rep["tracking"]["cmd_motion_std_rad"]
