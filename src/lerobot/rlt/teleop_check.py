@@ -84,6 +84,14 @@ class LeaderCheckConfig:
     gravity_comp_mit_kp: float = 0.0
     gravity_comp_mit_kd: float = 0.0
     gravity_comp_control_hz: float = 200.0
+    # 重力模型用的 URDF。null 用内置的 piper_no_gripper_description.urdf（腕部不带
+    # 任何东西）。末端装了夹爪就换成 assets/piper_description/urdf/piper_description.urdf。
+    gravity_comp_urdf: str | None = None
+    # 末端额外负载（示教手柄 / 相机等），kg 与 m，相对 joint6 坐标系。
+    # 内置 URDF 腕部为空，末端真有负载而模型没有，腕部重力矩会被系统性低估，
+    # 表现就是"腕部没有重力补偿"，而且调 tx_ratio 补不回来。
+    gravity_comp_payload_mass: float = 0.0
+    gravity_comp_payload_com: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 
 @dataclass
@@ -237,6 +245,9 @@ class TeleopChecker:
                 gravity_comp_mit_kp=lead.gravity_comp_mit_kp,
                 gravity_comp_mit_kd=lead.gravity_comp_mit_kd,
                 gravity_comp_control_hz=lead.gravity_comp_control_hz,
+                gravity_comp_urdf=lead.gravity_comp_urdf,
+                gravity_comp_payload_mass=lead.gravity_comp_payload_mass,
+                gravity_comp_payload_com=tuple(lead.gravity_comp_payload_com),
             )
         )
         self.leader.connect()

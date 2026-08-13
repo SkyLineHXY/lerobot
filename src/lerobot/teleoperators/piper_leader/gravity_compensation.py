@@ -58,6 +58,8 @@ class PiperGravityCompensationLoop:
         base_rpy_deg: tuple[float, float, float],
         mode_refresh_interval_s: float,
         move_speed_ratio: int,
+        payload_mass: float = 0.0,
+        payload_com: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         import pinocchio as pin
 
@@ -80,6 +82,9 @@ class PiperGravityCompensationLoop:
         self._robot.data = self._robot.model.createData()
         self._nq = 6
 
+        if payload_mass > 0:
+            self._append_payload(payload_mass, payload_com)
+
         rot_world_base = _rpy_deg_to_rot(*base_rpy_deg)
         gravity_world = np.array([0.0, 0.0, -9.81], dtype=np.float64)
         gravity_base = rot_world_base.T @ gravity_world
@@ -88,6 +93,29 @@ class PiperGravityCompensationLoop:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._last_mode_refresh_t = 0.0
+
+    def _append_payload(self, mass: float, com: tuple[float, float, float]) -> None:
+        """把末端负载（夹爪 / 示教手柄 / 相机）并入模型的最后一节。
+
+        默认 URDF 是 `piper_no_gripper_description.urdf`，腕部什么都不带
+        （link6 仅 0.007 kg）。末端真装了东西而模型里没有，算出的腕部重力矩会
+        系统性偏小 —— 实测装上夹爪后 J4/J5 的真实需求是模型值的约 3.9 倍，手上
+        的表现就是「腕部完全没有重力补偿」。这种偏差**调 tx_ratio 补不回来**：
+        缩放的是一个本身就错的 g(q)，只能在某一个位姿上凑对。
+
+        重力项只取决于质量和质心位置，所以按质点处理即可，转动惯量留 0。
+        """
+        model = self._robot.model
+        joint_id = model.getJointId("joint6")
+        if joint_id <= 0 or joint_id >= model.njoints:
+            logger.warning("URDF 里找不到 joint6，末端负载未并入模型。")
+            return
+        inertia = self._pin.Inertia(
+            float(mass), np.asarray(com, dtype=np.float64), np.zeros((3, 3))
+        )
+        model.appendBodyToJoint(joint_id, inertia, self._pin.SE3.Identity())
+        self._robot.data = model.createData()
+        logger.info("末端负载已并入重力模型: %.3f kg @ %s", mass, tuple(com))
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():

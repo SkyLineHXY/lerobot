@@ -127,7 +127,15 @@ def render(
     return lines
 
 
-def probe(port: str, step: float, max_ratio: float, hz: float) -> int:
+def probe(
+    port: str,
+    step: float,
+    max_ratio: float,
+    hz: float,
+    urdf: str | None = None,
+    payload_mass: float = 0.0,
+    payload_com: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> int:
     leader = PiperLeader(
         PiperLeaderConfig(
             port=port,
@@ -136,10 +144,20 @@ def probe(port: str, step: float, max_ratio: float, hz: float) -> int:
             # 连上先别放软：由本脚本显式控制何时进重力补偿。
             manual_control=False,
             gravity_comp_tx_ratio=(0.0,) * N_JOINTS,
+            gravity_comp_urdf=urdf,
+            gravity_comp_payload_mass=payload_mass,
+            gravity_comp_payload_com=payload_com,
         )
     )
     leader.connect()
-    print(f"[probe] 主臂已连接 ({port})，当前为位置模式\n")
+    print(f"[probe] 主臂已连接 ({port})，当前为位置模式")
+    print(f"[probe] 重力模型: {urdf or '内置 piper_no_gripper_description.urdf'}")
+    if payload_mass > 0:
+        print(f"[probe] 末端负载: {payload_mass} kg @ {payload_com}")
+    else:
+        print("[probe] 末端负载: 无。若主臂装了夹爪/示教手柄，腕部重力矩会被系统性"
+              "低估，务必用 --payload-mass 或 --urdf 补上。")
+    print()
     print(__doc__.split("用法::")[1].split("⚠")[0].strip())
     print("\n⚠ 先用手扶住主臂再开始。手臂自己往上飘 = 过补偿，立刻按 0。")
     input("按 Enter 开始（Ctrl-C 取消）...")
@@ -218,9 +236,23 @@ def main() -> int:
     parser.add_argument("--step", type=float, default=0.05, help="每次 +/- 的步长")
     parser.add_argument("--max-ratio", type=float, default=1.2, help="tx_ratio 硬上限")
     parser.add_argument("--hz", type=float, default=20.0, help="刷新频率")
+    parser.add_argument(
+        "--urdf", default=None,
+        help="重力模型 URDF；末端装夹爪时可用 "
+             "assets/piper_description/urdf/piper_description.urdf",
+    )
+    parser.add_argument(
+        "--payload-mass", type=float, default=0.0,
+        help="末端额外负载质量 kg（夹爪示教器 / 手柄 / 相机）",
+    )
+    parser.add_argument(
+        "--payload-com", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z"), help="负载质心相对 joint6 坐标系的位置，单位 m",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
-    return probe(args.port, args.step, args.max_ratio, args.hz)
+    return probe(args.port, args.step, args.max_ratio, args.hz,
+                 args.urdf, args.payload_mass, tuple(args.payload_com))
 
 
 if __name__ == "__main__":

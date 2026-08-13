@@ -18,6 +18,7 @@ import logging
 import time
 from functools import cached_property
 from importlib import resources
+from pathlib import Path
 from typing import Any
 
 from lerobot.motors import MotorCalibration
@@ -231,16 +232,38 @@ class PiperLeader(Teleoperator):
                 self._set_gripper_enabled(True)
             self._manual_control_enabled = False
 
+    def _resolve_gravity_urdf(self) -> str:
+        """选定重力模型用的 URDF：配置优先，否则用内置的那份。
+
+        配置值可以是绝对路径，也可以是相对 lerobot 包的路径（例如
+        "assets/piper_description/urdf/piper_description.urdf"，那份含夹爪）。
+        """
+        override = self.config.gravity_comp_urdf
+        if override:
+            candidate = Path(override).expanduser()
+            if not candidate.is_file():
+                packaged = resources.files("lerobot").joinpath(override)
+                if not packaged.is_file():
+                    raise FileNotFoundError(
+                        f"gravity_comp_urdf 指向的文件不存在: {override}（既不是可用的"
+                        "绝对路径，也不是 lerobot 包内的相对路径）"
+                    )
+                _ensure_not_lfs_pointer(packaged, override)
+                return str(packaged)
+            return str(candidate)
+
+        default_urdf = resources.files("lerobot").joinpath(self.gravity_comp_urdf_relpath)
+        if not default_urdf.is_file():
+            raise FileNotFoundError(
+                "Bundled gravity compensation URDF is missing: "
+                f"{self.gravity_comp_urdf_relpath}. Reinstall the package."
+            )
+        _ensure_not_lfs_pointer(default_urdf, self.gravity_comp_urdf_relpath)
+        return str(default_urdf)
+
     def _ensure_gravity_comp_loop(self) -> PiperGravityCompensationLoop:
         if self._gravity_comp_loop is None:
-            default_urdf = resources.files("lerobot").joinpath(self.gravity_comp_urdf_relpath)
-            if not default_urdf.is_file():
-                raise FileNotFoundError(
-                    "Bundled gravity compensation URDF is missing: "
-                    f"{self.gravity_comp_urdf_relpath}. Reinstall the package."
-                )
-            _ensure_not_lfs_pointer(default_urdf, self.gravity_comp_urdf_relpath)
-            urdf_path = str(default_urdf)
+            urdf_path = self._resolve_gravity_urdf()
             self._gravity_comp_loop = PiperGravityCompensationLoop(
                 arm=self.arm,
                 urdf_path=urdf_path,
@@ -252,6 +275,8 @@ class PiperLeader(Teleoperator):
                 base_rpy_deg=self.config.gravity_comp_base_rpy_deg,
                 mode_refresh_interval_s=self.config.mode_refresh_interval_s,
                 move_speed_ratio=self.config.command_speed_ratio,
+                payload_mass=self.config.gravity_comp_payload_mass,
+                payload_com=self.config.gravity_comp_payload_com,
             )
         return self._gravity_comp_loop
 

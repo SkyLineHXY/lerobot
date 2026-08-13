@@ -64,6 +64,15 @@ class PiperLeaderConfigBase:
     gravity_comp_mit_kp: float = 0.0
     gravity_comp_mit_kd: float = 0.0
     gravity_comp_base_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # 重力模型用的 URDF。None = 用内置的 piper_no_gripper_description.urdf；
+    # 也可给绝对路径，或相对 lerobot 包的路径（如
+    # "assets/piper_description/urdf/piper_description.urdf"，该文件含夹爪）。
+    gravity_comp_urdf: str | None = None
+    # 末端额外负载（夹爪示教器 / 手柄 / 相机等），单位 kg 与 m，相对 joint6 坐标系。
+    # 内置 URDF 腕部不带任何东西，末端真装了负载而模型里没有，腕部重力矩会被系统性
+    # 低估（实测装夹爪后 J4/J5 差约 3.9 倍），表现就是「腕部没有重力补偿」。
+    gravity_comp_payload_mass: float = 0.0
+    gravity_comp_payload_com: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     # Calibration precision:
     # homing_offset/range_min/range_max are stored as "degree * calibration_scale".
