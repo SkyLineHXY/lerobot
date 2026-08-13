@@ -29,24 +29,42 @@ leader:
   # 接管瞬间主从关节差的上限，超过就拒绝释放主臂并重新对齐
   max_takeover_delta_rad: 0.15
 
+  # ---- 重力补偿 ----
+  # tx_ratio 是唯一按手感标定的系数：RNEA 算出的关节力矩 -> SDK MIT 力矩单位的
+  # 比例，同时兼作降额。0.2（Piper 默认）只补偿约两成自重，主臂拖起来会明显发沉,
+  # 感觉「重力补偿没起作用」。请从 0.2 起一档档往上加，找到「托得住又不上飘」的值。
+  # ⚠ 一旦发现主臂自己往上走 = 过补偿（正反馈），立刻调小。
+  gravity_comp_tx_ratio: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+  # 安装姿态 (roll, pitch, yaw)，单位度。侧装/斜装必须设，否则重力矢量转不到
+  # 基座系，g(q) 整个是错的 —— 表现同样是「补偿不起作用」。先设它再调 tx_ratio。
+  gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
+  # 单关节力矩上限（SDK t_ref 硬件范围 ±18 N·m）。实测本体重力矩峰值约 3.3 N·m，
+  # 所以 8.0 平时不触发，是防 URDF 写错 / NaN 的兜底。
+  gravity_comp_torque_limit: 8.0
+  # ⚠ kp 必须保持 0：MIT 的 pos_ref 恒为 0，kp>0 会把主臂往零位拽。
+  # 抖动只调 kd（vel_ref 也是 0，所以 kd 是纯阻尼），建议 0.1~0.8。
+  gravity_comp_mit_kp: 0.0
+  gravity_comp_mit_kd: 0.0
+  gravity_comp_control_hz: 200.0
+
 control_hz: 30.0
 duration_s: 30.0
 # 与 piper_online.yaml 保持一致，否则测出来的限速余量没有参考价值
-max_joint_step_rad: 0.05
+max_joint_step_rad: 0.2
 
 # 相机是控制回路里最贵的一环，必须计入实时性预算。
 # 留空则沿用 PIPERConfig 自带的相机；改 use_cameras 可整体关掉。
 use_cameras: true
 cameras: []
 
-# 按键后端：auto = stdin 是真终端就用 termios，否则退到 pynput 全局钩子。
-# IDE（PyCharm/VSCode）控制台里 stdin 是管道，auto 会自动落到 pynput，按键照常可用；
-# 代价是 pynput 捕获是全局的 —— 焦点在别的窗口按 s/f/空格同样算操作员指令。
-# 可选 termios / pynput / none 强制指定。
 keyboard_backend: auto
 
 dry_run: false
+# 一启动就进接管态（不用按空格）。IDE 里调试、或按键不可用时很有用。
 engage_on_start: false
+# 对齐后等主臂真正走到跟随臂位姿的时间上限。send_feedback 的 JointCtrl 是异步的，
+# 不等就按空格会被接管安全门拒掉，现象是「按了空格主臂没松开」。
+align_settle_s: 2.0
 
 # 给了就额外验证「人的关节读数 -> 归一化 -> 反归一化」能否原样回来
 rl_token: null

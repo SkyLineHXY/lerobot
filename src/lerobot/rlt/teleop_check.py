@@ -65,6 +65,26 @@ class LeaderCheckConfig:
     # 主从关节差超过这个值就拒绝接管（0 表示不检查）
     max_takeover_delta_rad: float = 0.15
 
+    # ---- 重力补偿参数 ----
+    # 这些直通 PiperLeaderConfig。必须能从 yaml 调，否则"主臂拖不动"时无从下手：
+    # tx_ratio 是唯一按手感标定的系数，而 base_rpy_deg 决定 g(q) 算得对不对。
+    #
+    # tx_ratio：RNEA 算出的关节力矩 -> SDK MIT 力矩单位的比例，同时兼作降额。
+    # Piper 默认 0.2，即只补偿约两成自重 —— 手感会接近"完全没补偿"。往上调到手臂
+    # 托得住又不上飘为止；**发现手臂自己往上走就是过补偿，立刻降**。
+    gravity_comp_tx_ratio: list[float] = field(
+        default_factory=lambda: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+    )
+    # 安装姿态。侧装/斜装不设这个，重力矢量就转不到基座系，g(q) 整个是错的。
+    gravity_comp_base_rpy_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    # 单关节力矩上限（SDK t_ref 硬件范围 ±18 N·m）。实测本体重力矩峰值约 3.3 N·m，
+    # 所以 8.0 平时不会触发，是防 URDF 写错 / NaN 的兜底。
+    gravity_comp_torque_limit: float = 8.0
+    # kp 必须保持 0：pos_ref 恒为 0，kp>0 会把主臂往零位拽。抖动只调 kd（纯阻尼）。
+    gravity_comp_mit_kp: float = 0.0
+    gravity_comp_mit_kd: float = 0.0
+    gravity_comp_control_hz: float = 200.0
+
 
 @dataclass
 class CameraCheckSpec:
@@ -84,7 +104,7 @@ class TeleopCheckConfig:
     control_hz: float = 30.0
     duration_s: float = 30.0
     # 与 PiperEnvConfig 保持一致：反归一化后的每步关节限速
-    max_joint_step_rad: float = 0.05
+    max_joint_step_rad: float = 0.5
 
     # 相机是控制回路里最贵的一环，必须计入实时性预算。留空则沿用 PIPERConfig
     # 自带的相机；`use_cameras=false` 可以关掉相机单独看机械臂链路。
@@ -93,9 +113,10 @@ class TeleopCheckConfig:
 
     # 只读不下发。第一次上机永远先用它。
     dry_run: bool = False
-    # 是否一启动就处于接管态；默认 false，要求操作员按空格，这样也顺带验证
-    # 「握住主臂 -> 交还」的模式切换流程。
     engage_on_start: bool = False
+    # 对齐后等主臂真正走到跟随臂位姿的时间上限。JointCtrl 是异步的，不等就按空格
+    # 会被接管安全门拒掉，现象是"按了空格主臂没松开"。
+    align_settle_s: float = 2.0
 
     # 按键后端：auto（stdin 是终端就用 termios，否则退到 pynput 全局钩子）/
     # termios / pynput / none。IDE 控制台里 stdin 是管道，auto 会自动落到 pynput。
@@ -204,15 +225,33 @@ class TeleopChecker:
             self.robot.connect(calibrate=False)
         print(f"[check] 跟随臂已连接 ({cfg.can_port})，相机: {list(self.robot.cameras) or '无'}")
 
+        lead = cfg.leader
         self.leader = PiperLeader(
             PiperLeaderConfig(
-                port=cfg.leader.port,
-                id=cfg.leader.id,
-                require_calibration=cfg.leader.require_calibration,
+                port=lead.port,
+                id=lead.id,
+                require_calibration=lead.require_calibration,
+                gravity_comp_tx_ratio=tuple(lead.gravity_comp_tx_ratio),
+                gravity_comp_base_rpy_deg=tuple(lead.gravity_comp_base_rpy_deg),
+                gravity_comp_torque_limit=lead.gravity_comp_torque_limit,
+                gravity_comp_mit_kp=lead.gravity_comp_mit_kp,
+                gravity_comp_mit_kd=lead.gravity_comp_mit_kd,
+                gravity_comp_control_hz=lead.gravity_comp_control_hz,
             )
         )
         self.leader.connect()
-        print(f"[check] 主臂已连接 ({cfg.leader.port})，重力补偿线程已启动")
+        print(
+            f"[check] 主臂已连接 ({lead.port})  重力补偿: "
+            f"tx_ratio={lead.gravity_comp_tx_ratio} "
+            f"base_rpy={lead.gravity_comp_base_rpy_deg} "
+            f"limit={lead.gravity_comp_torque_limit}N·m "
+            f"kp={lead.gravity_comp_mit_kp} kd={lead.gravity_comp_mit_kd}"
+        )
+        if max(lead.gravity_comp_tx_ratio) <= 0.25:
+            print(
+                "[check] 提示：tx_ratio 很低，只补偿约两成自重，主臂拖起来会明显发沉。"
+                "若感觉「重力补偿没起作用」，先往上调这个值。"
+            )
 
         if cfg.rl_token:
             self._load_normalizer()
@@ -244,12 +283,31 @@ class TeleopChecker:
         joints = np.array([obs[k] for k in JOINT_ORDER], dtype=np.float32)
         return obs, joints
 
-    def align(self) -> None:
-        """把主臂拉回命令模式并对到跟随臂当前位姿 —— 与干预路径的 `_exit` 同构。"""
+    def align(self, settle_s: float = 0.0) -> None:
+        """把主臂拉回命令模式并对到跟随臂当前位姿 —— 与干预路径的 `_exit` 同构。
+
+        `send_feedback` 下发的 JointCtrl 是**异步**的：命令发出去主臂才开始走。
+        不等它到位就按空格，接管安全门会拿一个还没收敛的主从差去比，于是把接管
+        拒掉 —— 现象就是"按了空格主臂却没松开"。`settle_s > 0` 时轮询等待到位。
+        """
         _obs, joints = self.read_follower()
         action = dict(zip(JOINT_ORDER, joints.tolist(), strict=True))
         self.leader.send_feedback(follower_action_to_leader(action))
         self.leader.set_manual_control(False)
+        if settle_s <= 0:
+            return
+        limit = max(self.cfg.leader.max_takeover_delta_rad, 1e-3)
+        deadline = time.perf_counter() + settle_s
+        while time.perf_counter() < deadline:
+            if self.takeover_delta() <= limit * 0.5:
+                return
+            time.sleep(0.02)
+        logger.warning(
+            "[check] 主臂在 %.1fs 内没走到跟随臂位姿（当前差 %.3f rad）。"
+            "接管可能被安全门拒绝；检查主臂是否使能、或调大 align_settle_s。",
+            settle_s,
+            self.takeover_delta(),
+        )
 
     def takeover_delta(self) -> float:
         leader = self.read_leader()
@@ -269,12 +327,16 @@ class TeleopChecker:
             f"{'DRY-RUN（不下发）' if cfg.dry_run else '真实下发'}\n"
         )
         # 先对齐再进裸终端：对齐可能要等主臂使能，不该被按键监听打断
-        self.align()
+        self.align(settle_s=cfg.align_settle_s)
 
-        engaged = cfg.engage_on_start
-        if engaged:
-            self.leader.set_manual_control(True)
-        prev_engaged = engaged
+        # engage_on_start 必须去播种按键监听器的 toggle，而不是直接调
+        # set_manual_control(True)：toggle 才是主循环每一拍读的状态，绕过它安排的
+        # 接管会在下一拍被 `prev_engaged and not engaged` 判成"松手"而立刻撤销 ——
+        # 重力补偿刚开起来就被关掉，整场一拍都接管不了。
+        if cfg.engage_on_start:
+            self.keys.set_intervening(True)
+        # 从"未接管"起步，让首次接管照常走 _on_engage()（含主从对齐安全门）。
+        prev_engaged = False
         last_ts = self.leader_timestamp()
 
         self.keys.start()
@@ -355,7 +417,9 @@ class TeleopChecker:
                 "已重新对齐，把主臂放回机器人位姿后再按空格。"
             )
             self.keys.clear_intervention()
-            self.align()
+            # 这里等主臂真正回到位再返回：否则操作员立刻再按一次空格，比的还是
+            # 那个没收敛的差值，又被拒一次。（松手交还的路径不能等，会卡住控制回路。）
+            self.align(settle_s=self.cfg.align_settle_s)
             return False
         print(f"\n[check] 接管开始（主从差 {delta:.4f} rad）")
         self.leader.set_manual_control(True)

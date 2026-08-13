@@ -309,6 +309,15 @@ class KeyboardEventListener:
     def clear_intervention(self) -> None:
         self._intervene = False
 
+    def set_intervening(self, value: bool) -> None:
+        """Seed the takeover toggle (e.g. an `engage_on_start` option).
+
+        Callers must go through the listener rather than driving the robot
+        directly: the toggle *is* the state the control loop reads every tick,
+        so a takeover arranged behind its back is undone on the very next one.
+        """
+        self._intervene = bool(value)
+
     def reset_episode_flags(self) -> None:
         self._success = self._failure = self._handover = self._discard = False
 

@@ -184,3 +184,78 @@ def test_alignment_puts_leader_back_in_command_mode():
     sent = checker.leader.feedback[-1]
     assert sent["joint_3.pos"] == pytest.approx(0.2)
     assert sent["gripper.pos"] == pytest.approx(0.6)
+
+
+class SpyLeader(FakeLeader):
+    """记录 set_manual_control 的调用序列 —— 重力补偿的开关就是它。"""
+
+    def __init__(self):
+        super().__init__()
+        self.history: list[bool] = []
+
+    def set_manual_control(self, enabled):
+        self.history.append(enabled)
+        super().set_manual_control(enabled)
+
+
+def _spy_checker(**kw):
+    cfg = TeleopCheckConfig(
+        control_hz=200.0, duration_s=0.4, use_cameras=False, align_settle_s=0.0,
+        keyboard_backend="none", **kw,
+    )
+    checker = TeleopChecker(cfg)
+    checker.leader = SpyLeader()
+    checker.robot = FakeFollower()
+    return checker
+
+
+def test_engage_on_start_actually_engages():
+    """engage_on_start 必须真的进入接管，而不是开完重力补偿就被状态机撤销。
+
+    曾经的写法是绕过按键 toggle 直接 set_manual_control(True) 并把 prev_engaged
+    设成 True；主循环第一拍读到 toggle 仍是 False，就判成"松手"立刻交还 ——
+    重力补偿刚起来就被关掉，整场 0 拍接管。
+    """
+    checker = _spy_checker(engage_on_start=True)
+    checker.run()
+    rep = checker.report()
+
+    assert rep["engaged_steps"] > 5, "engage_on_start 应当全程处于接管态"
+    assert checker.robot.n_sent == rep["engaged_steps"]
+    # 重力补偿必须被真正打开过
+    assert True in checker.leader.history, "从未调用 set_manual_control(True)"
+    # 且不能开完立刻关：True 之后不该紧跟着一次撤销性的 False
+    first_true = checker.leader.history.index(True)
+    assert checker.leader.history[first_true:].count(False) <= 1, (
+        f"重力补偿被反复开关: {checker.leader.history}"
+    )
+
+
+def test_engage_on_start_false_stays_disengaged():
+    checker = _spy_checker(engage_on_start=False)
+    checker.run()
+
+    assert checker.report()["engaged_steps"] == 0
+    assert checker.robot.n_sent == 0
+    assert True not in checker.leader.history, "没按空格就不该释放主臂"
+
+
+def test_gravity_comp_params_are_configurable():
+    """重力补偿参数必须能从配置里调 —— tx_ratio 是唯一按手感标定的系数。"""
+    import dataclasses
+
+    from lerobot.rlt.teleop_check import LeaderCheckConfig
+
+    names = {f.name for f in dataclasses.fields(LeaderCheckConfig)}
+    for required in (
+        "gravity_comp_tx_ratio",
+        "gravity_comp_base_rpy_deg",
+        "gravity_comp_torque_limit",
+        "gravity_comp_mit_kp",
+        "gravity_comp_mit_kd",
+        "gravity_comp_control_hz",
+    ):
+        assert required in names, f"{required} 无法从 yaml 配置"
+
+    # kp 默认必须是 0：pos_ref 恒为 0，kp>0 会把主臂往零位拽
+    assert LeaderCheckConfig().gravity_comp_mit_kp == 0.0
