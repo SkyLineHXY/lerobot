@@ -30,27 +30,35 @@ leader:
   max_takeover_delta_rad: 0.15
 
   # ---- 重力补偿 ----
-  # tx_ratio 是唯一按手感标定的系数：RNEA 算出的关节力矩 -> SDK MIT 力矩单位的
-  # 比例，同时兼作降额。0.2（Piper 默认）只补偿约两成自重，主臂拖起来会明显发沉,
-  # 感觉「重力补偿没起作用」。请从 0.2 起一档档往上加，找到「托得住又不上飘」的值。
-  # ⚠ 一旦发现主臂自己往上走 = 过补偿（正反馈），立刻调小。
-  gravity_comp_tx_ratio: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
-  # 安装姿态 (roll, pitch, yaw)，单位度。侧装/斜装必须设，否则重力矢量转不到
-  # 基座系，g(q) 整个是错的 —— 表现同样是「补偿不起作用」。先设它再调 tx_ratio。
+  gravity_comp_tx_ratio: [0.55, 0.95, 1.05, 1.2, 1.2, 0.5]
   gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
-  # 单关节力矩上限（SDK t_ref 硬件范围 ±18 N·m）。实测本体重力矩峰值约 3.3 N·m，
-  # 所以 8.0 平时不触发，是防 URDF 写错 / NaN 的兜底。
   gravity_comp_torque_limit: 8.0
-  # ⚠ kp 必须保持 0：MIT 的 pos_ref 恒为 0，kp>0 会把主臂往零位拽。
-  # 抖动只调 kd（vel_ref 也是 0，所以 kd 是纯阻尼），建议 0.1~0.8。
   gravity_comp_mit_kp: 0.0
   gravity_comp_mit_kd: 0.0
   gravity_comp_control_hz: 200.0
 
+  # ---- 末端负载（这一项漏了会直接表现为"腕部没有重力补偿"）----
+  # 内置 URDF 腕部什么都不带（link6 仅 0.007 kg）。主臂末端若装了夹爪 / 示教手柄 /
+  # 相机，模型算出的腕部重力矩会被系统性低估 —— 实测装夹爪后 J4/J5 的真实需求是
+  # 无负载模型的约 3.9 倍（0.218 -> 0.846 N·m）。
+  # ⚠ 这种偏差**调 tx_ratio 补不回来**：缩放的是一个本身就错的 g(q)，只能在某一个
+  #   位姿上凑对，换个姿态又不对，因为负载的力臂随构型变化。
+  #
+  # 二选一：
+  # (A) 换成含夹爪的 URDF（仓库里现成就有）
+  #     gravity_comp_urdf: assets/piper_description/urdf/piper_description.urdf
+  # (B) 把负载按质点并进模型（示教器未必等于标准夹爪，这条更灵活）
+  #     gravity_comp_payload_mass: 0.5            # kg，称一下实际重量
+  #     gravity_comp_payload_com: [0.0, 0.0, 0.05]  # m，质心相对 joint6 坐标系
+  # 两条等价性已验证：0.5kg@0.05m 与含夹爪 URDF 结果几乎重合（J4: 0.907 vs 0.846）。
+  gravity_comp_urdf: null
+  gravity_comp_payload_mass: 0.0
+  gravity_comp_payload_com: [0.0, 0.0, 0.0]
+
 control_hz: 30.0
 duration_s: 30.0
 # 与 piper_online.yaml 保持一致，否则测出来的限速余量没有参考价值
-max_joint_step_rad: 0.2
+max_joint_step_rad: 0.5
 
 # 相机是控制回路里最贵的一环，必须计入实时性预算。
 # 留空则沿用 PIPERConfig 自带的相机；改 use_cameras 可整体关掉。

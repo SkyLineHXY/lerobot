@@ -258,6 +258,20 @@ class TeleopChecker:
             f"limit={lead.gravity_comp_torque_limit}N·m "
             f"kp={lead.gravity_comp_mit_kp} kd={lead.gravity_comp_mit_kd}"
         )
+        # 重力模型带没带末端负载必须打出来。整类"腕部没有补偿"的故障，根因就是模型
+        # 里静默地少了夹爪/示教器，而日志里看不出来 —— 所以这里要说清楚。
+        print(f"[check]   重力模型: {lead.gravity_comp_urdf or '内置 piper_no_gripper_description.urdf'}")
+        if lead.gravity_comp_payload_mass > 0:
+            print(
+                f"[check]   末端负载: {lead.gravity_comp_payload_mass} kg "
+                f"@ {lead.gravity_comp_payload_com} m"
+            )
+        elif not lead.gravity_comp_urdf:
+            print(
+                "[check]   末端负载: 无。主臂若装了夹爪 / 示教手柄，腕部重力矩会被系统性"
+                "低估（实测约 3.9 倍），表现为「腕部没有重力补偿」，且调 tx_ratio 补不回来。"
+                "请设 gravity_comp_payload_mass 或换含夹爪的 gravity_comp_urdf。"
+            )
         if max(lead.gravity_comp_tx_ratio) <= 0.25:
             print(
                 "[check] 提示：tx_ratio 很低，只补偿约两成自重，主臂拖起来会明显发沉。"
