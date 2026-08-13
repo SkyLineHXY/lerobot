@@ -1,7 +1,5 @@
 """只做遥操作的 HIL 链路验证脚本：不训练、不加载 VLA、不写数据集。
-
 用途是在跑 `train_online.py` 之前，单独回答两个问题：
-
 1. **实时性够不够？** 重力补偿主臂 -> 跟随臂这条链路每一拍花在哪：主臂 CAN 读数、
    跟随臂观测（含相机 `async_read`）、限速换算、`send_action` 下发。逐项统计
    p50/p95/p99/max，并统计错拍率（单拍耗时超过 1/control_hz 的比例）。
@@ -13,9 +11,7 @@
    给了 `--rl_token` 还会顺带验证归一化往返：人的关节读数经阶段 1 的
    normalizer 正/反变换后能否原样回来 —— 这是干预动作能否落在策略动作空间里
    的前提。
-
-典型用法::
-
+典型用法:
     # 1) 空跑：只读不下发，先看链路耗时和主臂读数是否正常
     python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml \
         --dry_run=true
@@ -30,8 +26,11 @@
 按键与 `train_online.py` 完全一致：空格切换接管、s/f 打成功/失败标签、
 ← 打一个分段标记、Esc 结束。
 """
-from __future__ import annotations
-
+# 注意：这里**不能**加 `from __future__ import annotations`。
+# `lerobot.configs.parser.wrap()` 是直接读 `inspect.getfullargspec(fn).annotations`
+# 取配置类的，PEP 563 会把注解变成字符串，draccus 就会收到 "TeleopCheckConfig"
+# 而不是那个 dataclass，报 "must be called with a dataclass type or instance"。
+# 仓库里所有 @parser.wrap() 的入口脚本都遵守这一点。
 import json
 import logging
 import time
@@ -43,8 +42,8 @@ import numpy as np
 from lerobot.configs import parser
 from lerobot.utils.robot_utils import precise_sleep
 
-from .intervention import JOINT_KEYS_6, KeyboardEventListener
-from .piper_env import (
+from lerobot.rlt.intervention import JOINT_KEYS_6, KeyboardEventListener
+from lerobot.rlt.piper_env import (
     JOINT_ORDER,
     build_piper_cameras,
     follower_action_to_leader,
@@ -218,7 +217,7 @@ class TeleopChecker:
         """加载阶段 1 的 preprocessor，取出动作 normalizer 用于往返验证。"""
         from lerobot.policies.rlt import load_stage1_processors
 
-        from .piper_env import _find_action_normalizer
+        from lerobot.rlt.piper_env import _find_action_normalizer
 
         preprocessor, _post = load_stage1_processors(self.cfg.rl_token, device=self.cfg.device)
         self.normalizer = _find_action_normalizer(preprocessor)
@@ -309,7 +308,11 @@ class TeleopChecker:
                 target = np.array([leader_action[k] for k in JOINT_ORDER], dtype=np.float32)
                 limited, saturated = rate_limit_joints(target, measured, cfg.max_joint_step_rad)
                 self.t_map.append(time.perf_counter() - t0)
-                self.saturated.append(bool(saturated))
+                # 只在接管期间统计限速饱和：没接管时不下发动作，跟随臂不会向主臂
+                # 靠拢，主从差会一直挂着，饱和率恒等于 100% —— 那是记账假象，
+                # 不是"跟随臂追不上人手"。
+                if engaged:
+                    self.saturated.append(bool(saturated))
 
                 # 4) 下发
                 t0 = time.perf_counter()
@@ -471,13 +474,16 @@ class TeleopChecker:
         )
 
         sat = rep["ratelimit_saturation_rate"]
-        add(
-            "限速余量",
-            sat < 0.3,
-            f"{sat:.1%} 的拍触发了限速 (max_joint_step_rad="
-            f"{self.cfg.max_joint_step_rad}). 持续饱和说明跟随臂追不上人手，"
-            "干预时会有明显拖滞",
-        )
+        if not self.saturated:
+            add("限速余量", None, "整场没有接管，限速余量只在下发动作时才有意义")
+        else:
+            add(
+                "限速余量",
+                sat < 0.3,
+                f"接管期间 {sat:.1%} 的拍触发了限速 (max_joint_step_rad="
+                f"{self.cfg.max_joint_step_rad}). 持续饱和说明跟随臂追不上人手，"
+                "干预时会有明显拖滞",
+            )
 
         lag_ms = rep["tracking"]["lag_ms"]
         moved = rep["tracking"]["cmd_motion_std_rad"]
@@ -518,13 +524,27 @@ class TeleopChecker:
         return v
 
     def close(self) -> None:
+        """关机路径不允许抛异常。
+
+        `check()` 在 `finally` 里调用它，所以这里冒出来的任何异常都会顶掉
+        `connect()` / `run()` 真正的那个错误 —— 上机排障时看到的就会是一个
+        无关的收尾异常。逐段兜住并记录，让原始错误活着传出去。
+        """
         if self.leader is not None and getattr(self.leader, "is_connected", False):
             try:
                 self.align()
-            finally:
+            except Exception:
+                logger.exception("[check] 交还主臂失败")
+            try:
                 self.leader.disconnect()
-        if self.robot is not None and self.robot.is_connected:
-            self.robot.disconnect()
+            except Exception:
+                logger.exception("[check] 主臂断开失败")
+        if self.robot is not None:
+            try:
+                if self.robot.is_connected:
+                    self.robot.disconnect()
+            except Exception:
+                logger.exception("[check] 跟随臂断开失败")
 
 
 def _pad(text: str, width: int) -> str:

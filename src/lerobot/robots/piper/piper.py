@@ -111,13 +111,19 @@ class Piper(Robot):
 
     @property
     def is_connected(self) -> bool:
-        """机器人和所有相机是否都已连接"""
-        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
+        """机器人和所有相机是否都已连接
+
+        注意：这里读的是本类自己维护的 `_is_connected`，而不是 `self.bus`。
+        `PiperMotorsBus` 没有 `is_connected` / `is_calibrated` 属性，早先那种写法
+        任何一次访问都会抛 AttributeError；类里 connect/disconnect/calibrate
+        以及所有前置检查用的一直都是下划线开头的这两个标志位。
+        """
+        return self._is_connected and all(cam.is_connected for cam in self.cameras.values())
 
     @property
     def is_calibrated(self) -> bool:
         """机器人是否已完成标定"""
-        return self.bus.is_calibrated
+        return self._is_calibrated
 
     @property
     def has_camera(self):

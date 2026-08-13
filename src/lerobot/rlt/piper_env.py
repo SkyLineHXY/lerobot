@@ -28,7 +28,7 @@ from torch import Tensor
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.robot_utils import precise_sleep
 
-from .intervention import InterventionManager, InterventionResult, KeyboardEventListener
+from lerobot.rlt.intervention import InterventionManager, InterventionResult, KeyboardEventListener
 
 logger = logging.getLogger(__name__)
 
