@@ -108,7 +108,10 @@ def probe(port: str, step: float, max_ratio: float, hz: float) -> int:
         while True:
             if keys.should_quit():
                 break
-            for key in (keys._impl.poll() if keys._impl else []):
+            # 必须走 poll_extra()：should_quit() 内部的 _read_keys() 会把后端队列
+            # 一次抽干并分派到六个内置绑定上，`+` 不匹配任何一个就被丢掉。直接去
+            # 读后端（keys._impl.poll()）永远抢不过它，拿到的只会是空列表。
+            for key in keys.poll_extra():
                 if key in ("+", "="):
                     ratio = min(ratio + step, max_ratio)
                 elif key in ("-", "_"):
@@ -167,7 +170,7 @@ def main() -> int:
     parser.add_argument("--port", default="can_left_l", help="主臂 CAN 接口名")
     parser.add_argument("--step", type=float, default=0.05, help="每次 +/- 的步长")
     parser.add_argument("--max-ratio", type=float, default=1.2, help="tx_ratio 硬上限")
-    parser.add_argument("--hz", type=float, default=20.0, help="刷新频率")
+    parser.add_argument("--hz", type=float, default=30.0, help="刷新频率")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     return probe(args.port, args.step, args.max_ratio, args.hz)

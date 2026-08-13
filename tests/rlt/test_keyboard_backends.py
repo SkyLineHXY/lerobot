@@ -165,3 +165,33 @@ def test_stop_releases_the_backend():
     keys.stop()
     assert impl.stopped is True
     assert keys.available is False
+
+
+def test_extra_keys_survive_the_builtin_drain():
+    """自定义热键必须能从 poll_extra() 拿到。
+
+    `_read_keys()` 会把后端队列一次抽干并分派到六个内置绑定上。曾经 gravity_probe
+    直接去读 `_impl.poll()`，结果每次都被 should_quit() 里的 _read_keys() 抢先抽走，
+    `+` 永远读不到 —— 现象就是"按 + 没反应"。
+    """
+    keys = _listener([KEY_SUCCESS, "+", "+", "-", "0"])
+    # 先让内置通道抽干队列（模拟每拍开头的 should_quit()）
+    assert keys.should_quit() is False
+    # 内置绑定照常生效
+    assert keys.poll_outcome() == (True, False)
+    # 未被认领的键仍然拿得到，且顺序保持
+    assert keys.poll_extra() == ["+", "+", "-", "0"]
+    assert keys.poll_extra() == [], "读取后必须清空"
+
+
+def test_extra_keys_are_bounded():
+    """乱按不能让缓冲无限增长。"""
+    keys = _listener([f"k{i}" for i in range(500)])
+    keys._read_keys()
+    assert len(keys.poll_extra()) <= 64
+
+
+def test_builtin_keys_never_leak_into_extra():
+    keys = _listener([KEY_SUCCESS, KEY_FAILURE, KEY_HANDOVER, KEY_INTERVENE, KEY_DISCARD, KEY_QUIT])
+    keys._read_keys()
+    assert keys.poll_extra() == []

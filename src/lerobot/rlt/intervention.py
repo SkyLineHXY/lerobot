@@ -28,6 +28,7 @@ import sys
 import termios
 import time
 import tty
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -204,6 +205,11 @@ class KeyboardEventListener:
             )
         self.backend = backend
         self._impl = None
+        # Keys the six built-in bindings don't claim. `_read_keys` drains the
+        # backend in one go, so a caller that polls the backend itself would
+        # always find it empty — tools with their own hotkeys must read them
+        # from here instead. Bounded so stray typing can't grow without limit.
+        self._extra: deque[str] = deque(maxlen=64)
         self._success = False
         self._failure = False
         self._handover = False
@@ -278,6 +284,21 @@ class KeyboardEventListener:
                 self._discard = True
             elif key == KEY_QUIT:
                 self._quit = True
+            else:
+                self._extra.append(key)
+
+    def poll_extra(self) -> list[str]:
+        """Keys not claimed by the built-in bindings; cleared on read.
+
+        For tools that add their own hotkeys on top of the operator keys. They
+        must come through here rather than off the backend: `_read_keys` drains
+        the backend in a single pass, so a second reader would always lose the
+        race and see nothing.
+        """
+        self._read_keys()
+        out = list(self._extra)
+        self._extra.clear()
+        return out
 
     # Latched flags: polled once per control step, consumed by the reader.
     def poll_outcome(self) -> tuple[bool, bool]:
