@@ -21,6 +21,8 @@ otherwise have gathered (the `InterventionResult` pattern from rlt-openpi).
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import select
 import sys
 import termios
@@ -35,13 +37,15 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 # Key bindings mirror the Evo-RLT recording wrapper so operators trained on one
-# tool are not retrained for the other.
+# tool are not retrained for the other. These are *canonical* names: every
+# backend normalizes to them, so the state machine never sees raw escape codes
+# or pynput objects.
 KEY_SUCCESS = "s"
 KEY_FAILURE = "f"
 KEY_HANDOVER = "r"
-KEY_INTERVENE = " "
-KEY_DISCARD = "\x1b[D"  # left arrow
-KEY_QUIT = "\x1b"  # bare Esc
+KEY_INTERVENE = "space"
+KEY_DISCARD = "left"
+KEY_QUIT = "esc"
 
 # The 6 arm joints (the gripper is excluded from the takeover safety check: it
 # is an opening in metres, not an angle, and a gripper mismatch is harmless).
@@ -61,16 +65,145 @@ class InterventionResult:
     info: dict[str, Any] = field(default_factory=dict)
 
 
-class KeyboardEventListener:
-    """Non-blocking single-keypress listener (no Enter needed).
+class _TermiosBackend:
+    """Read raw keypresses from stdin. Only usable when stdin is a real pty.
 
-    Falls back to a no-op when stdin is not a TTY (headless / nohup runs), so a
-    remote session degrades to "no operator input" instead of crashing.
+    Keys reach the process only while its terminal has focus, which is the safe
+    behaviour on a robot: nothing typed into another window can command the arm.
     """
+
+    name = "termios"
+
+    # Raw byte sequence -> canonical key name.
+    _SEQUENCES = {
+        " ": KEY_INTERVENE,
+        "\x1b[D": KEY_DISCARD,
+        "\x1b": KEY_QUIT,
+    }
 
     def __init__(self) -> None:
         self._old: list | None = None
-        self._raw = False
+        self._active = False
+
+    def start(self) -> bool:
+        try:
+            self._old = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+        except (termios.error, OSError, ValueError, AttributeError):
+            return False
+        self._active = True
+        return True
+
+    def poll(self) -> list[str]:
+        if not self._active:
+            return []
+        keys: list[str] = []
+        while select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b" and select.select([sys.stdin], [], [], 0.02)[0]:
+                ch += sys.stdin.read(2)  # arrow keys arrive as an escape sequence
+            keys.append(self._SEQUENCES.get(ch, ch))
+        return keys
+
+    def stop(self) -> None:
+        if self._active and self._old is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old)
+        self._active = False
+        self._old = None
+
+
+class _PynputBackend:
+    """Grab keyboard events at the X11 level, bypassing stdin entirely.
+
+    Migrated from the dual_piper collection node
+    (``scripts/data_to_lerobot3_node.py``): an IDE run/debug console, ``nohup``
+    and ``roslaunch`` all hand the process a *pipe* rather than a pty, which
+    kills the termios backend outright — and with it every operator key, so an
+    episode can only end on the step limit and no human can ever intervene.
+    pynput keeps working there because it never touches stdin.
+
+    The cost is that capture is **global**: whichever window has focus, `s` /
+    `f` / space still count as operator commands. Typing `s` into an editor
+    while the rig is running will label the episode a success. That is a real
+    hazard on hardware, which is why the termios backend wins whenever stdin is
+    a proper terminal.
+    """
+
+    name = "pynput"
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._listener = None
+
+    def start(self) -> bool:
+        # Same guard the keyboard teleoperator uses: importing pynput without a
+        # display raises (or worse, hangs) on headless Linux.
+        if "DISPLAY" not in os.environ and "linux" in sys.platform:
+            return False
+        try:
+            from pynput import keyboard
+        except Exception as exc:  # ImportError, X11 errors, ...
+            logger.debug("pynput unavailable: %s", exc)
+            return False
+
+        def on_press(event) -> None:
+            # Printable keys carry `.char`; special keys (space/esc/left) carry
+            # `.name`, which already matches our canonical names.
+            char = getattr(event, "char", None)
+            key = char if char is not None else getattr(event, "name", None)
+            if key is not None:
+                self._queue.put(key)
+
+        try:
+            self._listener = keyboard.Listener(on_press=on_press)
+            self._listener.daemon = True  # never keep the process alive
+            self._listener.start()
+        except Exception as exc:
+            logger.debug("could not start pynput listener: %s", exc)
+            self._listener = None
+            return False
+        return True
+
+    def poll(self) -> list[str]:
+        keys: list[str] = []
+        while True:
+            try:
+                keys.append(self._queue.get_nowait())
+            except queue.Empty:
+                return keys
+
+    def stop(self) -> None:
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                logger.debug("pynput listener stop failed", exc_info=True)
+            self._listener = None
+
+
+class KeyboardEventListener:
+    """Non-blocking single-keypress listener (no Enter needed).
+
+    Two backends, tried in order (``backend="auto"``):
+
+    1. ``termios`` — needs stdin to be a real terminal. Preferred, because keys
+       only register while that terminal has focus.
+    2. ``pynput`` — global X11 hook, works when stdin is a pipe (IDE console,
+       nohup, roslaunch). Chosen only as a fallback: it captures keys no matter
+       which window is focused.
+
+    If neither is available the listener degrades to "no operator input" rather
+    than crashing, and says so loudly — on a real rig that means the whole
+    human-in-the-loop channel is gone.
+    """
+
+    def __init__(self, backend: str = "auto") -> None:
+        if backend not in ("auto", "termios", "pynput", "none"):
+            raise ValueError(
+                f"unknown keyboard backend {backend!r}; use auto/termios/pynput/none"
+            )
+        self.backend = backend
+        self._impl = None
         self._success = False
         self._failure = False
         self._handover = False
@@ -78,23 +211,49 @@ class KeyboardEventListener:
         self._quit = False
         self._intervene = False
 
+    @property
+    def backend_name(self) -> str:
+        return self._impl.name if self._impl is not None else "none"
+
+    @property
+    def available(self) -> bool:
+        """Whether operator keys actually work in this run."""
+        return self._impl is not None
+
+    def _candidates(self) -> list:
+        if self.backend == "none":
+            return []
+        if self.backend == "termios":
+            return [_TermiosBackend()]
+        if self.backend == "pynput":
+            return [_PynputBackend()]
+        # auto: a focused terminal is safer than a global hook, so try it first.
+        return [_TermiosBackend(), _PynputBackend()]
+
     def start(self) -> None:
-        try:
-            self._old = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-            self._raw = True
-        except (termios.error, OSError, ValueError):
-            self._raw = False
+        for impl in self._candidates():
+            if impl.start():
+                self._impl = impl
+                break
+        if self._impl is None:
             logger.warning(
-                "stdin is not a TTY: operator keys (success/failure/handover) are disabled. "
-                "Episodes will only end on the step limit."
+                "No usable keyboard backend: operator keys (success/failure/handover/"
+                "intervene) are ALL disabled. Episodes will only end on the step limit "
+                "and no human intervention is possible. stdin is not a TTY and pynput "
+                "is unavailable (no DISPLAY?). In PyCharm/VSCode enable the run "
+                "configuration's terminal emulation, or run from a real terminal."
+            )
+        elif self._impl.name == "pynput":
+            logger.warning(
+                "stdin is not a TTY; falling back to the global pynput hook. Keys are "
+                "captured regardless of which window has focus — typing 's'/'f'/space "
+                "anywhere on this desktop will be read as an operator command."
             )
 
     def stop(self) -> None:
-        if self._raw and self._old is not None:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old)
-            self._raw = False
-            self._old = None
+        if self._impl is not None:
+            self._impl.stop()
+            self._impl = None
 
     def __enter__(self) -> KeyboardEventListener:
         self.start()
@@ -104,23 +263,20 @@ class KeyboardEventListener:
         self.stop()
 
     def _read_keys(self) -> None:
-        if not self._raw:
+        if self._impl is None:
             return
-        while select.select([sys.stdin], [], [], 0)[0]:
-            ch = sys.stdin.read(1)
-            if ch == "\x1b" and select.select([sys.stdin], [], [], 0.02)[0]:
-                ch += sys.stdin.read(2)  # arrow keys arrive as an escape sequence
-            if ch == KEY_SUCCESS:
+        for key in self._impl.poll():
+            if key == KEY_SUCCESS:
                 self._success = True
-            elif ch == KEY_FAILURE:
+            elif key == KEY_FAILURE:
                 self._failure = True
-            elif ch == KEY_HANDOVER:
+            elif key == KEY_HANDOVER:
                 self._handover = True
-            elif ch == KEY_INTERVENE:
+            elif key == KEY_INTERVENE:
                 self._intervene = not self._intervene
-            elif ch == KEY_DISCARD:
+            elif key == KEY_DISCARD:
                 self._discard = True
-            elif ch == KEY_QUIT:
+            elif key == KEY_QUIT:
                 self._quit = True
 
     # Latched flags: polled once per control step, consumed by the reader.

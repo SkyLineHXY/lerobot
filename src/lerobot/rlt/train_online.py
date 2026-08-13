@@ -345,7 +345,7 @@ def train(cfg: RLTOnlineTrainConfig):
         buffer.load(cfg.resume_buffer)
         print(f"[stage2] resumed buffer with {len(buffer)} transitions")
 
-    keys = KeyboardEventListener()
+    keys = KeyboardEventListener(backend=cfg.keyboard_backend)
     env = None
     try:
         # Build the env *before* putting stdin in cbreak mode: connecting the

@@ -97,6 +97,10 @@ class TeleopCheckConfig:
     # 「握住主臂 -> 交还」的模式切换流程。
     engage_on_start: bool = False
 
+    # 按键后端：auto（stdin 是终端就用 termios，否则退到 pynput 全局钩子）/
+    # termios / pynput / none。IDE 控制台里 stdin 是管道，auto 会自动落到 pynput。
+    keyboard_backend: str = "auto"
+
     # 给了阶段 1 输出目录就额外验证归一化往返
     rl_token: str | None = None
     device: str = "cpu"
@@ -157,7 +161,7 @@ class TeleopChecker:
     def __init__(self, cfg: TeleopCheckConfig):
         self.cfg = cfg
         self.dt = 1.0 / cfg.control_hz
-        self.keys = KeyboardEventListener()
+        self.keys = KeyboardEventListener(backend=cfg.keyboard_backend)
         self.robot = None
         self.leader = None
         self.normalizer = None
@@ -197,7 +201,7 @@ class TeleopChecker:
         robot_cfg.max_joint_step_rad = cfg.max_joint_step_rad
         self.robot = Piper(robot_cfg)
         if not self.robot.is_connected:
-            self.robot.connect()
+            self.robot.connect(calibrate=False)
         print(f"[check] 跟随臂已连接 ({cfg.can_port})，相机: {list(self.robot.cameras) or '无'}")
 
         self.leader = PiperLeader(
@@ -281,7 +285,6 @@ class TeleopChecker:
                     print("[check] 操作员结束")
                     break
                 loop_t0 = time.perf_counter()
-
                 engaged = self.keys.intervening
                 if engaged and not prev_engaged:
                     engaged = self._on_engage()

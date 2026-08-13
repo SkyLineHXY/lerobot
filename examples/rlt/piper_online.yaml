@@ -78,6 +78,12 @@ rl:
   total_env_steps: 50000
   buffer_capacity: 200000
 
+# 按键后端：auto = stdin 是真终端就用 termios，否则退到 pynput 全局钩子。
+# IDE（PyCharm/VSCode）控制台里 stdin 是管道，auto 会自动落到 pynput，按键照常可用；
+# 代价是 pynput 捕获是全局的 —— 焦点在别的窗口按 s/f/空格同样算操作员指令。
+# 可选 termios / pynput / none 强制指定。
+keyboard_backend: auto
+
 # 论文 Sec. V：episode 先跑 base VLA，操作员在关键阶段按 `r` 交接给 RL policy
 critical_phase: true
 resume_buffer: null                 # 中断续跑时指向 <out>/replay_buffer.pt

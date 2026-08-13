@@ -17,10 +17,10 @@
 # 操作员按键（与 train_online.py 完全一致）：
 #   空格 握住/交还主臂   s 成功   f 失败   ← 打标记   Esc 结束
 
-can_port: can0
+can_port: can_left_f
 
 leader:
-  port: can1
+  port: can_left_l
   id: piper_leader
   # 干预动作必须与阶段 1 数据集的绝对关节角空间一致，默认读绝对值而非标定偏移
   use_calibrated_offsets: false
@@ -38,12 +38,12 @@ max_joint_step_rad: 0.05
 # 留空则沿用 PIPERConfig 自带的相机；改 use_cameras 可整体关掉。
 use_cameras: true
 cameras: []
-# 示例：
-# cameras:
-#   - name: cam_left
-#     serial: "148522072680"
-#   - name: cam_top
-#     serial: "327122074756"
+
+# 按键后端：auto = stdin 是真终端就用 termios，否则退到 pynput 全局钩子。
+# IDE（PyCharm/VSCode）控制台里 stdin 是管道，auto 会自动落到 pynput，按键照常可用；
+# 代价是 pynput 捕获是全局的 —— 焦点在别的窗口按 s/f/空格同样算操作员指令。
+# 可选 termios / pynput / none 强制指定。
+keyboard_backend: auto
 
 dry_run: false
 engage_on_start: false

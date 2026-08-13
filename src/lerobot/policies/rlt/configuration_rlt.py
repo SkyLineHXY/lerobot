@@ -274,6 +274,12 @@ class RLTOnlineTrainConfig:
     env: ChunkEnvConfig = field(default_factory=MockEnvConfig)
     rl: OnlineRLConfig = field(default_factory=OnlineRLConfig)
 
+    # Operator-key backend: "auto" prefers termios (needs stdin to be a real
+    # terminal) and falls back to pynput's global X11 hook, which is what makes
+    # the keys work from an IDE console / nohup / roslaunch where stdin is a
+    # pipe. "none" disables operator input entirely.
+    keyboard_backend: str = "auto"
+
     # Start every episode under the base VLA and hand control to the RL policy
     # when the operator presses `r` (paper Sec. V).
     critical_phase: bool = False
