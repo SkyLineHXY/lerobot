@@ -1,0 +1,81 @@
+# 双臂 Piper 主从遥操作数据采集
+#
+# 与单臂的唯一区别是 arms 写了两条：左臂进 joint_1..7，右臂进 joint_8..14，
+# state / action 都是 14 维。两条臂用两组独立的 Piper + PiperLeader，
+# 重力补偿、模式守卫、标定各自独立，读写在线程池里并行。
+#
+# ⚠ 双臂对实时性更敏感：gs_usb 写一帧 ≈ 2.3ms，一次 JointCtrl 是 3 帧 ≈ 7ms。
+#   跑不满 fps 就先降相机分辨率，再考虑把 fps 降到 25。
+#
+# 按键：c 开始/继续 | space 暂停 | e 错误模式 | 1-9 子任务 | s 保存 | r 丢弃 | q/Esc 退出
+
+arms:
+  - name: left
+    leader_port: can_left_l
+    follower_port: can_left_f
+    max_takeover_delta_rad: 0.4
+    gravity_comp_tx_ratio: [0.55, 0.95, 1.02, 1.2, 1.2, 0.5]
+    gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
+    gravity_comp_torque_limit: 8.0
+    gravity_comp_mit_kp: 0.0
+    gravity_comp_mit_kd: 0.0
+    gravity_comp_urdf: assets/piper_description/urdf/piper_description.urdf
+
+  - name: right
+    leader_port: can_right_l
+    follower_port: can_right_f
+    max_takeover_delta_rad: 0.4
+    # 左右两条臂的 tx_ratio 要各自标定：装配公差和末端负载都不一样
+    gravity_comp_tx_ratio: [0.55, 0.95, 1.02, 1.2, 1.2, 0.5]
+    gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
+    gravity_comp_torque_limit: 8.0
+    gravity_comp_mit_kp: 0.0
+    gravity_comp_mit_kd: 0.0
+    gravity_comp_urdf: assets/piper_description/urdf/piper_description.urdf
+
+dataset:
+  repo_id: user/DualPiperDemo
+  root: /home/zzq/data/data_lerobot3/piper/DualPiperDemo
+  task: "blood gas sample analysis"
+  robot_type: dual_piper
+  fps: 25
+
+  resume: false
+  use_videos: true
+  video_codec: h264_nvenc
+  streaming_encoding: true
+  encoder_threads: 4
+  data_flush_every: 10
+
+  subtasks:
+    '1': 'grasp the routine blood tube.'
+    '2': 'remove the sample tube cap.'
+    '3': 'discard the tube cap into the waste bin.'
+    '4': 'dock the blood gas sample tube to the blood gas analyzer.'
+    '5': 'insert the sample tube into the analyzer probe.'
+    '6': 'withdraw the blood gas sample tube after testing is complete.'
+    '7': 'discard the tested blood sample into the waste bin.'
+    '8': 'return the robotic arm to the home position.'
+
+collection:
+  max_timesteps: 10000
+  max_joint_step_rad: 0.05
+  use_back_event: true
+  dry_run: false
+
+  init_mode: follower_to_leader
+  init_duration_s: 2.0
+  init_max_step_rad: 0.5
+  init_settle_timeout_s: 10.0
+
+cameras:
+  - {name: cam_top,   serial: "327122074756", width: 640, height: 480, fps: 30}
+  - {name: cam_left,  serial: "148522072680", width: 640, height: 480, fps: 30}
+  - {name: cam_right, serial: "241222073777", width: 640, height: 480, fps: 30}
+
+view:
+  enabled: true
+  max_width: 1280
+  render_hz: 15.0
+
+keyboard_backend: auto

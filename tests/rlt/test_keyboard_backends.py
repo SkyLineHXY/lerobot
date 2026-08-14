@@ -8,6 +8,7 @@
 import queue
 
 import pytest
+
 from lerobot.rlt.intervention import (
     KEY_DISCARD,
     KEY_FAILURE,
@@ -18,6 +19,7 @@ from lerobot.rlt.intervention import (
     KeyboardEventListener,
     _PynputBackend,
     _TermiosBackend,
+    key_backend_candidates,
 )
 
 
@@ -136,26 +138,26 @@ def test_backend_none_degrades_without_crashing():
     keys.stop()
 
 
+def _names(backend):
+    return [type(impl).__name__ for impl in key_backend_candidates(backend)]
+
+
 def test_auto_prefers_termios_over_global_hook():
     """termios 只在终端有焦点时才收键，比全局钩子安全，auto 必须优先选它。"""
-    keys = KeyboardEventListener(backend="auto")
-    order = [type(impl).__name__ for impl in keys._candidates()]
-    assert order == ["_TermiosBackend", "_PynputBackend"]
+    assert _names("auto") == ["_TermiosBackend", "_PynputBackend"]
 
 
 def test_explicit_backend_selection():
-    assert [type(i).__name__ for i in KeyboardEventListener(backend="pynput")._candidates()] == [
-        "_PynputBackend"
-    ]
-    assert [type(i).__name__ for i in KeyboardEventListener(backend="termios")._candidates()] == [
-        "_TermiosBackend"
-    ]
-    assert KeyboardEventListener(backend="none")._candidates() == []
+    assert _names("pynput") == ["_PynputBackend"]
+    assert _names("termios") == ["_TermiosBackend"]
+    assert _names("none") == []
 
 
 def test_rejects_unknown_backend():
     with pytest.raises(ValueError, match="unknown keyboard backend"):
         KeyboardEventListener(backend="magic")
+    with pytest.raises(ValueError, match="unknown keyboard backend"):
+        key_backend_candidates("magic")
 
 
 def test_stop_releases_the_backend():

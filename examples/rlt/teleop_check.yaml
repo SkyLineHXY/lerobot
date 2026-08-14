@@ -22,87 +22,34 @@ can_port: can_left_f
 leader:
   port: can_left_l
   id: piper_leader
-  # 干预动作必须与阶段 1 数据集的绝对关节角空间一致，默认读绝对值而非标定偏移
   use_calibrated_offsets: false
-  # 验证脚本默认不强制标定，避免连上就掉进交互式标定流程
   require_calibration: false
-  # 接管瞬间主从关节差的上限，超过就拒绝释放主臂并重新对齐
   max_takeover_delta_rad: 0.15
 
   # ---- 重力补偿 ----
-  gravity_comp_tx_ratio: [0.55, 0.95, 1.05, 1.2, 1.2, 0.5]
+  gravity_comp_tx_ratio: [0.55, 0.95, 1.02, 1.2, 1.2, 0.5]
   gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
   gravity_comp_torque_limit: 8.0
   gravity_comp_mit_kp: 0.0
   gravity_comp_mit_kd: 0.0
   gravity_comp_control_hz: 200.0
-
-  # ---- 末端负载（这一项漏了会直接表现为"腕部没有重力补偿"）----
-  # 内置 URDF 腕部什么都不带（link6 仅 0.007 kg）。主臂末端若装了夹爪 / 示教手柄 /
-  # 相机，模型算出的腕部重力矩会被系统性低估 —— 实测装夹爪后 J4/J5 的真实需求是
-  # 无负载模型的约 3.9 倍（0.218 -> 0.846 N·m）。
-  # ⚠ 这种偏差**调 tx_ratio 补不回来**：缩放的是一个本身就错的 g(q)，只能在某一个
-  #   位姿上凑对，换个姿态又不对，因为负载的力臂随构型变化。
-  #
-  # 二选一：
-  # (A) 换成含夹爪的 URDF（仓库里现成就有）
-  #     gravity_comp_urdf: assets/piper_description/urdf/piper_description.urdf
-  # (B) 把负载按质点并进模型（示教器未必等于标准夹爪，这条更灵活）
-  #     gravity_comp_payload_mass: 0.5            # kg，称一下实际重量
-  #     gravity_comp_payload_com: [0.0, 0.0, 0.05]  # m，质心相对 joint6 坐标系
-  # 两条等价性已验证：0.5kg@0.05m 与含夹爪 URDF 结果几乎重合（J4: 0.907 vs 0.846）。
   gravity_comp_urdf: assets/piper_description/urdf/piper_description.urdf
   gravity_comp_payload_mass: 0.0
   gravity_comp_payload_com: [0.0, 0.0, 0.0]
 
 control_hz: 30.0
-duration_s: 30.0
+duration_s: 60.0
 # 反归一化后的每步关节限速。⚠ 当前 1.0 在 30Hz 下等于 30 rad/s —— 限幅完全失效，
 # 主臂读数的任何跳变都会原样打到跟随臂上。想让它真正起作用请回到 0.05 量级。
 max_joint_step_rad: 1.0
 
-# ============================ 跟随臂控制方式 ============================
-# position —— 原有路径：每拍 JointCtrl 位置阶跃 + 速度比例 100。
-#   干预时跟随臂抖动的根因就在这里：每 33ms 落一个新位置点，内部轨迹发生器以最大
-#   速度冲过去、到点就停，下一拍再来一次，加减速反复 —— 一秒抖 30 次。而且位置模式
-#   **没有任何可调阻尼**，你手上没有旋钮能压住它。
-#
-# mit —— MIT 阻抗控制：τ = kp(pos_ref − q) + kd(vel_ref − q̇) + t_ref
-#   * kd 是真正的阻尼项，抖动的主要旋钮（位置模式根本没有这一项）
-#   * vel_ref 用主臂自身的速度反馈做前馈，跟随臂跟着"指令速度"走而不是追阶跃
-#   * t_ref 放跟随臂的重力补偿，kp 因此不必靠刚度硬扛自重，可以调低、更柔顺
-#   与低通滤波相比：滤波是把抖动换成延迟（而延迟正是本脚本要盯的指标），
-#   MIT 阻尼消除的是振荡的来源。
-#
-# ⚠ 这是把跟随臂从位置控制换成力矩控制，风险等级不同，先读 mit_follower.py 的
-#   安全须知。调参顺序：先确认重力前馈（手臂能自己托住不下垂）-> 加 kp 到跟手
-#   -> 加 kd 压抖动。顺序反了会互相掩盖。
-follower_control: position
-
-follower_mit:
-  kp: 30.0            # 刚度。太低+重力前馈不准=手臂垮下来；太高会自激振荡
-  kd: 1.0             # 阻尼 —— 抖动的主要旋钮，SDK 范围 [-5, 5]
-  torque_limit: 8.0   # t_ref 限幅（硬件范围 ±18 N·m）
-  gravity_ratio: 1.0  # 重力前馈系数，1.0 = 完全补偿自重
-  # 跟随臂的重力模型。跟随臂末端装了夹爪就必须指明，否则 t_ref 偏小、手臂下垂。
-  gravity_urdf: null
-  gravity_payload_mass: 0.0
-  gravity_payload_com: [0.0, 0.0, 0.0]
-  gravity_base_rpy_deg: [0.0, 0.0, 0.0]
-  use_velocity_feedforward: true
-
-# 相机是控制回路里最贵的一环，必须计入实时性预算。
-# 留空则沿用 PIPERConfig 自带的相机；改 use_cameras 可整体关掉。
 use_cameras: true
 cameras: []
 
 keyboard_backend: auto
 
 dry_run: false
-# 一启动就进接管态（不用按空格）。IDE 里调试、或按键不可用时很有用。
 engage_on_start: false
-# 对齐后等主臂真正走到跟随臂位姿的时间上限。send_feedback 的 JointCtrl 是异步的，
-# 不等就按空格会被接管安全门拒掉，现象是「按了空格主臂没松开」。
 align_settle_s: 2.0
 
 # 给了就额外验证「人的关节读数 -> 归一化 -> 反归一化」能否原样回来

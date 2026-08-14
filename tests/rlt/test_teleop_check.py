@@ -7,6 +7,7 @@
 
 import numpy as np
 import pytest
+
 from lerobot.rlt.piper_env import (
     JOINT_ORDER,
     follower_action_to_leader,
@@ -113,7 +114,7 @@ def test_key_mapping_round_trips_between_leader_and_follower():
 
 def test_key_mapping_reports_missing_keys():
     with pytest.raises(KeyError, match="gripper.pos"):
-        leader_action_to_follower({k: 0.0 for k in LEADER_KEYS[:6]})
+        leader_action_to_follower(dict.fromkeys(LEADER_KEYS[:6], 0.0))
 
 
 def test_rate_limit_scales_whole_step_and_flags_saturation():
@@ -259,3 +260,31 @@ def test_gravity_comp_params_are_configurable():
 
     # kp 默认必须是 0：pos_ref 恒为 0，kp>0 会把主臂往零位拽
     assert LeaderCheckConfig().gravity_comp_mit_kp == 0.0
+
+
+# ------------------------------------------------------------------ 抖动度量
+# 这三条原本在 test_mit_follower.py 里。jitter_rms 是 piper_env 的通用度量，与
+# 从臂 MIT 无关，所以删掉那个文件时把它们迁到这里。
+def test_jitter_rms_ignores_smooth_motion():
+    """匀速运动不算抖 —— 一阶差分恒定，二阶差分为 0。"""
+    from lerobot.rlt.piper_env import jitter_rms
+
+    t = np.arange(200)
+    ramp = np.stack([t * 0.01] * 6, axis=1)
+    assert jitter_rms(ramp, dt=1 / 30) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_jitter_rms_catches_alternating_noise():
+    """方向反复翻转的高频成分才是抖动。"""
+    from lerobot.rlt.piper_env import jitter_rms
+
+    t = np.arange(200)
+    smooth = np.stack([t * 0.01] * 6, axis=1)
+    shaky = smooth + np.stack([((-1.0) ** t) * 0.002] * 6, axis=1)
+    assert jitter_rms(shaky, dt=1 / 30) > 10 * max(jitter_rms(smooth, dt=1 / 30), 1e-9)
+
+
+def test_jitter_rms_needs_three_samples():
+    from lerobot.rlt.piper_env import jitter_rms
+
+    assert np.isnan(jitter_rms(np.zeros((2, 6)), dt=1 / 30))
