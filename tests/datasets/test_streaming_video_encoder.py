@@ -728,3 +728,35 @@ class TestStreamingEncoderIntegration:
         assert dataset.meta.total_frames == num_frames
 
         dataset.finalize()
+
+
+def test_stats_frame_stride_defaults_to_about_five_per_second():
+    """统计量抽样频率必须和 fps 解耦，否则高帧率下编码线程会被 stats 压垮。"""
+    from lerobot.datasets.video_utils import StreamingVideoEncoder
+
+    assert StreamingVideoEncoder(fps=30).stats_frame_stride == 6
+    assert StreamingVideoEncoder(fps=60).stats_frame_stride == 12
+    # 低帧率下不能退化成 0（会 ZeroDivisionError）也不能跳过任何帧
+    assert StreamingVideoEncoder(fps=5).stats_frame_stride == 1
+    assert StreamingVideoEncoder(fps=1).stats_frame_stride == 1
+    # 显式指定时按指定值走
+    assert StreamingVideoEncoder(fps=30, stats_frame_stride=3).stats_frame_stride == 3
+    assert StreamingVideoEncoder(fps=30, stats_frame_stride=0).stats_frame_stride == 1
+
+
+def test_strided_stats_still_produced_for_short_episode(tmp_path):
+    """episode 比 stride 还短时，第 0 帧仍会被抽到，stats 不能变成 None。"""
+    import numpy as np
+
+    from lerobot.datasets.video_utils import StreamingVideoEncoder
+
+    key = "observation.images.cam"
+    enc = StreamingVideoEncoder(fps=30, vcodec="libsvtav1", stats_frame_stride=100)
+    enc.start_episode(video_keys=[key], temp_dir=tmp_path)
+    rng = np.random.default_rng(0)
+    for _ in range(4):  # 4 帧 < stride=100
+        enc.feed_frame(key, rng.integers(0, 255, (64, 64, 3), dtype=np.uint8))
+    results = enc.finish_episode()
+    _, stats = results[key]
+    assert stats is not None
+    assert set(stats) >= {"min", "max", "mean", "std", "count"}

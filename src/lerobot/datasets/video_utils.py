@@ -589,8 +589,10 @@ class _CameraEncoderThread(threading.Thread):
         result_queue: queue.Queue,
         stop_event: threading.Event,
         encoder_threads: int | None = None,
+        stats_frame_stride: int = 1,
     ):
         super().__init__(daemon=True)
+        self.stats_frame_stride = max(1, stats_frame_stride)
         self.video_path = video_path
         self.fps = fps
         self.vcodec = vcodec
@@ -610,6 +612,7 @@ class _CameraEncoderThread(threading.Thread):
         output_stream = None
         stats_tracker = RunningQuantileStats()
         frame_count = 0
+        stats_samples = 0
 
         try:
             logging.getLogger("libav").setLevel(av.logging.WARNING)
@@ -665,12 +668,17 @@ class _CameraEncoderThread(threading.Thread):
                     container.mux(packet)
 
                 # Update stats with downsampled frame (per-channel stats like compute_episode_stats)
-                img_chw = frame_data.transpose(2, 0, 1)  # HWC -> CHW
-                img_downsampled = auto_downsample_height_width(img_chw)
-                # Reshape CHW to (H*W, C) for per-channel stats
-                channels = img_downsampled.shape[0]
-                img_for_stats = img_downsampled.transpose(1, 2, 0).reshape(-1, channels)
-                stats_tracker.update(img_for_stats)
+                # 只抽样更新：update 走的是 np.histogram(5000 个 bin 边界) + sort，是这个线程里
+                # 最贵的一步，而且全程持有 GIL。每帧都算会把编码线程压到 30Hz 以下，帧队列灌满后
+                # feed_frame 开始阻塞，最终反压到采集回路上。
+                if frame_count % self.stats_frame_stride == 0:
+                    img_chw = frame_data.transpose(2, 0, 1)  # HWC -> CHW
+                    img_downsampled = auto_downsample_height_width(img_chw)
+                    # Reshape CHW to (H*W, C) for per-channel stats
+                    channels = img_downsampled.shape[0]
+                    img_for_stats = img_downsampled.transpose(1, 2, 0).reshape(-1, channels)
+                    stats_tracker.update(img_for_stats)
+                    stats_samples += 1
 
                 frame_count += 1
 
@@ -686,7 +694,7 @@ class _CameraEncoderThread(threading.Thread):
             av.logging.restore_default_callback()
 
             # Get stats and put on result queue
-            if frame_count >= 2:
+            if frame_count >= 2 and stats_samples >= 1:
                 stats = stats_tracker.get_statistics()
                 self.result_queue.put(("ok", stats))
             else:
@@ -722,6 +730,7 @@ class StreamingVideoEncoder:
         preset: int | None = None,
         queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        stats_frame_stride: int | None = None,
     ):
         self.fps = fps
         self.vcodec = resolve_vcodec(vcodec)
@@ -731,6 +740,12 @@ class StreamingVideoEncoder:
         self.preset = preset
         self.queue_maxsize = queue_maxsize
         self.encoder_threads = encoder_threads
+        # 每 stride 帧才更新一次统计量。默认约 5 帧/秒，和非流式路径
+        # (compute_episode_stats -> sample_images -> sample_indices) 的抽样量级一致：
+        # 那条路径对 500 帧以内的 episode 也只取 100 帧。
+        self.stats_frame_stride = (
+            max(1, round(fps / 5)) if stats_frame_stride is None else max(1, stats_frame_stride)
+        )
 
         self._frame_queues: dict[str, queue.Queue] = {}
         self._result_queues: dict[str, queue.Queue] = {}
@@ -772,6 +787,7 @@ class StreamingVideoEncoder:
                 result_queue=result_queue,
                 stop_event=stop_event,
                 encoder_threads=self.encoder_threads,
+                stats_frame_stride=self.stats_frame_stride,
             )
             encoder_thread.start()
 
