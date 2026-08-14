@@ -474,13 +474,18 @@ class RealSenseCamera(Camera):
         while not self.stop_event.is_set():
             try:
                 frame = self._read_from_hardware()
+                # get_data() is a zero-copy view into a librealsense frame buffer, so as long as the
+                # array is alive it holds one slot of the frame pool. The pool defaults to 16 slots:
+                # once a consumer keeps frames around (a recording script queueing them for disk),
+                # the pool drains, try_wait_for_frames stops yielding new frames, and read_latest
+                # starts raising "latest frame is too old". Copy here to hand the buffer straight back.
                 color_frame_raw = frame.get_color_frame()
-                color_frame = np.asanyarray(color_frame_raw.get_data())
+                color_frame = np.asanyarray(color_frame_raw.get_data()).copy()
                 processed_color_frame = self._postprocess_image(color_frame)
 
                 if self.use_depth:
                     depth_frame_raw = frame.get_depth_frame()
-                    depth_frame = np.asanyarray(depth_frame_raw.get_data())
+                    depth_frame = np.asanyarray(depth_frame_raw.get_data()).copy()
                     processed_depth_frame = self._postprocess_image(depth_frame, depth_frame=True)
 
                 capture_time = time.perf_counter()
