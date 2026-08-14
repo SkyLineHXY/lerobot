@@ -65,9 +65,14 @@ class ArmSpec:
     mode_refresh_interval_s: float = 1.0
     # 夹爪死区，单位 1e-6 m。200 = 0.2mm，小于这个的抖动不值得占一个 CAN 帧。
     gripper_deadband: int = 200
-    # 关节死区（rad）。主臂在 kp=kd=0 的纯力矩重力补偿下是无阻尼自由体，静止时
-    # 读数一直小幅游走；不挡住的话这点噪声会被原样放大成从臂的高频抖。
-    joint_deadband_rad: float = 0.002
+    # 关节死区（rad）。默认 0 = 关闭，别轻易打开。
+    #
+    # 它是拿「本次目标 vs 上次已下发的目标」比的，所以在高频指令下会把**慢速连续运动
+    # 量化成台阶**：主臂速度低于 deadband * 指令频率（0.002 * 188 ≈ 0.38 rad/s）时，
+    # 要攒够一个死区才放一帧过去，人手上就是明显卡顿 —— 恰好发生在慢速精细操作时。
+    # 30Hz 时每拍位移远大于死区所以看不出来，5.3ms 周期下每拍位移小了约 7 倍就暴露了。
+    # CAN 是 1Mbit/s 且四条总线独立，省这几帧没有收益。
+    joint_deadband_rad: float = 0.0
 
     gravity_comp_tx_ratio: list[float] = field(default_factory=lambda: [0.2] * 6)
     gravity_comp_base_rpy_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
@@ -102,7 +107,13 @@ class DatasetSpec:
     resume: bool = True
     use_videos: bool = True
     video_codec: str = "libsvtav1"
-    streaming_encoding: bool = True
+    # 遥操作场景下默认关掉流式编码。PyAV 在每个 episode 第一帧打开编码器时**不释放
+    # GIL**：实测 h264_nvenc 首帧 encode 独占 GIL 约 400ms、libsvtav1 约 254ms，两路
+    # 相机叠加会让遥操作线程整整停顿 1~2 秒 —— 从臂先僵住再猛追，就是"采集一开始特别
+    # 卡"。关掉之后遥操作周期 max 从 1130ms 降到 45ms。
+    # 代价：采集期间图像先落成 PNG，存集时再由 ProcessPoolExecutor 在独立进程里编码
+    # （那时采集已暂停，且不共享 GIL）。PNG 编码完就删，实测无残留。
+    streaming_encoding: bool = False
     encoder_threads: int = 4
     data_flush_every: int = 10
     writer_queue_maxsize: int = 90
@@ -1079,6 +1090,13 @@ class PiperRecorder:
                 max_width=cfg.view.max_width,
                 window_name="Piper Collect",
             ).start()
+
+        if cfg.dataset.streaming_encoding and cfg.teleop.enabled and cfg.cameras:
+            logger.warning(
+                "streaming_encoding=true 与遥操作同时开着：PyAV 打开编码器时不释放 GIL"
+                "（每相机首帧 encode 实测 250~400ms），每集开头从臂会停顿 1~2 秒。"
+                "要手感就关掉它，改由存集时的独立进程编码。"
+            )
 
         self.start_writer()
         self.start_teleop()

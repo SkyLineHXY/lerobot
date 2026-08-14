@@ -43,7 +43,9 @@ dataset:
   resume: false
   use_videos: true
   video_codec: h264_nvenc
-  streaming_encoding: true
+  # 关闭流式编码：PyAV 打开编码器时不释放 GIL（nvenc 首帧 ~400ms/相机），
+  # 会让遥操作线程在每集开头停顿 1~2 秒。关掉后改为存集时用独立进程编码。
+  streaming_encoding: false
   encoder_threads: 4
   data_flush_every: 10        # 每 N 集把 parquet footer 落盘
   # 写帧线程的排队上限。结束时打印的「写帧队列峰值」持续接近它，说明视频编码
