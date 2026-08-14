@@ -15,8 +15,10 @@
 # limitations under the License.
 import json
 import logging
+import queue
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -39,16 +41,13 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.status_view import StatusView
 
 logger = logging.getLogger(__name__)
-
 DOF_PER_ARM = len(JOINT_ORDER)  # 6 关节 + 夹爪
 INIT_MODES = ("follower_to_leader", "home", "none")
+ACTION_SOURCES = ("follower_next", "leader")
 
-
-# ===================================================================== 配置
 @dataclass
 class ArmSpec:
     """一条「主臂 + 从臂」。CAN 口名以 `ip -br link show | grep can` 的实际输出为准。"""
-
     name: str = "left"
     leader_port: str = "can_left_l"
     follower_port: str = "can_left_f"
@@ -93,6 +92,9 @@ class DatasetSpec:
     streaming_encoding: bool = True
     encoder_threads: int = 4
     data_flush_every: int = 10
+    # 写帧线程的排队上限。队列满了说明编码器长期跟不上，此时丢帧比让控制回路
+    # 跟着一起卡住更好 —— 卡住会连带影响从臂跟随。
+    writer_queue_maxsize: int = 90
 
     # 数字键 -> 子任务描述。留空则不记录 subtask_index。
     subtasks: dict = field(default_factory=dict)
@@ -105,6 +107,8 @@ class CollectionSpec:
     max_joint_step_rad: float = 0.05
     use_back_event: bool = True
     dry_run: bool = False
+
+    action_source: str = "follower_next"
 
     # follower_to_leader（从臂去找主臂）/ home（各自回原点）/ none
     init_mode: str = "follower_to_leader"
@@ -135,11 +139,6 @@ class RecordPiperConfig:
 
 # ================================================================= 按键状态机
 class CollectKeys:
-    """采集的按键状态机，键位沿用 ROS 版 data_to_lerobot3_node.py。
-    不复用 `KeyboardEventListener`：它的内建绑定（s=成功 / r=交接 / space=接管）与
-    采集键位语义冲突。共用的只有底层后端，见 :func:`start_key_backend`。
-    """
-
     def __init__(self, backend: str = "auto", subtask_keys=()):
         self._impl = start_key_backend(backend)
         self._subtask_keys = set(subtask_keys)
@@ -241,6 +240,15 @@ class ArmPair:
             )
         )
 
+        # send() 的省帧状态。0xAD 与 PiperMotorsBus.write 保持一致，换成 0x00 会改变
+        # 从臂的动力学表现，别在没上机验证的情况下动它。
+        self.move_speed_ratio = 60
+        self.can_mit_flag = 0xAD
+        self.mode_refresh_interval_s = 1.0
+        self.gripper_deadband = 200  # 0.0002 m，小于这个的抖动不值得占一个 CAN 帧
+        self._last_mode_refresh = -1e9
+        self._last_gripper: int | None = None
+
     def connect(self) -> None:
         if not self.robot.is_connected:
             self.robot.connect(calibrate=False)
@@ -272,7 +280,20 @@ class ArmPair:
         return np.array([obs[k] for k in JOINT_ORDER], dtype=np.float32)
 
     def send(self, joints: np.ndarray) -> None:
-        self.robot.send_action(dict(zip(JOINT_ORDER, joints.tolist(), strict=True)))
+        arm = self.robot.bus.piper
+        factor = self.robot.bus.joint_factor
+
+        now = time.perf_counter()
+        if now - self._last_mode_refresh >= self.mode_refresh_interval_s:
+            arm.MotionCtrl_2(0x01, 0x01, self.move_speed_ratio, self.can_mit_flag)
+            self._last_mode_refresh = now
+
+        arm.JointCtrl(*(round(float(j) * factor) for j in joints[:6]))
+
+        gripper = round(abs(float(joints[6])) * 1e6)
+        if self._last_gripper is None or abs(gripper - self._last_gripper) >= self.gripper_deadband:
+            arm.GripperCtrl(gripper, 1000, 0x01, 0)
+            self._last_gripper = gripper
 
     def takeover_delta(self) -> float:
         """主从最大关节差。夹爪是开度不是角度，不参与。"""
@@ -380,14 +401,26 @@ class PiperRecorder:
         self.n_arms = len(cfg.arms)
         self.dof = DOF_PER_ARM * self.n_arms
 
+        if cfg.collection.action_source not in ACTION_SOURCES:
+            raise ValueError(
+                f"未知的 action_source {cfg.collection.action_source!r}；可选 {ACTION_SOURCES}"
+            )
+
         self.pairs = [ArmPair(spec) for spec in cfg.arms]
         self.cameras: dict = {}
         self.dataset = None
         self.view = None
         self.keys = None
-        # gs_usb 写一帧 ≈ 2.3ms，一次 JointCtrl 是 3 帧 ≈ 7ms；双臂串行下发 14ms，
-        # 30Hz 的 33ms 预算里去掉快一半，所以双臂并行。
-        self._pool = ThreadPoolExecutor(max_workers=self.n_arms) if self.n_arms > 1 else None
+        self._pool = ThreadPoolExecutor(max_workers=max(2, self.n_arms + len(cfg.cameras)))
+        self._pending_sends: list = []
+        self._pending_frame: dict | None = None
+
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=cfg.dataset.writer_queue_maxsize)
+        self._writer_thread: threading.Thread | None = None
+        self._writer_stop = threading.Event()
+        self._writer_error: list[BaseException] = []
+        # read_latest 允许的帧龄：3 拍还没有新图就说明相机真的掉线了
+        self._frame_max_age_ms = max(200, int(3000 / max(1, cfg.dataset.fps)))
         self.subtasks = {str(k): v for k, v in cfg.dataset.subtasks.items()}
         names = list(self.subtasks.values())
         if len(names) != len(set(names)):
@@ -401,9 +434,13 @@ class PiperRecorder:
         self._saturated: list[bool] = []
         self._loop_periods: list[float] = []
         self._dropped_frames = 0
+        # 分段耗时，用来回答"到底是哪一段吃掉了实时预算"
+        self._t_arms: list[float] = []
+        self._t_cams: list[float] = []
+        self._t_write: list[float] = []
+        self._queue_peak = 0
 
     def joint_names(self) -> list[str]:
-        """单臂 joint_1..7；双臂左 joint_1..7、右 joint_8..14（与 DualPIPERConfig 一致）。"""
         return [f"joint_{i + 1}.pos" for i in range(self.dof)]
 
     def build_features(self) -> dict:
@@ -467,8 +504,6 @@ class PiperRecorder:
         if root.exists():
             if cfg.resume:
                 logger.info("续采已有数据集：%s", root)
-                # 必须在构造 LeRobotDataset 之前修：数据与元数据不一致时 __init__ 会
-                # 回退去访问 HuggingFace Hub，本地 repo_id 会直接挂住。
                 repair_dataset_consistency(root)
                 codec = _local_video_codec(root, cfg.video_codec)
                 if codec != cfg.video_codec:
@@ -486,8 +521,6 @@ class PiperRecorder:
                     streaming_encoding=cfg.streaming_encoding,
                     encoder_threads=cfg.encoder_threads,
                 )
-                # __init__ 之后 episode_buffer 是 None；add_frame 会自建，但
-                # clear_episode_buffer 不会 —— 一帧还没加就按 r 丢弃会 TypeError。
                 self.dataset.episode_buffer = self.dataset.create_episode_buffer()
                 if not cfg.streaming_encoding:
                     self.dataset.start_image_writer(
@@ -525,7 +558,6 @@ class PiperRecorder:
         print(f"[record] 已新建数据集：{root}（编码 {cfg.video_codec}，流式={cfg.streaming_encoding}）")
 
     def _check_resume_compatibility(self, features: dict) -> None:
-        """续采不能凭空长出新列，已有数据集没有的字段必须关掉，否则 add_frame 会拒收。"""
         existing = self.dataset.meta.features
         if self.use_back_event and "back_event" not in existing:
             logger.warning("已有数据集没有 back_event 列，本次运行自动关闭它。")
@@ -542,7 +574,6 @@ class PiperRecorder:
             )
 
     def _write_subtasks_parquet(self, root: Path) -> None:
-        """仓库的 dataset 代码只在 `__getitem__` 里读这个文件，没有任何写入方。"""
         import pandas as pd
 
         names = list(self.subtasks.values())
@@ -557,12 +588,20 @@ class PiperRecorder:
 
     # ------------------------------------------------------------- 每拍
     def _map(self, fn, items):
-        if self._pool is None:
+        items = list(items)
+        if len(items) < 2:
             return [fn(x) for x in items]
         return list(self._pool.map(fn, items))
 
+    def _join_pending_sends(self) -> None:
+        for fut in self._pending_sends:
+            try:
+                fut.result()
+            except Exception:
+                logger.exception("下发失败")
+        self._pending_sends = []
+
     def step_arms(self) -> tuple[np.ndarray, np.ndarray]:
-        """读主臂 + 读从臂 + 限速 + 下发，返回 (从臂实测, 实际下发的目标)。"""
         cfg = self.cfg.collection
         leader_actions = self._map(lambda p: p.read_leader(), self.pairs)
         measured_list = self._map(lambda p: p.read_follower(), self.pairs)
@@ -575,26 +614,28 @@ class PiperRecorder:
             self._saturated.append(bool(saturated))
 
         if not cfg.dry_run:
-            self._map(lambda iv: iv[0].send(iv[1]), list(zip(self.pairs, limited_list, strict=True)))
+            self._pending_sends = [
+                self._pool.submit(pair.send, limited)
+                for pair, limited in zip(self.pairs, limited_list, strict=True)
+            ]
 
         return np.concatenate(measured_list), np.concatenate(limited_list)
 
     def read_cameras(self) -> dict:
-        images = {}
-        for name, cam in self.cameras.items():
+        def grab(item):
+            name, cam = item
             try:
-                images[name] = cam.async_read()
+                reader = getattr(cam, "read_latest", None)
+                return name, (reader(max_age_ms=self._frame_max_age_ms) if reader else cam.async_read())
             except Exception as exc:
                 logger.warning("相机 %s 读取失败：%s", name, exc)
-        return images
+                return name, None
+
+        results = self._map(grab, self.cameras.items())
+        return {name: img for name, img in results if img is not None}
 
     def build_frame(self, state: np.ndarray, action: np.ndarray, images: dict) -> dict:
-        """拼一帧。
 
-        `add_frame` 要求键集合恰好等于 schema，数值特征 dtype / shape 精确匹配 ——
-        所以 subtask_index / back_event 是 (1,) 的 int64 数组而不是裸 int，
-        `task` 是 frame 里的一个键而不是单独参数。
-        """
         frame = {
             "observation.state": state.astype(np.float32),
             "action": action.astype(np.float32),
@@ -618,8 +659,82 @@ class PiperRecorder:
             )
         return frame
 
+    def record_tick(self, state: np.ndarray, commanded: np.ndarray, images: dict) -> None:
+        if len(images) < len(self.cfg.cameras):
+            self._dropped_frames += 1
+            self._pending_frame = None
+            return
+
+        if self.cfg.collection.action_source == "leader":
+            self._enqueue_frame(self.build_frame(state, commanded, images))
+            return
+
+        pending = self._pending_frame
+        if pending is not None:
+            pending["action"] = state.astype(np.float32)
+            self._enqueue_frame(pending)
+        self._pending_frame = self.build_frame(state, state, images)
+
+    def flush_pending_frame(self) -> None:
+        self._pending_frame = None
+
+    # ------------------------------------------------------------- 写帧线程
+    def _enqueue_frame(self, frame: dict) -> None:
+        try:
+            self._frame_queue.put_nowait(frame)
+        except queue.Full:
+            # 编码器长期跟不上。丢帧比拖住控制回路好：控制回路一卡，从臂跟随就跟着抖。
+            self._dropped_frames += 1
+
+    def _writer_loop(self) -> None:
+        """把队列里的帧写进数据集。
+
+        `add_frame` 会把图像喂给流式编码器，编码器队列一满就阻塞（实测 p95 63ms、
+        最坏 214ms）。这件事必须发生在控制回路之外，否则从臂跟随会跟着一起卡。
+        """
+        while True:
+            try:
+                frame = self._frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._writer_stop.is_set():
+                    return
+                continue
+            try:
+                self.dataset.add_frame(frame)
+            except BaseException as exc:
+                self._writer_error.append(exc)
+                return
+            finally:
+                self._frame_queue.task_done()
+
+    def start_writer(self) -> None:
+        self._writer_stop.clear()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, name="piper-record-writer", daemon=True
+        )
+        self._writer_thread.start()
+
+    def drain_writer(self, timeout_s: float = 60.0) -> None:
+        """等队列排空。存集 / 丢弃 / 退出前必须调，否则会少帧或把帧串到下一集。"""
+        deadline = time.perf_counter() + timeout_s
+        while not self._frame_queue.empty() and time.perf_counter() < deadline:
+            if self._writer_error:
+                break
+            time.sleep(0.005)
+        if not self._frame_queue.empty():
+            logger.warning(
+                "写帧队列在 %.0fs 内没排空，仍有 %d 帧未落盘。", timeout_s, self._frame_queue.qsize()
+            )
+        if self._writer_error:
+            raise self._writer_error[0]
+
+    def stop_writer(self) -> None:
+        self._writer_stop.set()
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=10.0)
+            self._writer_thread = None
+
     def buffered_frames(self) -> int:
-        """`save_episode()` 会先 pop 'size'，两集之间缓冲也可能是 None，所以要防御式读。"""
         if self.dataset is None:
             return 0
         buf = getattr(self.dataset, "episode_buffer", None)
@@ -629,6 +744,8 @@ class PiperRecorder:
 
     # ------------------------------------------------------------- episode
     def save_episode(self) -> None:
+        self.flush_pending_frame()
+        self.drain_writer()
         n = self.buffered_frames()
         if n == 0:
             print("[record] 缓冲区是空的，没有东西可存。")
@@ -638,7 +755,6 @@ class PiperRecorder:
 
         print(f"[record] 💾 正在保存 {n} 帧 …")
         self.dataset.save_episode()
-        # 元数据默认攒够 10 集才落盘，不主动 flush 一次硬杀最多丢 10 集
         self.dataset.meta._flush_metadata_buffer()
 
         self._episodes_since_flush += 1
@@ -657,13 +773,6 @@ class PiperRecorder:
         )
 
     def _checkpoint_data_writer(self) -> None:
-        """让 parquet footer 落盘。
-
-        LeRobot 跨集复用同一个 ParquetWriter，footer 只有 close() 时才写，在那之前
-        文件读不了，进程被杀会丢掉整个文件里的所有 episode。`_writer_closed_for_reading`
-        必须置上，下一集才会滚到新文件 —— 不置的话 LeRobot 会在同一路径重开 writer，
-        把已写内容整个截断。
-        """
         ds = self.dataset
         if ds is None or getattr(ds, "writer", None) is None:
             return
@@ -676,6 +785,8 @@ class PiperRecorder:
             logger.warning("落盘 data writer 失败：%s", exc)
 
     def discard_episode(self) -> None:
+        self.flush_pending_frame()
+        self.drain_writer()
         if self.buffered_frames() > 0:
             self.dataset.clear_episode_buffer()
         self.reset_episode_state()
@@ -723,67 +834,103 @@ class PiperRecorder:
                 window_name="Piper Collect",
             ).start()
 
+        self.start_writer()
         self.print_usage()
         if cfg.collection.dry_run:
             print("[record] ⚠ DRY-RUN：只读不下发，从臂不会动。")
+        stop = threading.Event()
+        failure: list[BaseException] = []
+
+        def control_thread():
+            try:
+                self._control_loop(stop)
+            except BaseException as exc:  # 交给主线程抛，否则异常会被线程吞掉
+                failure.append(exc)
+            finally:
+                stop.set()
+        worker = threading.Thread(target=control_thread, name="piper-record", daemon=True)
+        worker.start()
 
         render_interval = 1.0 / max(1e-3, cfg.view.render_hz)
-        last_render = 0.0
+        try:
+            while not stop.is_set():
+                if self.view is not None and self.view.enabled:
+                    if not self.view.render_once():
+                        print("[record] 操作员在窗口里按了 q/ESC")
+                        break
+                    time.sleep(render_interval)
+                else:
+                    stop.wait(0.1)
+        finally:
+            stop.set()
+            worker.join(timeout=5.0)
+            self.keys.stop()
+            self.flush_pending_frame()
+            try:
+                self.drain_writer()
+            finally:
+                self.stop_writer()
+
+        if failure:
+            raise failure[0]
+
+    def _control_loop(self, stop: "threading.Event") -> None:
+        cfg = self.cfg
         collect_start = time.perf_counter()
         meas_fps = float(cfg.dataset.fps)
         prev_loop_t = None
 
-        try:
-            while True:
-                loop_t0 = time.perf_counter()
-                if prev_loop_t is not None and loop_t0 > prev_loop_t:
-                    meas_fps = 0.9 * meas_fps + 0.1 / (loop_t0 - prev_loop_t)
-                prev_loop_t = loop_t0
+        while not stop.is_set():
+            loop_t0 = time.perf_counter()
+            if prev_loop_t is not None and loop_t0 > prev_loop_t:
+                meas_fps = 0.9 * meas_fps + 0.1 / (loop_t0 - prev_loop_t)
+            prev_loop_t = loop_t0
 
-                self.keys.poll()
-                for msg in self.keys.drain_messages():
-                    print(f"[record] {msg}")
-                if self.keys.quit:
-                    print("[record] 操作员请求退出")
-                    break
-                sub_key = self.keys.poll_subtask()
-                if sub_key is not None:
-                    self.current_subtask = self.subtasks[sub_key]
-                    print(f"[record] 🔄 子任务 → {self.current_subtask}")
-                if self.keys.poll_save():
-                    if self.keys.collecting:
-                        print("[record] ⚠ 采集中不能保存，先按 space 暂停")
-                    else:
-                        self.save_episode()
-                if self.keys.poll_discard():
-                    self.discard_episode()
-                state, action = self.step_arms()
-                images = self.read_cameras()
+            self._join_pending_sends()
+
+            self.keys.poll()
+            for msg in self.keys.drain_messages():
+                print(f"[record] {msg}")
+            if self.keys.quit:
+                print("[record] 操作员请求退出")
+                return
+            sub_key = self.keys.poll_subtask()
+            if sub_key is not None:
+                self.current_subtask = self.subtasks[sub_key]
+                print(f"[record] 🔄 子任务 → {self.current_subtask}")
+            if self.keys.poll_save():
                 if self.keys.collecting:
-                    if self.buffered_frames() >= cfg.collection.max_timesteps:
-                        print(f"[record] ⏹ 达到单集上限 {cfg.collection.max_timesteps}，自动暂停")
-                        self.keys.collecting = False
-                    elif len(images) < len(cfg.cameras):
-                        # 少一路相机就整帧丢掉：add_frame 要求键集合精确匹配，
-                        # 补一张假图会把坏数据写进数据集，比丢一帧糟得多。
-                        self._dropped_frames += 1
-                    else:
-                        self.dataset.add_frame(self.build_frame(state, action, images))
+                    print("[record] ⚠ 采集中不能保存，先按 space 暂停")
+                else:
+                    self.save_episode()
+            if self.keys.poll_discard():
+                self.discard_episode()
 
-                if self.view is not None and self.view.enabled:
-                    self.view.update(images, self._status(meas_fps, collect_start))
-                    now = time.perf_counter()
-                    if now - last_render >= render_interval:
-                        last_render = now
-                        if not self.view.render_once():
-                            print("[record] 操作员在窗口里按了 q/ESC")
-                            break
+            t0 = time.perf_counter()
+            state, commanded = self.step_arms()
+            t1 = time.perf_counter()
+            images = self.read_cameras()
+            t2 = time.perf_counter()
 
-                busy = time.perf_counter() - loop_t0
-                precise_sleep(max(self.dt - busy, 0.0))
-                self._loop_periods.append(time.perf_counter() - loop_t0)
-        finally:
-            self.keys.stop()
+            if self.keys.collecting:
+                if self.buffered_frames() >= cfg.collection.max_timesteps:
+                    print(f"[record] ⏹ 达到单集上限 {cfg.collection.max_timesteps}，自动暂停")
+                    self.keys.collecting = False
+                    self.flush_pending_frame()
+                else:
+                    self.record_tick(state, commanded, images)
+            elif self._pending_frame is not None:
+                self.flush_pending_frame()
+            t3 = time.perf_counter()
+            self._t_arms.append(t1 - t0)
+            self._t_cams.append(t2 - t1)
+            self._t_write.append(t3 - t2)
+            self._queue_peak = max(self._queue_peak, self._frame_queue.qsize())
+            if self.view is not None and self.view.enabled:
+                self.view.update(images, self._status(meas_fps, collect_start))
+            busy = time.perf_counter() - loop_t0
+            precise_sleep(max(self.dt - busy, 0.0))
+            self._loop_periods.append(time.perf_counter() - loop_t0)
 
     def _status(self, meas_fps: float, collect_start: float) -> dict:
         total_eps = self.dataset.meta.total_episodes if self.dataset is not None else 0
@@ -803,20 +950,40 @@ class PiperRecorder:
             "saved_frames": total_frames,
         }
 
-    # ------------------------------------------------------------- 收尾
     def print_summary(self) -> None:
         n = len(self._loop_periods)
         if n == 0:
             return
         achieved = n / sum(self._loop_periods)
         sat = float(np.mean(self._saturated)) if self._saturated else 0.0
+        budget_ms = self.dt * 1e3
         print("\n" + "=" * 66)
         print(f"目标 {self.cfg.dataset.fps:.1f} Hz -> 实测 {achieved:.1f} Hz（共 {n} 拍）")
+
+        print(f"\n分段耗时 (ms，预算 {budget_ms:.1f})    {'p50':>8}{'p95':>8}{'max':>8}")
+        for label, samples in (
+            ("主从读写 (CAN)", self._t_arms),
+            ("相机 async_read", self._t_cams),
+            ("写帧入队", self._t_write),
+        ):
+            if not samples:
+                continue
+            arr = np.asarray(samples) * 1e3
+            print(
+                f"  {label:<22}{np.percentile(arr, 50):>8.2f}"
+                f"{np.percentile(arr, 95):>8.2f}{arr.max():>8.2f}"
+            )
+
+        print(
+            f"\n写帧队列峰值 {self._queue_peak}/{self.cfg.dataset.writer_queue_maxsize}"
+            "（持续接近上限说明视频编码跟不上，降分辨率或换更快的 video_codec）"
+        )
         print(f"限速饱和率 {sat:.1%}（max_joint_step_rad={self.cfg.collection.max_joint_step_rad}）")
         if sat > 0.3:
-            print("  ⚠ 饱和率偏高：记录的 action 已经不等于人手的意图，请调大 max_joint_step_rad 后重采。")
+            print("  ⚠ 饱和率偏高：从臂跟不上主臂，请调大 max_joint_step_rad 后重采。")
         if achieved < 0.9 * self.cfg.dataset.fps:
-            print("  ⚠ 实测频率明显低于目标：减少相机 / 降低分辨率 / 降低 dataset.fps。")
+            print("  ⚠ 实测频率明显低于目标：看上面哪一段最贵 —— CAN 段贵就降 fps 或减臂，")
+            print("    相机段贵就降分辨率 / 减相机；写帧入队本来就该接近 0，不为 0 说明队列满了。")
         if self._dropped_frames:
             print(f"  ⚠ 有 {self._dropped_frames} 帧因为相机读数缺失被丢弃。")
         print("=" * 66 + "\n")

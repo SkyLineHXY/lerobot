@@ -364,3 +364,163 @@ def test_duplicate_subtask_descriptions_are_rejected(monkeypatch):
     cfg = _cfg(subtasks={"1": "same", "2": "same"})
     with pytest.raises(ValueError, match="子任务描述有重复"):
         PiperRecorder(cfg)
+
+
+# ------------------------------------------------------------------ action 映射
+class FakeDataset:
+    def __init__(self):
+        self.frames: list[dict] = []
+        self.episode_buffer = {"size": 0}
+
+    def add_frame(self, frame):
+        self.frames.append(frame)
+        self.episode_buffer["size"] += 1
+
+
+def _recorder_with_dataset(monkeypatch, **cfg_kw):
+    rec = _recorder(monkeypatch, _cfg(**cfg_kw))
+    rec.dataset = FakeDataset()
+    rec.keys.collecting = True
+    return rec
+
+
+def _drain(rec):
+    """同步版的写帧线程：帧现在是排队写的，断言前得先把队列倒出来。"""
+    while not rec._frame_queue.empty():
+        rec.dataset.add_frame(rec._frame_queue.get_nowait())
+
+
+def test_follower_next_records_the_pose_the_arm_actually_reached(monkeypatch):
+    """示教时从臂跟不满主臂，所以 action 记的是从臂下一拍真正到达的位姿。"""
+    rec = _recorder_with_dataset(monkeypatch, action_source="follower_next")
+
+    for step in range(3):
+        state = np.full(7, float(step), dtype=np.float32)
+        rec.record_tick(state, np.full(7, 99.0, dtype=np.float32), {})
+
+    _drain(rec)
+    # 第 3 拍才提交出 2 帧：每帧都要等下一拍的 state 才能定稿
+    assert len(rec.dataset.frames) == 2
+    for i, frame in enumerate(rec.dataset.frames):
+        assert frame["observation.state"] == pytest.approx([float(i)] * 7)
+        assert frame["action"] == pytest.approx([float(i + 1)] * 7), "action = 下一拍的 state"
+
+
+def test_follower_next_never_records_a_degenerate_identity_action(monkeypatch):
+    """action[t] == state[t] 会让策略学成恒等映射，推理时手臂永远不动。"""
+    rec = _recorder_with_dataset(monkeypatch, action_source="follower_next")
+    for step in range(4):
+        rec.record_tick(np.full(7, float(step), np.float32), np.zeros(7, np.float32), {})
+
+    _drain(rec)
+    for frame in rec.dataset.frames:
+        assert not np.allclose(frame["observation.state"], frame["action"])
+
+
+def test_leader_source_records_the_commanded_target(monkeypatch):
+    rec = _recorder_with_dataset(monkeypatch, action_source="leader")
+    state = np.zeros(7, np.float32)
+    commanded = np.full(7, 0.5, np.float32)
+    rec.record_tick(state, commanded, {})
+
+    _drain(rec)
+    assert len(rec.dataset.frames) == 1, "leader 模式不需要挂起，当拍就能定稿"
+    assert rec.dataset.frames[0]["action"] == pytest.approx([0.5] * 7)
+
+
+def test_pending_frame_is_dropped_at_episode_boundaries(monkeypatch):
+    """挂起的那帧没有下一拍，留着它会让 action 跨越两集之间的空档。"""
+    rec = _recorder_with_dataset(monkeypatch, action_source="follower_next")
+    rec.record_tick(np.zeros(7, np.float32), np.zeros(7, np.float32), {})
+    assert rec._pending_frame is not None
+
+    rec.flush_pending_frame()
+    assert rec._pending_frame is None
+    rec.record_tick(np.ones(7, np.float32), np.zeros(7, np.float32), {})
+    _drain(rec)
+    assert rec.dataset.frames == [], "断点之后不能拿新一拍去补旧帧的 action"
+
+
+def test_missing_camera_drops_the_whole_frame(monkeypatch):
+    """补一张假图会把坏数据写进数据集，比丢一帧糟得多。"""
+    cams = [CameraSpec(name="cam_top", width=2, height=2)]
+    rec = _recorder_with_dataset(monkeypatch, action_source="leader")
+    rec.cfg.cameras = cams
+
+    rec.record_tick(np.zeros(7, np.float32), np.zeros(7, np.float32), {})
+    _drain(rec)
+    assert rec.dataset.frames == []
+    assert rec._dropped_frames == 1
+
+
+def test_unknown_action_source_is_rejected(monkeypatch):
+    monkeypatch.setattr(rp, "ArmPair", FakeArmPair)
+    with pytest.raises(ValueError, match="未知的 action_source"):
+        PiperRecorder(_cfg(action_source="telepathy"))
+
+
+# ------------------------------------------------------------------ CAN 省帧
+class FakeSdkArm:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def MotionCtrl_2(self, *a):  # noqa: N802
+        self.calls.append("MotionCtrl_2")
+
+    def JointCtrl(self, *a):  # noqa: N802
+        self.calls.append("JointCtrl")
+
+    def GripperCtrl(self, *a):  # noqa: N802
+        self.calls.append("GripperCtrl")
+
+
+def _send_pair():
+    pair = ArmPair.__new__(ArmPair)
+    pair.spec = ArmSpec()
+    sdk = FakeSdkArm()
+    pair.robot = type("R", (), {"bus": type("B", (), {"piper": sdk, "joint_factor": 57324.840764})()})()
+    pair.move_speed_ratio = 60
+    pair.can_mit_flag = 0xAD
+    pair.mode_refresh_interval_s = 1.0
+    pair.gripper_deadband = 200
+    pair._last_mode_refresh = -1e9
+    pair._last_gripper = None
+    return pair, sdk
+
+
+def test_mode_frame_is_not_resent_every_tick():
+    """每拍复述模式帧就是白白多占一个 CAN 帧（≈2.3ms），双臂下直接掉频。"""
+    pair, sdk = _send_pair()
+    for _ in range(5):
+        pair.send(np.zeros(7, np.float32))
+    assert sdk.calls.count("MotionCtrl_2") == 1
+    assert sdk.calls.count("JointCtrl") == 5
+
+
+def test_mode_frame_is_refreshed_after_the_interval():
+    pair, sdk = _send_pair()
+    pair.send(np.zeros(7, np.float32))
+    pair._last_mode_refresh -= 2.0
+    pair.send(np.zeros(7, np.float32))
+    assert sdk.calls.count("MotionCtrl_2") == 2
+
+
+def test_gripper_frame_is_skipped_while_the_target_holds_still():
+    pair, sdk = _send_pair()
+    for _ in range(4):
+        pair.send(np.zeros(7, np.float32))
+    assert sdk.calls.count("GripperCtrl") == 1
+
+    moved = np.zeros(7, np.float32)
+    moved[6] = 0.05
+    pair.send(moved)
+    assert sdk.calls.count("GripperCtrl") == 2
+
+
+def test_tiny_gripper_jitter_does_not_burn_a_can_frame():
+    pair, sdk = _send_pair()
+    pair.send(np.zeros(7, np.float32))
+    jitter = np.zeros(7, np.float32)
+    jitter[6] = 1e-5  # 0.00001 m，远小于死区
+    pair.send(jitter)
+    assert sdk.calls.count("GripperCtrl") == 1

@@ -46,7 +46,10 @@ dataset:
   video_codec: h264_nvenc     # 没有 NVENC 就换 libsvtav1
   streaming_encoding: true
   encoder_threads: 4
-  data_flush_every: 10        # 每 N 集把 parquet footer 落盘，限定硬杀最多毁几集
+  data_flush_every: 10        # 每 N 集把 parquet footer 落盘
+  # 写帧线程的排队上限。结束时打印的「写帧队列峰值」持续接近它，说明视频编码
+  # 跟不上采集速度，该降分辨率或换更快的 video_codec。
+  writer_queue_maxsize: 90
 
   subtasks:
     '1': 'grasp the connector.'
@@ -59,6 +62,12 @@ collection:
   max_joint_step_rad: 0.4    # 每拍关节推进上限，调太大等于关掉限速
   use_back_event: true
   dry_run: false
+
+  # action 记什么：
+  #   follower_next —— 从臂在下一拍的实测位姿（默认）。示教时从臂并不能 100% 跟上
+  #      主臂，记主臂指令等于记了一个没被真正执行的动作。代价是每集丢掉最后一帧。
+  #   leader        —— 限速后实际下发给从臂的目标（即主臂指令）。
+  action_source: follower_next
 
   # follower_to_leader = 从臂运动到主臂当前位姿（人先握好主臂摆姿势）
   # home               = 主从各自平滑回原点

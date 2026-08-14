@@ -45,7 +45,10 @@ dataset:
   video_codec: h264_nvenc
   streaming_encoding: true
   encoder_threads: 4
-  data_flush_every: 10
+  data_flush_every: 10        # 每 N 集把 parquet footer 落盘
+  # 写帧线程的排队上限。结束时打印的「写帧队列峰值」持续接近它，说明视频编码
+  # 跟不上采集速度，该降分辨率或换更快的 video_codec。
+  writer_queue_maxsize: 90
 
   subtasks:
     '1': 'grasp the routine blood tube.'
@@ -62,6 +65,12 @@ collection:
   max_joint_step_rad: 0.05
   use_back_event: true
   dry_run: false
+
+  # action 记什么：
+  #   follower_next —— 从臂在下一拍的实测位姿（默认）。示教时从臂并不能 100% 跟上
+  #      主臂，记主臂指令等于记了一个没被真正执行的动作。代价是每集丢掉最后一帧。
+  #   leader        —— 限速后实际下发给从臂的目标（即主臂指令）。
+  action_source: follower_next
 
   init_mode: follower_to_leader
   init_duration_s: 2.0
