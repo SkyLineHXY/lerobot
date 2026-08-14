@@ -115,6 +115,12 @@ class DatasetSpec:
     # （那时采集已暂停，且不共享 GIL）。PNG 编码完就删，实测无残留。
     streaming_encoding: bool = False
     encoder_threads: int = 4
+    # 写图必须走**进程**而不是线程：单张 640x480 PNG 实测 34.5ms，两路相机 30fps
+    # 需要约 2 个核。放在线程里即使 PIL 会释放 GIL，也足以把主臂 200Hz 的重力补偿
+    # 线程挤到 6.8% 的周期错过截止（暂停时只有 2.0%）—— 那正是"采集时重力补偿变差"。
+    # 用进程后主进程每帧只付一次 ~900KB 的序列化。
+    image_writer_processes: int = 2
+    image_writer_threads: int = 4
     data_flush_every: int = 10
     writer_queue_maxsize: int = 90
 
@@ -576,6 +582,9 @@ class PiperRecorder:
             unit="帧",
             dynamic_ncols=True,
             leave=False,
+            # 进度条只在采集时刷新，是"采集比暂停更卡"的一份来源：终端写入要拿 tqdm
+            # 的全局锁，真实 TTY 比管道慢得多。2Hz 对操作员完全够看。
+            mininterval=0.5,
         )
 
     def _close_bar(self) -> None:
@@ -683,7 +692,8 @@ class PiperRecorder:
                 self.dataset.episode_buffer = self.dataset.create_episode_buffer()
                 if not cfg.streaming_encoding:
                     self.dataset.start_image_writer(
-                        num_processes=0, num_threads=4 * max(1, len(self.cameras))
+                        num_processes=cfg.image_writer_processes,
+                        num_threads=cfg.image_writer_threads,
                     )
                 self._check_resume_compatibility(features)
                 print(
@@ -706,8 +716,8 @@ class PiperRecorder:
             robot_type=cfg.robot_type,
             use_videos=cfg.use_videos,
             tolerance_s=1e-4,
-            image_writer_processes=0,
-            image_writer_threads=4,
+            image_writer_processes=cfg.image_writer_processes,
+            image_writer_threads=cfg.image_writer_threads,
             vcodec=cfg.video_codec,
             streaming_encoding=cfg.streaming_encoding,
             encoder_threads=cfg.encoder_threads,
