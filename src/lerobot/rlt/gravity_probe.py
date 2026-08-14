@@ -1,51 +1,25 @@
-"""主臂重力补偿实时探针：逐关节看数值、逐关节标定 tx_ratio。
+"""Per-joint live probe for the leader arm's gravity compensation.
 
-只碰**主臂**，全程不给跟随臂发任何指令。
+Only ever touches the *leader*; never commands the follower.
 
-为什么必须逐关节
-----------------
-Piper 各关节的重力负载相差一个数量级以上（模型实算，取多个位姿的最大值）：
+Gravity load differs by more than an order of magnitude across Piper's joints
+(model, max over poses): J1 0.000, J2 3.185, J3 2.718, J4 0.218, J5 0.218,
+J6 0.000 N*m. J1/J6 reading 0 is correct, not a fault — gravity has no moment
+arm about the base vertical axis or the tool axis, so those two can only hold
+themselves by friction. J4/J5 need roughly 1/15 of what J2/J3 do, so a single
+tx_ratio tuned until J2 feels right leaves the wrist below stiction and the arm
+feels like "the wrist has no compensation". Hence `gravity_comp_tx_ratio` is a
+6-tuple and this probe tunes each joint separately.
 
-    J1      J2      J3      J4      J5      J6
-  0.000   3.185   2.718   0.218   0.218   0.000   N·m
+It also separates the two causes of "no torque after engaging":
+  A. MIT never engaged — `JointMitCtrl` silently ignored. mode_feed never
+     reaches MOVE_M(0x4) and the arm stays stiff (position loop still holding).
+  B. MIT engaged but compensation too weak — arm goes limp and sags, with the
+     commanded torque far below the model's g(q).
 
-* **J1 / J6 恒为 0 是正确的**，不是故障：J1 绕基座竖直轴旋转、J6 绕工具轴旋转，
-  重力对这两根轴没有力臂，压根产生不了力矩。这两个关节永远只能靠摩擦自持。
-* **J4 / J5 的需求只有 J2/J3 的约 1/15**。用一个统一的 tx_ratio 时，把 J2 调到
-  手感合适，腕部拿到的力矩会低到被静摩擦完全吃掉 —— 手上就是"腕部没有补偿"。
-
-所以 `gravity_comp_tx_ratio` 本来就是 6 元组（各关节减速比与电机力矩常数不同），
-本探针也按关节分别调。
-
-另外：默认 URDF 是 `piper_no_gripper_description.urdf`，**腕部不含夹爪/手柄**
-（link6 质量仅 0.007 kg）。如果主臂末端装了夹爪或遥操作手柄，真实腕部负载比模型
-大得多，模型会系统性地少给力矩 —— 这种情况要换一个含负载的 URDF，光调 tx_ratio
-补不回来。
-
-判定「按下接管后没有力矩输出」属于哪一种：
-
-  A. MIT 模式没挂上 —— `JointMitCtrl` 被静默忽略，力矩指令根本没生效。
-     现象：mode_feed 一直不是 MOVE_M(0x4)，手臂发硬（位置环还在托着）。
-  B. MIT 挂上了但补偿太弱 —— 位置环被释放、手臂变软，而 tx_ratio 缩放后的
-     力矩托不住自重，手臂往下掉。
-     现象：mode_feed = MOVE_M(0x4)，下发力矩 << 模型 g(q)。
-
-安全设计：
-  * 所有关节的 tx_ratio 从 **0 起步**（等于完全不补偿），必须手动一档档往上加。
-  * 上限硬性钳在 `--max-ratio`（默认 1.2）。
-  * 按 `0` 全部立即归零；退出时一定把主臂交还位置模式。
-
-用法::
-
-    python -m lerobot.rlt.gravity_probe --port can_left_l
-
-    1-6   选中要调的关节        a   选中全部关节
-    +/=   选中项 tx_ratio +0.05    -/_  -0.05
-    0     全部归零（手臂重新变沉，等同于急停补偿）
-    q/Esc 退出并交还位置模式
-
-⚠ 开始前先用手扶住主臂。tx_ratio 往上加的过程中手臂会逐渐变软。
-⚠ **一旦发现手臂自己往上飘 = 过补偿（正反馈），立刻按 0。**
+Safety: every tx_ratio starts at 0 (no compensation at all) and is raised by
+hand one step at a time, hard-capped at `--max-ratio`; `0` zeroes everything
+instantly, and exit always hands the leader back to position mode.
 """
 import argparse
 import logging
@@ -59,16 +33,24 @@ from lerobot.teleoperators.piper_leader import PiperLeader, PiperLeaderConfig
 
 logger = logging.getLogger(__name__)
 
-MOVE_M = 0x04  # MIT / 力矩透传模式的 mode_feed 取值
+MOVE_M = 0x04  # mode_feed value for MIT / torque pass-through mode
 N_JOINTS = 6
-# 低于这个值就认为「重力对该轴没有力臂」，此时下发 0 是正确结果而不是故障。
+# Below this, gravity has no moment arm about the axis: commanding 0 is correct.
 NO_LOAD_NM = 0.01
-# 腕部谐波减速器的静摩擦量级：下发力矩低于它，手上根本感觉不到补偿。
+# Stiction of the wrist harmonic drives: below this the operator feels nothing.
 STICTION_NM = 0.05
+
+# Printed to the operator before the loop starts; kept in Chinese like the rest of
+# this script's console output.
+KEY_HELP = """按键：
+    1-6   选中要调的关节        a   选中全部关节
+    +/=   选中项 tx_ratio +0.05    -/_  -0.05
+    0     全部归零（手臂重新变沉，等同于急停补偿）
+    q/Esc 退出并交还位置模式"""
 
 
 def _mode_feed(arm) -> tuple[int | None, str]:
-    """读回 mode_feed，返回 (整数值, 原始表示)。"""
+    """Read back mode_feed as (int value, raw repr)."""
     status = getattr(arm.GetArmStatus(), "arm_status", None)
     raw = getattr(status, "mode_feed", None)
     if raw is None:
@@ -90,7 +72,7 @@ def _efforts(arm) -> np.ndarray:
 
 
 def joint_verdict(g_i: float, commanded_i: float, mit_ok: bool) -> str:
-    """单个关节的判定。区分「本来就不该有力矩」和「补偿不足」。"""
+    """Per-joint verdict, separating "should be zero" from "under-compensated"."""
     if not mit_ok:
         return "❌ MIT 未挂上，指令被忽略"
     if abs(g_i) < NO_LOAD_NM:
@@ -111,7 +93,7 @@ def render(
     mit_ok: bool,
     selected: int | None,
 ) -> list[str]:
-    """组装要刷新的整块文本（每行一个关节）。"""
+    """Build the redrawn text block, one line per joint."""
     sel_txt = "全部" if selected is None else f"J{selected + 1}"
     lines = [
         f"MIT模式: {mode_txt:<14}选中: {sel_txt:<6}"
@@ -141,7 +123,7 @@ def probe(
             port=port,
             id="gravity_probe",
             require_calibration=False,
-            # 连上先别放软：由本脚本显式控制何时进重力补偿。
+            # Stay stiff on connect; this script decides when to go limp.
             manual_control=False,
             gravity_comp_tx_ratio=(0.0,) * N_JOINTS,
             gravity_comp_urdf=urdf,
@@ -158,11 +140,12 @@ def probe(
         print("[probe] 末端负载: 无。若主臂装了夹爪/示教手柄，腕部重力矩会被系统性"
               "低估，务必用 --payload-mass 或 --urdf 补上。")
     print()
-    print(__doc__.split("用法::")[1].split("⚠")[0].strip())
+    print(KEY_HELP)
     print("\n⚠ 先用手扶住主臂再开始。手臂自己往上飘 = 过补偿，立刻按 0。")
     input("按 Enter 开始（Ctrl-C 取消）...")
 
-    # tx_ratio 全 0 进入 MIT：位置环被释放但不给任何补偿力矩，等于「自由下垂」。
+    # Enter MIT with every tx_ratio at 0: position loop released, no compensating
+    # torque at all, i.e. free sag.
     leader.set_manual_control(True)
     loop = leader._gravity_comp_loop
     if loop is None:
@@ -170,7 +153,7 @@ def probe(
         return 1
 
     ratios = np.zeros(N_JOINTS, dtype=np.float64)
-    selected: int | None = None  # None = 全部关节
+    selected: int | None = None  # None = all joints
     keys = KeyboardEventListener()
     keys.start()
     if not keys.available:
@@ -182,8 +165,8 @@ def probe(
         while True:
             if keys.should_quit():
                 break
-            # 必须走 poll_extra()：should_quit() 内部的 _read_keys() 会把后端队列
-            # 一次抽干并分派到六个内置绑定上，`+` 不匹配任何一个就被丢掉。
+            # Must go through poll_extra(): should_quit() drains the backend queue
+            # into the six built-in bindings, and `+` matches none of them.
             for key in keys.poll_extra():
                 idx = slice(None) if selected is None else selected
                 if key in ("+", "="):
@@ -199,7 +182,7 @@ def probe(
                 elif key == "q":
                     raise KeyboardInterrupt
 
-            # 回路每一拍都重读这个属性，所以可以在线改。
+            # The loop re-reads this attribute every tick, so it is live-tunable.
             loop._tx_ratio = ratios.copy()
 
             q_rad, v_rad = loop._read_q_v()
@@ -210,7 +193,7 @@ def probe(
 
             lines = render(ratios, g, commanded, eff, mode_txt, mode_val == MOVE_M, selected)
             if n_lines:
-                print(f"\033[{n_lines}A", end="")  # 光标回到块首，原地刷新
+                print(f"\033[{n_lines}A", end="")  # cursor back to block start
             print("\n".join(f"{line:<78}" for line in lines), flush=True)
             n_lines = len(lines)
             time.sleep(dt)
@@ -232,7 +215,7 @@ def probe(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="主臂重力补偿实时探针（逐关节）")
-    parser.add_argument("--port", default="can_left_l", help="主臂 CAN 接口名")
+    parser.add_argument("--port", default="can_left_f", help="主臂 CAN 接口名")
     parser.add_argument("--step", type=float, default=0.05, help="每次 +/- 的步长")
     parser.add_argument("--max-ratio", type=float, default=1.2, help="tx_ratio 硬上限")
     parser.add_argument("--hz", type=float, default=20.0, help="刷新频率")
@@ -242,11 +225,11 @@ def main() -> int:
              "assets/piper_description/urdf/piper_description.urdf",
     )
     parser.add_argument(
-        "--payload-mass", type=float, default=0.0,
+        "--payload-mass", type=float, default=0.6,
         help="末端额外负载质量 kg（夹爪示教器 / 手柄 / 相机）",
     )
     parser.add_argument(
-        "--payload-com", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+        "--payload-com", type=float, nargs=3, default=[0.0, 0.0, 0.6],
         metavar=("X", "Y", "Z"), help="负载质心相对 joint6 坐标系的位置，单位 m",
     )
     args = parser.parse_args()

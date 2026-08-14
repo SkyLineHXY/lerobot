@@ -183,10 +183,11 @@ class _PynputBackend:
 
 
 def key_backend_candidates(backend: str = "auto") -> list:
-    """按 backend 名给出要依次尝试的后端实例。
+    """Backend instances to try in order, for a given backend name.
 
-    ``auto`` 优先 termios（要求 stdin 是真终端，好处是只有该终端有焦点时才收键），
-    退到 pynput 的全局 X11 钩子，代价是不管焦点在哪个窗口按键都算数。
+    ``auto`` prefers termios (needs stdin to be a real terminal; the upside is that
+    keys only register while that terminal has focus) and falls back to pynput's
+    global X11 hook, which counts keypresses regardless of which window has focus.
     """
     if backend not in ("auto", "termios", "pynput", "none"):
         raise ValueError(f"unknown keyboard backend {backend!r}; use auto/termios/pynput/none")
@@ -200,10 +201,11 @@ def key_backend_candidates(backend: str = "auto") -> list:
 
 
 def start_key_backend(backend: str = "auto"):
-    """挑一个可用的按键后端并启动它；都不可用时返回 None。
+    """Start the first usable key backend, or return None if none work.
 
-    两个使用方共用它：本模块的 :class:`KeyboardEventListener`，以及采集脚本里键位
-    完全不同的状态机 —— 共用的是"先试哪个后端、失败了怎么提示"，而不是键位表。
+    Shared by :class:`KeyboardEventListener` and the collection script's own state
+    machine, whose key bindings are completely different: what is shared is the
+    backend preference order and the failure message, not the key table.
     """
     for impl in key_backend_candidates(backend):
         if impl.start():

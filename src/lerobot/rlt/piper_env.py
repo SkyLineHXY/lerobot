@@ -33,9 +33,10 @@ logger = logging.getLogger(__name__)
 
 JOINT_ORDER = [f"joint_{i}.pos" for i in range(1, 8)]
 
-# 主臂（PiperLeader）与跟随臂（Piper）的键名约定不同：主臂沿用 PIPER_ACTION_KEYS，
-# 把夹爪叫 `gripper.pos`；跟随臂把夹爪当作第 7 个关节 `joint_7.pos`。两边的物理量
-# 完全一致（关节弧度 / 夹爪开度米），只是名字不同，所以只需要改名，不需要换算。
+# PiperLeader keeps PIPER_ACTION_KEYS and calls the gripper `gripper.pos`, while
+# the Piper follower treats it as a 7th joint `joint_7.pos`. The physical
+# quantities are identical (joint radians, gripper opening in metres), so this is
+# a rename, never a conversion.
 LEADER_KEY_FOR_FOLLOWER = {
     **{key: key for key in JOINT_ORDER[:6]},
     JOINT_ORDER[6]: "gripper.pos",
@@ -111,9 +112,6 @@ class JointSlewLimiter:
 
         limited, saturated = rate_limit_joints(target, self._prev_cmd, self.max_vel_rad_s * dt)
 
-        # Clamp the emitted command, not the anchor: clamping the anchor would still
-        # let one full step be added on top, so the lead would settle at
-        # max_lead_rad + max_vel_rad_s * dt instead of the bound we asked for.
         if self.max_lead_rad > 0:
             lead = limited[:6] - measured[:6]
             peak_lead = float(np.abs(lead).max()) if lead.size else 0.0
@@ -126,15 +124,6 @@ class JointSlewLimiter:
 
 
 def jitter_rms(traj: np.ndarray, dt: float) -> float:
-    """轨迹的抖动度量：二阶差分的 RMS，单位 rad/s²。
-
-    一阶差分是速度，正常运动本来就有，拿它衡量抖动会把"动得快"误判成"抖"。
-    二阶差分（加速度）才反映方向反复翻转的高频成分，也就是手上感觉到的抖。
-
-    分别对"下发指令"和"跟随臂实测"各算一次，两者的关系能直接定位责任方：
-    实测远大于指令 -> 跟随臂自己在振（该调 kp/kd 或换控制模式）；
-    两者相当且都高 -> 输入本身就抖（主臂那端的问题）。
-    """
     if traj.ndim != 2 or traj.shape[0] < 3:
         return float("nan")
     accel = np.diff(traj, n=2, axis=0) / (dt * dt)
@@ -173,21 +162,22 @@ def build_piper_cameras(specs, control_hz: float) -> dict:
 
 
 def leader_action_to_follower(raw: dict[str, float]) -> dict[str, float]:
-    """主臂动作 dict -> 跟随臂键名（joint_1..joint_7.pos）。"""
+    """Leader action dict -> follower key names (joint_1..joint_7.pos)."""
     missing = [k for k in LEADER_KEY_FOR_FOLLOWER.values() if k not in raw]
     if missing:
         raise KeyError(
-            f"主臂动作缺少键 {missing}；拿到的是 {sorted(raw)}。"
-            "PiperLeader 应返回 joint_1..joint_6.pos + gripper.pos。"
+            f"Leader action is missing {missing}; got {sorted(raw)}. "
+            "PiperLeader should return joint_1..joint_6.pos + gripper.pos."
         )
     return {follower: raw[leader] for follower, leader in LEADER_KEY_FOR_FOLLOWER.items()}
 
 
 def follower_action_to_leader(action: dict[str, float]) -> dict[str, float]:
-    """跟随臂关节 dict -> 主臂键名（joint_1..joint_6.pos + gripper.pos）。
+    """Follower joint dict -> leader key names (joint_1..joint_6.pos + gripper.pos).
 
-    交接回位时必须带上 `gripper.pos`，否则 `PiperLeader.send_feedback` 会静默跳过
-    夹爪，主臂夹爪停在人松手时的开度上。
+    `gripper.pos` must be included when handing control back, or
+    `PiperLeader.send_feedback` silently skips the gripper and the leader's stays
+    at whatever opening the operator let go at.
     """
     return {leader: action[follower] for follower, leader in LEADER_KEY_FOR_FOLLOWER.items()}
 

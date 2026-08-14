@@ -1,36 +1,32 @@
-"""只做遥操作的 HIL 链路验证脚本：不训练、不加载 VLA、不写数据集。
-用途是在跑 `train_online.py` 之前，单独回答两个问题：
-1. **实时性够不够？** 重力补偿主臂 -> 跟随臂这条链路每一拍花在哪：主臂 CAN 读数、
-   跟随臂观测（含相机 `async_read`）、限速换算、`send_action` 下发。逐项统计
-   p50/p95/p99/max，并统计错拍率（单拍耗时超过 1/control_hz 的比例）。
-   再用互相关估计端到端跟随延迟（主臂指令 -> 跟随臂实际到位）。
+"""Teleoperation-only HIL link check: no training, no VLA, no dataset writes.
 
-2. **流程对不对？** 复用 `train_online.py` 真机干预路径上的**同一批**函数
-   （`leader_action_to_follower` / `rate_limit_joints` / `KeyboardEventListener`），
-   所以这里跑通就等于那条路径的键名映射、限速、按键语义、主从对齐都是对的。
-   给了 `--rl_token` 还会顺带验证归一化往返：人的关节读数经阶段 1 的
-   normalizer 正/反变换后能否原样回来 —— 这是干预动作能否落在策略动作空间里
-   的前提。
-典型用法:
-    # 1) 空跑：只读不下发，先看链路耗时和主臂读数是否正常
+Run this before `train_online.py` to answer two questions separately from RL:
+
+1. Is the loop fast enough? Per-tick timing of leader CAN read, follower
+   observation (camera `async_read` included), rate limiting and `send_action`,
+   reported as p50/p95/p99/max plus the overrun rate, and an end-to-end
+   follow lag estimated by time-shifting the command against the measurement.
+2. Is the plumbing right? It calls the *same* functions the real-robot
+   intervention path uses (`leader_action_to_follower`, `rate_limit_joints`,
+   `KeyboardEventListener`), so a clean run here means key mapping, rate
+   limiting, key semantics and leader/follower alignment are all correct there
+   too. With `--rl_token` it also round-trips joint readings through the
+   stage-1 normalizer, which is what decides whether human corrections land
+   inside the policy's action space at all.
+
+    # dry run: read only, never command the follower
     python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml \
         --dry_run=true
-
-    # 2) 真实跟随：按空格握住主臂开始拖动，再按空格交还
     python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml
-
-    # 3) 连带验证阶段 1 归一化边界
     python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml \
         --rl_token=outputs/rl_token
 
-按键与 `train_online.py` 完全一致：空格切换接管、s/f 打成功/失败标签、
-← 打一个分段标记、Esc 结束。
+Keys match `train_online.py`: space toggles takeover, s/f label success/failure,
+left arrow marks a segment, Esc ends the run.
 """
-# 注意：这里**不能**加 `from __future__ import annotations`。
-# `lerobot.configs.parser.wrap()` 是直接读 `inspect.getfullargspec(fn).annotations`
-# 取配置类的，PEP 563 会把注解变成字符串，draccus 就会收到 "TeleopCheckConfig"
-# 而不是那个 dataclass，报 "must be called with a dataclass type or instance"。
-# 仓库里所有 @parser.wrap() 的入口脚本都遵守这一点。
+# No `from __future__ import annotations` here: `lerobot.configs.parser.wrap()`
+# reads `inspect.getfullargspec(fn).annotations`, and PEP 563 would hand draccus
+# the string "TeleopCheckConfig" instead of the dataclass.
 import json
 import logging
 import time
@@ -53,8 +49,8 @@ from lerobot.utils.robot_utils import precise_sleep
 
 logger = logging.getLogger(__name__)
 
-# 抖动的可察觉量级 (rad/s²)。参考：30Hz 下 ±0.002 rad 的交替振荡约 7 rad/s²，
-# 那已经是手上摸得到、耳朵听得见的嗡鸣。低于这个值就没必要再追责到哪一侧。
+# Jitter you can feel by hand (rad/s^2): at 30 Hz a +-0.002 rad alternating
+# oscillation is ~7, and that already hums audibly. Below this, stop blaming sides.
 JITTER_NOTICEABLE = 5.0
 
 
@@ -62,38 +58,47 @@ JITTER_NOTICEABLE = 5.0
 class LeaderCheckConfig:
     port: str = "can1"
     id: str = "piper_leader"
-    # 与 PiperLeaderTeleopConfig 同义：默认读绝对关节角，而不是标定偏移
+    # Same meaning as PiperLeaderTeleopConfig: read absolute joint angles rather
+    # than calibrated offsets.
     use_calibrated_offsets: bool = False
-    # 校验脚本默认不强制标定，避免连上就掉进交互式标定流程
+    # Off by default so connecting does not drop into interactive calibration.
     require_calibration: bool = False
-    # 主从关节差超过这个值就拒绝接管（0 表示不检查）
+    # Refuse takeover past this leader/follower gap (0 disables the check).
     max_takeover_delta_rad: float = 0.15
 
-    # ---- 重力补偿参数 ----
-    # 这些直通 PiperLeaderConfig。必须能从 yaml 调，否则"主臂拖不动"时无从下手：
-    # tx_ratio 是唯一按手感标定的系数，而 base_rpy_deg 决定 g(q) 算得对不对。
+    # Gravity compensation, passed straight through to PiperLeaderConfig. These
+    # must be reachable from yaml: tx_ratio is the only coefficient calibrated by
+    # feel, and base_rpy_deg decides whether g(q) is computed in the right frame
+    # at all.
     #
-    # tx_ratio：RNEA 算出的关节力矩 -> SDK MIT 力矩单位的比例，同时兼作降额。
-    # Piper 默认 0.2，即只补偿约两成自重 —— 手感会接近"完全没补偿"。往上调到手臂
-    # 托得住又不上飘为止；**发现手臂自己往上走就是过补偿，立刻降**。
+    # tx_ratio scales RNEA joint torques into SDK MIT torque units and doubles as
+    # a derating factor. Piper's 0.2 default compensates ~20% of the arm's weight,
+    # which feels like no compensation. Raise it until the arm holds itself up;
+    # if it starts drifting *upwards* that is over-compensation — lower it now.
     gravity_comp_tx_ratio: list[float] = field(
         default_factory=lambda: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
     )
-    # 安装姿态。侧装/斜装不设这个，重力矢量就转不到基座系，g(q) 整个是错的。
+    # Mounting attitude. Without it a side/tilted mount never rotates gravity into
+    # the base frame and every g(q) is wrong.
     gravity_comp_base_rpy_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
-    # 单关节力矩上限（SDK t_ref 硬件范围 ±18 N·m）。实测本体重力矩峰值约 3.3 N·m，
-    # 所以 8.0 平时不会触发，是防 URDF 写错 / NaN 的兜底。
+    # Per-joint torque cap (SDK t_ref hardware range +-18 N*m). Measured peak
+    # self-weight torque is ~3.3 N*m, so 8.0 never trips in normal use — it only
+    # guards against a broken URDF or a NaN.
     gravity_comp_torque_limit: float = 8.0
-    # kp 必须保持 0：pos_ref 恒为 0，kp>0 会把主臂往零位拽。抖动只调 kd（纯阻尼）。
+    # kp must stay 0: pos_ref is always 0, so kp > 0 drags the leader toward zero.
+    # Tune jitter with kd (pure damping) only.
     gravity_comp_mit_kp: float = 0.0
     gravity_comp_mit_kd: float = 0.0
     gravity_comp_control_hz: float = 200.0
-    # 重力模型用的 URDF。null 用内置的 piper_no_gripper_description.urdf（腕部不带
-    # 任何东西）。末端装了夹爪就换成 assets/piper_description/urdf/piper_description.urdf。
+    # URDF for the gravity model. null uses the built-in
+    # piper_no_gripper_description.urdf (nothing on the wrist); with a gripper
+    # fitted, switch to assets/piper_description/urdf/piper_description.urdf.
     gravity_comp_urdf: str | None = None
-    # 末端额外负载（示教手柄 / 相机等），kg 与 m，相对 joint6 坐标系。
-    # 内置 URDF 腕部为空，末端真有负载而模型没有，腕部重力矩会被系统性低估，
-    # 表现就是"腕部没有重力补偿"，而且调 tx_ratio 补不回来。
+    # Extra end-effector payload (teach handle, camera) in kg and m, relative to
+    # the joint6 frame. The built-in URDF has an empty wrist, so a real payload
+    # the model does not know about systematically underestimates wrist gravity
+    # torque — it presents as "the wrist has no compensation" and no amount of
+    # tx_ratio tuning fixes it.
     gravity_comp_payload_mass: float = 0.0
     gravity_comp_payload_com: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
@@ -115,39 +120,42 @@ class TeleopCheckConfig:
 
     control_hz: float = 30.0
     duration_s: float = 30.0
-    # 与 PiperEnvConfig 保持一致：反归一化后的每步关节限速
+    # Matches PiperEnvConfig: per-step joint rate limit after un-normalisation.
     max_joint_step_rad: float = 0.5
 
-    # 相机是控制回路里最贵的一环，必须计入实时性预算。留空则沿用 PIPERConfig
-    # 自带的相机；`use_cameras=false` 可以关掉相机单独看机械臂链路。
+    # Cameras are the most expensive part of the control loop and must count
+    # against the real-time budget. Empty keeps PIPERConfig's own cameras;
+    # `use_cameras=false` isolates the arm link.
     cameras: list[CameraCheckSpec] = field(default_factory=list)
     use_cameras: bool = True
 
-    # 只读不下发。第一次上机永远先用它。
+    # Read only, never command. Always the first run on real hardware.
     dry_run: bool = False
     engage_on_start: bool = False
-    # 对齐后等主臂真正走到跟随臂位姿的时间上限。JointCtrl 是异步的，不等就按空格
-    # 会被接管安全门拒掉，现象是"按了空格主臂没松开"。
+    # Time budget for the leader to actually reach the follower's pose after
+    # alignment. JointCtrl is asynchronous; pressing space before it arrives is
+    # rejected by the takeover safety gate and looks like "space did nothing".
     align_settle_s: float = 2.0
 
-    # 按键后端：auto（stdin 是终端就用 termios，否则退到 pynput 全局钩子）/
-    # termios / pynput / none。IDE 控制台里 stdin 是管道，auto 会自动落到 pynput。
+    # auto (termios when stdin is a real terminal, else pynput's global X11 hook)
+    # / termios / pynput / none. In an IDE console stdin is a pipe, so auto falls
+    # back to pynput.
     keyboard_backend: str = "auto"
 
-    # 给了阶段 1 输出目录就额外验证归一化往返
+    # Pointing at a stage-1 output directory also checks the normalisation
+    # round-trip.
     rl_token: str | None = None
     device: str = "cpu"
 
     out: str = "outputs/teleop_check"
 
 
-# --------------------------------------------------------------------- 统计
 def _pct(values: list[float], q: float) -> float:
     return float(np.percentile(values, q)) if values else float("nan")
 
 
 def _stats_ms(values: list[float]) -> dict[str, float]:
-    """把一列秒转成毫秒统计量。"""
+    """Seconds -> millisecond summary statistics."""
     if not values:
         return {}
     arr = np.asarray(values) * 1e3
@@ -163,16 +171,17 @@ def _stats_ms(values: list[float]) -> dict[str, float]:
 def estimate_tracking_lag(
     cmd: np.ndarray, meas: np.ndarray, max_lag: int
 ) -> tuple[int, float]:
-    """用最小 RMSE 的时移估计端到端跟随延迟。
+    """End-to-end follow lag as the time shift minimising RMSE.
 
-    `cmd[k]` 是第 k 拍下发的关节目标，`meas[k]` 是同一拍读到的实际关节角。真实
-    机械臂总是滞后若干拍，所以把 meas 相对 cmd 前移 lag 拍后误差最小的那个 lag
-    就是延迟估计。返回 (lag 拍数, 该 lag 下的 RMS 误差 rad)。
+    `cmd[k]` is the joint target sent on tick k, `meas[k]` the angle read on the
+    same tick. A real arm always trails by some ticks, so the shift that best
+    aligns them is the lag estimate. Returns (lag in ticks, RMS error in rad).
 
-    只有操作员真的拖动过主臂时才有意义：指令几乎不动的话所有 lag 的误差都一样。
+    Only meaningful once the operator has actually moved the leader: with a
+    near-constant command every lag scores the same.
 
-    搜索范围会被压到样本数的 1/4 以内：接管时间短的时候宁可给出一个保守的估计，
-    也好过因为窗口不够直接放弃测量。
+    The search is capped at a quarter of the sample count — with a short takeover
+    a conservative estimate beats refusing to measure at all.
     """
     max_lag = min(max_lag, len(cmd) // 4)
     if len(cmd) < 20 or max_lag < 1:
@@ -187,9 +196,8 @@ def estimate_tracking_lag(
     return best_lag, best_rmse
 
 
-# ------------------------------------------------------------------ 主流程
 class TeleopChecker:
-    """连接主臂 + 跟随臂，按 control_hz 跑遥操作并全程打点。"""
+    """Connect leader + follower, run teleoperation at control_hz and time every step."""
 
     def __init__(self, cfg: TeleopCheckConfig):
         self.cfg = cfg
@@ -199,14 +207,14 @@ class TeleopChecker:
         self.leader = None
         self.normalizer = None
 
-        # 打点缓冲
+        # Timing buffers
         self.t_leader: list[float] = []
         self.t_obs: list[float] = []
         self.t_map: list[float] = []
         self.t_write: list[float] = []
         self.t_norm: list[float] = []
-        self.t_busy: list[float] = []  # 一拍里除 sleep 外的总耗时
-        self.t_loop: list[float] = []  # 实际周期
+        self.t_busy: list[float] = []  # per-tick time excluding sleep
+        self.t_loop: list[float] = []  # measured period
         self.saturated: list[bool] = []
         self.stale_leader: list[bool] = []
         self.cmd_hist: list[np.ndarray] = []
@@ -219,7 +227,6 @@ class TeleopChecker:
         self.n_engaged_steps = 0
         self.n_refused = 0
 
-    # ------------------------------------------------------------- 连接
     def connect(self) -> None:
         from lerobot.robots.piper.config_piper import PIPERConfig
         from lerobot.robots.piper.piper import Piper
@@ -262,8 +269,9 @@ class TeleopChecker:
             f"limit={lead.gravity_comp_torque_limit}N·m "
             f"kp={lead.gravity_comp_mit_kp} kd={lead.gravity_comp_mit_kd}"
         )
-        # 重力模型带没带末端负载必须打出来。整类"腕部没有补偿"的故障，根因就是模型
-        # 里静默地少了夹爪/示教器，而日志里看不出来 —— 所以这里要说清楚。
+        # Whether the gravity model carries a payload has to be printed: an entire
+        # class of "the wrist has no compensation" faults comes down to the model
+        # silently missing the gripper or teach handle, invisible in the logs.
         print(f"[check]   重力模型: {lead.gravity_comp_urdf or '内置 piper_no_gripper_description.urdf'}")
         if lead.gravity_comp_payload_mass > 0:
             print(
@@ -286,7 +294,7 @@ class TeleopChecker:
             self._load_normalizer()
 
     def _load_normalizer(self) -> None:
-        """加载阶段 1 的 preprocessor，取出动作 normalizer 用于往返验证。"""
+        """Load the stage-1 preprocessor and pull out its action normalizer."""
         from lerobot.policies.rlt import load_stage1_processors
         from lerobot.rlt.piper_env import _find_action_normalizer
 
@@ -297,7 +305,6 @@ class TeleopChecker:
         else:
             print(f"[check] 已加载阶段 1 归一化 ({self.cfg.rl_token})")
 
-    # --------------------------------------------------------- 读写原语
     def read_leader(self) -> dict[str, float]:
         raw = (
             self.leader.get_action()
@@ -312,11 +319,14 @@ class TeleopChecker:
         return obs, joints
 
     def align(self, settle_s: float = 0.0) -> None:
-        """把主臂拉回命令模式并对到跟随臂当前位姿 —— 与干预路径的 `_exit` 同构。
+        """Put the leader back in command mode and onto the follower's pose.
 
-        `send_feedback` 下发的 JointCtrl 是**异步**的：命令发出去主臂才开始走。
-        不等它到位就按空格，接管安全门会拿一个还没收敛的主从差去比，于是把接管
-        拒掉 —— 现象就是"按了空格主臂却没松开"。`settle_s > 0` 时轮询等待到位。
+        Mirrors `_exit` on the intervention path. The JointCtrl that
+        `send_feedback` issues is *asynchronous* — the leader only starts moving
+        after the command lands. Pressing space before it arrives makes the
+        takeover gate compare an unconverged leader/follower gap and refuse, which
+        looks like "space did not release the leader". `settle_s > 0` polls until
+        it has arrived.
         """
         _obs, joints = self.read_follower()
         action = dict(zip(JOINT_ORDER, joints.tolist(), strict=True))
@@ -350,7 +360,6 @@ class TeleopChecker:
     def leader_timestamp(self) -> float:
         return float(getattr(self.leader.arm.GetArmJointMsgs(), "time_stamp", 0.0) or 0.0)
 
-    # ------------------------------------------------------------- 主循环
     def run(self) -> None:
         cfg = self.cfg
         print(
@@ -358,16 +367,19 @@ class TeleopChecker:
             f"[check] 目标 {cfg.control_hz:.0f} Hz，时长 {cfg.duration_s:g}s，"
             f"{'DRY-RUN（不下发）' if cfg.dry_run else '真实下发'}\n"
         )
-        # 先对齐再进裸终端：对齐可能要等主臂使能，不该被按键监听打断
+        # Align before going raw-terminal: alignment may wait on the leader being
+        # enabled, and the key listener must not interrupt that.
         self.align(settle_s=cfg.align_settle_s)
 
-        # engage_on_start 必须去播种按键监听器的 toggle，而不是直接调
-        # set_manual_control(True)：toggle 才是主循环每一拍读的状态，绕过它安排的
-        # 接管会在下一拍被 `prev_engaged and not engaged` 判成"松手"而立刻撤销 ——
-        # 重力补偿刚开起来就被关掉，整场一拍都接管不了。
+        # engage_on_start has to seed the listener's toggle rather than call
+        # set_manual_control(True): the toggle is what the loop reads each tick, so a
+        # takeover arranged behind its back reads as `prev_engaged and not engaged`
+        # on the next tick and is cancelled immediately — gravity compensation comes
+        # up and is switched straight back off.
         if cfg.engage_on_start:
             self.keys.set_intervening(True)
-        # 从"未接管"起步，让首次接管照常走 _on_engage()（含主从对齐安全门）。
+        # Start disengaged so the first takeover goes through _on_engage() and its
+        # alignment safety gate like any other.
         prev_engaged = False
         last_ts = self.leader_timestamp()
 
@@ -386,7 +398,7 @@ class TeleopChecker:
                     self._on_disengage()
                 prev_engaged = engaged
 
-                # 1) 主臂读数
+                # 1) leader reading
                 t0 = time.perf_counter()
                 leader_action = self.read_leader()
                 self.t_leader.append(time.perf_counter() - t0)
@@ -395,29 +407,29 @@ class TeleopChecker:
                 self.stale_leader.append(ts <= last_ts)
                 last_ts = ts
 
-                # 2) 跟随臂观测（含相机），与训练时的观测开销一致
+                # 2) follower observation (cameras included), same cost as training
                 t0 = time.perf_counter()
                 _obs, measured = self.read_follower()
                 self.t_obs.append(time.perf_counter() - t0)
 
-                # 3) 换算 + 限速
                 t0 = time.perf_counter()
                 target = np.array([leader_action[k] for k in JOINT_ORDER], dtype=np.float32)
                 limited, saturated = rate_limit_joints(target, measured, cfg.max_joint_step_rad)
                 self.t_map.append(time.perf_counter() - t0)
-                # 只在接管期间统计限速饱和：没接管时不下发动作，跟随臂不会向主臂
-                # 靠拢，主从差会一直挂着，饱和率恒等于 100% —— 那是记账假象，
-                # 不是"跟随臂追不上人手"。
+                # Only count rate-limit saturation while engaged. Disengaged, no
+                # action is sent, so the follower never closes on the leader and the
+                # gap keeps saturating at 100% — an accounting artefact, not the
+                # follower failing to keep up.
                 if engaged:
                     self.saturated.append(bool(saturated))
 
-                # 4) 下发
+                # 4) send
                 t0 = time.perf_counter()
                 if engaged and not cfg.dry_run:
                     self._send_to_follower(limited)
                 self.t_write.append(time.perf_counter() - t0)
 
-                # 5) 归一化往返（可选）
+                # 5) normalisation round-trip (optional)
                 if self.normalizer is not None:
                     self._check_normalization(target)
 
@@ -438,7 +450,10 @@ class TeleopChecker:
                 self.align()
 
     def _on_engage(self) -> bool:
-        """空格按下：检查主从对齐后再释放主臂。返回是否真的进入接管。"""
+        """Space pressed: check alignment before releasing the leader.
+
+        Returns whether the takeover actually started.
+        """
         delta = self.takeover_delta()
         self.takeover_deltas.append(delta)
         limit = self.cfg.leader.max_takeover_delta_rad
@@ -449,8 +464,9 @@ class TeleopChecker:
                 "已重新对齐，把主臂放回机器人位姿后再按空格。"
             )
             self.keys.clear_intervention()
-            # 这里等主臂真正回到位再返回：否则操作员立刻再按一次空格，比的还是
-            # 那个没收敛的差值，又被拒一次。（松手交还的路径不能等，会卡住控制回路。）
+            # Wait for the leader to arrive before returning: otherwise the next
+            # space press compares the same unconverged gap and is refused again.
+            # (The disengage path must *not* wait — it would stall the control loop.)
             self.align(settle_s=self.cfg.align_settle_s)
             return False
         print(f"\n[check] 接管开始（主从差 {delta:.4f} rad）")
@@ -463,7 +479,7 @@ class TeleopChecker:
         print(f"[check] 交还主臂，对齐耗时 {1e3 * (time.perf_counter() - t0):.0f} ms")
 
     def _check_normalization(self, joints: np.ndarray) -> None:
-        """人的关节读数经归一化正反变换后能否原样回来。"""
+        """Does a human joint reading survive a normalize/un-normalize round trip?"""
         import torch
 
         t0 = time.perf_counter()
@@ -485,7 +501,6 @@ class TeleopChecker:
             self.n_marks += 1
             print("[check] 标记 (←)")
 
-    # ---------------------------------------------------------------- 报告
     def report(self) -> dict:
         cfg = self.cfg
         n = len(self.t_loop)
@@ -557,11 +572,11 @@ class TeleopChecker:
         return rep
 
     def _verdicts(self, rep: dict) -> list[dict]:
-        """把原始数字翻译成"这条链路能不能用"的判断。"""
+        """Turn the raw numbers into a per-item "is this link usable" verdict."""
         v: list[dict] = []
 
         def add(name: str, ok: bool | None, detail: str) -> None:
-            # ok=None 表示"这项没被验证到"，和"验证不通过"必须区分开
+            # ok=None means "not exercised", which must stay distinct from "failed"
             status = "WARN" if ok is None else ("PASS" if ok else "FAIL")
             v.append({"check": name, "status": status, "detail": detail})
 
@@ -599,16 +614,18 @@ class TeleopChecker:
         if not np.isfinite(meas_j):
             add("跟随臂抖动", None, "接管样本不足，无法评估")
         elif meas_j < JITTER_NOTICEABLE:
-            # 先过绝对阈值：指令本身几乎不抖时（匀速拖动）比值会爆到几万倍，
-            # 拿它下结论只会制造假阳性。抖动小就是小，不必再看比值。
+            # Absolute threshold first: with a smooth drag the command barely
+            # jitters, so the ratio explodes into the thousands and only produces
+            # false positives. Small jitter is small; the ratio adds nothing.
             add(
                 "跟随臂抖动",
                 True,
                 f"实测 {meas_j:.2f} rad/s²，低于可察觉量级 {JITTER_NOTICEABLE:.0f}",
             )
         else:
-            # 过了阈值才追责：实测远大于指令 = 跟随臂自己在振；两者相当 = 输入本身
-            # 就抖（主臂那端）。这一区分决定该去调哪一侧。
+            # Only past the threshold is blame worth assigning: measured >> command
+            # means the follower is ringing on its own; comparable values mean the
+            # input itself is jittery (the leader side). That decides which end to fix.
             ratio = meas_j / cmd_j if np.isfinite(cmd_j) and cmd_j > 1e-6 else float("inf")
             blames_follower = ratio > 2.0
             if blames_follower:
@@ -664,11 +681,11 @@ class TeleopChecker:
         return v
 
     def close(self) -> None:
-        """关机路径不允许抛异常。
+        """Teardown must never raise.
 
-        `check()` 在 `finally` 里调用它，所以这里冒出来的任何异常都会顶掉
-        `connect()` / `run()` 真正的那个错误 —— 上机排障时看到的就会是一个
-        无关的收尾异常。逐段兜住并记录，让原始错误活着传出去。
+        `check()` calls this from a `finally`, so anything escaping here masks the
+        real `connect()` / `run()` failure and hardware debugging ends up chasing an
+        unrelated shutdown error. Guard and log each step so the original survives.
         """
         if self.leader is not None and getattr(self.leader, "is_connected", False):
             try:
