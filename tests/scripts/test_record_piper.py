@@ -240,6 +240,18 @@ class FakeArmPair:
         self.leader_joints = np.arange(7, dtype=np.float32) * 0.1
         self.follower_joints = np.zeros(7, dtype=np.float32)
         self.sent: list[np.ndarray] = []
+        self._last_leader_ts = -1.0
+        self.limiter = None
+
+    def configure_limiter(self, teleop):
+        from lerobot.rlt.piper_env import JointSlewLimiter
+
+        self.limiter = JointSlewLimiter(
+            max_vel_rad_s=teleop.max_joint_vel_rad_s, max_lead_rad=teleop.max_lead_rad
+        )
+
+    def leader_timestamp(self):
+        return 1.0
 
     def read_leader(self):
         return dict(zip(JOINT_ORDER, self.leader_joints.tolist(), strict=True))
@@ -258,13 +270,24 @@ def _recorder(monkeypatch, cfg):
     return rec
 
 
-def _cfg(n_arms=1, cameras=(), subtasks=None, **collection_kw):
+def _cfg(n_arms=1, cameras=(), subtasks=None, max_joint_vel_rad_s=6.0, **collection_kw):
     return RecordPiperConfig(
         arms=[ArmSpec(name=f"a{i}") for i in range(n_arms)],
+        teleop=rp.TeleopSpec(max_joint_vel_rad_s=max_joint_vel_rad_s, max_lead_rad=0.0),
         dataset=rp.DatasetSpec(subtasks=subtasks if subtasks is not None else {"1": "grab"}),
         collection=CollectionSpec(**collection_kw),
         cameras=list(cameras),
     )
+
+
+def _step_all(rec, dt=1 / 30):
+    """跑一拍所有臂，返回拼接后的 (state, action) —— 等价于旧的 step_arms()。"""
+    measured, limited = [], []
+    for pair in rec.pairs:
+        m, c = rec.step_arm(pair, dt)
+        measured.append(m)
+        limited.append(c)
+    return np.concatenate(measured), np.concatenate(limited)
 
 
 def test_frame_keys_match_the_schema_exactly(monkeypatch):
@@ -317,11 +340,11 @@ def test_dual_arm_joint_names_and_dims(monkeypatch):
 
 
 def test_dual_arm_state_keeps_left_before_right(monkeypatch):
-    rec = _recorder(monkeypatch, _cfg(n_arms=2, max_joint_step_rad=10.0))
+    rec = _recorder(monkeypatch, _cfg(n_arms=2, max_joint_vel_rad_s=300.0))
     rec.pairs[0].follower_joints = np.full(7, 1.0, dtype=np.float32)
     rec.pairs[1].follower_joints = np.full(7, 2.0, dtype=np.float32)
 
-    state, _action = rec.step_arms()
+    state, _action = _step_all(rec)
     assert state.shape == (14,)
     assert state[:7] == pytest.approx([1.0] * 7)
     assert state[7:] == pytest.approx([2.0] * 7)
@@ -330,25 +353,25 @@ def test_dual_arm_state_keeps_left_before_right(monkeypatch):
 # ------------------------------------------------------------------ 限速
 def test_action_records_the_rate_limited_target(monkeypatch):
     """记的必须是真正下发出去的目标，否则「动作 → 下一帧状态」在数据里对不上。"""
-    rec = _recorder(monkeypatch, _cfg(max_joint_step_rad=0.01))
+    rec = _recorder(monkeypatch, _cfg(max_joint_vel_rad_s=0.3))
     rec.pairs[0].leader_joints = np.full(7, 1.0, dtype=np.float32)
     rec.pairs[0].follower_joints = np.zeros(7, dtype=np.float32)
 
-    _state, action = rec.step_arms()
+    _state, action = _step_all(rec)
     assert action[:6] == pytest.approx([0.01] * 6)
     np.testing.assert_allclose(rec.pairs[0].sent[0], action)
     assert rec._saturated == [True]
 
 
 def test_dry_run_sends_nothing(monkeypatch):
-    rec = _recorder(monkeypatch, _cfg(dry_run=True, max_joint_step_rad=10.0))
-    rec.step_arms()
+    rec = _recorder(monkeypatch, _cfg(dry_run=True, max_joint_vel_rad_s=300.0))
+    _step_all(rec)
     assert rec.pairs[0].sent == []
 
 
 def test_saturation_is_not_flagged_when_within_the_limit(monkeypatch):
-    rec = _recorder(monkeypatch, _cfg(max_joint_step_rad=10.0))
-    rec.step_arms()
+    rec = _recorder(monkeypatch, _cfg(max_joint_vel_rad_s=300.0))
+    _step_all(rec)
     assert rec._saturated == [False]
 
 
@@ -483,8 +506,11 @@ def _send_pair():
     pair.can_mit_flag = 0xAD
     pair.mode_refresh_interval_s = 1.0
     pair.gripper_deadband = 200
+    # 这些 send 测试关注的是模式帧/夹爪帧的省帧逻辑，关节死区设 0 免得挡住 JointCtrl
+    pair.joint_deadband_rad = 0.0
     pair._last_mode_refresh = -1e9
     pair._last_gripper = None
+    pair._last_joints = None
     return pair, sdk
 
 
@@ -524,3 +550,39 @@ def test_tiny_gripper_jitter_does_not_burn_a_can_frame():
     jitter[6] = 1e-5  # 0.00001 m，远小于死区
     pair.send(jitter)
     assert sdk.calls.count("GripperCtrl") == 1
+
+
+def test_joint_deadband_skips_can_frames_for_leader_tremor():
+    """主臂静止时的游走不该变成 JointCtrl 帧。
+
+    主臂在 kp=kd=0 的纯力矩重力补偿下是无阻尼自由体，读数一直小幅游走。位置模式下
+    每条 JointCtrl 都让从臂内部轨迹发生器重新起步一次，噪声级的目标同样会抖。
+    """
+    pair, sdk = _send_pair()
+    pair.joint_deadband_rad = 0.01
+
+    base = np.zeros(7, dtype=np.float32)
+    pair.send(base)
+    assert sdk.calls.count("JointCtrl") == 1
+
+    for _ in range(5):
+        noisy = base.copy()
+        noisy[0] = 0.003  # 死区以内
+        pair.send(noisy)
+    assert sdk.calls.count("JointCtrl") == 1, "死区内的抖动不该占 CAN 帧"
+
+    moved = base.copy()
+    moved[0] = 0.05
+    pair.send(moved)
+    assert sdk.calls.count("JointCtrl") == 2, "超出死区必须下发"
+
+
+def test_zero_joint_deadband_sends_every_tick():
+    """死区设 0 时行为与改造前一致，便于回退对照。"""
+    pair, sdk = _send_pair()
+    pair.joint_deadband_rad = 0.0
+    for i in range(3):
+        joints = np.zeros(7, dtype=np.float32)
+        joints[0] = 1e-9 * i
+        pair.send(joints)
+    assert sdk.calls.count("JointCtrl") == 3

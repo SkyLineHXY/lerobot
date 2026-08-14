@@ -60,9 +60,23 @@ dataset:
     '7': 'discard the tested blood sample into the waste bin.'
     '8': 'return the robotic arm to the home position.'
 
+# ── 遥操作（从臂指令下发）──────────────────────────────────────────────
+# 每条臂一个线程、各自由自己的主臂新样本驱动，与 dataset.fps 无关。
+# 双臂把 fps 降到 25 是为了扛住写盘负载，指令频率不再受它影响（以前 fps 一降
+# 指令周期就从 33ms 涨到 40ms，双臂反而比单臂更顿）。
+teleop:
+  enabled: true
+  max_hz: 250.0
+  idle_poll_s: 0.001
+  # 与单臂取同一量级。旧的 max_joint_step_rad=0.05 @25Hz 只有 1.25 rad/s，
+  # 正常示教就会持续饱和 —— 那是设计出来的滞后，不是安全裕度。
+  max_joint_vel_rad_s: 6.0
+  max_lead_rad: 0.5
+  # 双臂 4 个 CAN 接口合计约 12300 帧/秒全在 Python 里解析，过滤后约减半
+  can_filters: true
+
 collection:
   max_timesteps: 10000
-  max_joint_step_rad: 0.05
   use_back_event: true
   dry_run: false
 

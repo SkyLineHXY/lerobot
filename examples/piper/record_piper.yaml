@@ -23,7 +23,7 @@ arms:
     require_calibration: false
 
     # 主臂重力补偿参数
-    gravity_comp_tx_ratio: [0.55, 0.95, 1.02, 1.2, 1.2, 0.5]
+    gravity_comp_tx_ratio: [0.55, 0.95, 0.98, 1.2, 1.2, 0.5]
     gravity_comp_base_rpy_deg: [0.0, 0.0, 0.0]
     gravity_comp_torque_limit: 8.0
     gravity_comp_mit_kp: 0.0
@@ -47,8 +47,6 @@ dataset:
   streaming_encoding: true
   encoder_threads: 4
   data_flush_every: 10        # 每 N 集把 parquet footer 落盘
-  # 写帧线程的排队上限。结束时打印的「写帧队列峰值」持续接近它，说明视频编码
-  # 跟不上采集速度，该降分辨率或换更快的 video_codec。
   writer_queue_maxsize: 90
 
   subtasks:
@@ -56,39 +54,46 @@ dataset:
     '2': 'align it with the socket.'
     '3': 'insert and release.'
 
+# ── 遥操作（从臂指令下发）──────────────────────────────────────────────
+# 频率与 dataset.fps 无关：那是数据集帧率，这里才是控制频率。
+# 位置模式下每条指令是一个位置阶跃，阶跃幅度正比于指令周期 —— 周期越短越接近
+# 连续跟随，这就是「一顿一顿」的根治办法。由主臂新样本驱动，稳态约 188Hz。
+teleop:
+  enabled: true
+  max_hz: 250.0
+  idle_poll_s: 0.001
+  # 关节速度上限。职责是兜住异常（主臂被撞、读数跳变），不是日常压抖。
+  # 用 teleop_check 的 ratelimit_saturation_rate 校准：正常示教应接近 0。
+  max_joint_vel_rad_s: 6.0
+  # 指令允许领先实测位姿的最大量：从臂被卡住时防指令跑飞
+  max_lead_rad: 0.5
+  # CAN 内核过滤，只保留真正会读的报文 ID（从臂 5 个、主臂 11 个）。
+  # 实测单臂 3200 -> 1000 帧/秒，直接减掉 SDK 解析线程的 GIL 占用。
+  can_filters: true
+
 # ── 采集 ───────────────────────────────────────────────────────────────
 collection:
-  max_timesteps: 10000        # 单集帧数上限，到顶自动暂停（不自动保存）
-  max_joint_step_rad: 0.4    # 每拍关节推进上限，调太大等于关掉限速
+  max_timesteps: 10000
   use_back_event: true
   dry_run: false
 
-  # action 记什么：
-  #   follower_next —— 从臂在下一拍的实测位姿（默认）。示教时从臂并不能 100% 跟上
-  #      主臂，记主臂指令等于记了一个没被真正执行的动作。代价是每集丢掉最后一帧。
-  #   leader        —— 限速后实际下发给从臂的目标（即主臂指令）。
   action_source: follower_next
 
   # follower_to_leader = 从臂运动到主臂当前位姿（人先握好主臂摆姿势）
   # home               = 主从各自平滑回原点
-  # none               = 什么都不动
   init_mode: follower_to_leader
   init_duration_s: 2.0
-  init_max_step_rad: 0.05     # 别调大，这是「手臂不猛地弹过去」的唯一保障
+  init_max_step_rad: 0.05
   init_settle_timeout_s: 10.0
 
 # ── 相机 ───────────────────────────────────────────────────────────────
-# serial 走 RealSense，index_or_path 走 USB 摄像头。留空 [] 则不采图像。
 cameras:
-  - {name: cam_top,  serial: "327122074756", width: 640, height: 480, fps: 30}
-  - {name: cam_left, serial: "148522072680", width: 640, height: 480, fps: 30}
+  - {name: cam_top,  serial: "327122074756", width: 640, height: 480, fps: 60}
+  - {name: cam_left, serial: "148522072680", width: 640, height: 480, fps: 60}
 
-# ── 操作员界面 ─────────────────────────────────────────────────────────
 view:
-  enabled: true
+  enabled: false
   max_width: 1280
-  render_hz: 15.0
+  render_hz: 30
 
-# auto = stdin 是真终端就用 termios，否则退到 pynput 全局钩子（IDE 控制台里就是这种）。
-# pynput 是全局捕获：焦点在别的窗口按 c/s/space 同样算采集指令。
 keyboard_backend: auto

@@ -20,7 +20,7 @@ import shutil
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,11 +33,13 @@ from lerobot.datasets.utils import DEFAULT_SUBTASKS_PATH
 from lerobot.rlt.intervention import start_key_backend
 from lerobot.rlt.piper_env import (
     JOINT_ORDER,
+    JointSlewLimiter,
     build_piper_cameras,
     follower_action_to_leader,
+    jitter_rms,
     leader_action_to_follower,
-    rate_limit_joints,
 )
+from lerobot.utils.piper_sdk import apply_piper_can_filters
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.status_view import StatusView
 
@@ -56,6 +58,16 @@ class ArmSpec:
     max_takeover_delta_rad: float = 0.15
     use_calibrated_offsets: bool = False
     require_calibration: bool = False
+
+    # 位置模式下从臂内部轨迹发生器冲向每个目标的速度百分比。不上 MIT 阻抗时，
+    # 这是唯一的柔顺度旋钮：调低更柔但整体变钝，值得上机对比 40 / 60 / 80。
+    move_speed_ratio: int = 60
+    mode_refresh_interval_s: float = 1.0
+    # 夹爪死区，单位 1e-6 m。200 = 0.2mm，小于这个的抖动不值得占一个 CAN 帧。
+    gripper_deadband: int = 200
+    # 关节死区（rad）。主臂在 kp=kd=0 的纯力矩重力补偿下是无阻尼自由体，静止时
+    # 读数一直小幅游走；不挡住的话这点噪声会被原样放大成从臂的高频抖。
+    joint_deadband_rad: float = 0.002
 
     gravity_comp_tx_ratio: list[float] = field(default_factory=lambda: [0.2] * 6)
     gravity_comp_base_rpy_deg: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
@@ -99,10 +111,35 @@ class DatasetSpec:
 
 
 @dataclass
+class TeleopSpec:
+    """从臂指令下发。频率与 `dataset.fps` 无关 —— 那是数据集帧率，不是控制频率。
+
+    位置模式下每条指令都是一个位置阶跃，阶跃幅度 = 主臂在一个指令周期内走过的距离，
+    所以「一顿一顿」的根治办法就是把周期缩短。主臂关节反馈是 3 个 CAN 帧
+    (0x2A5/0x2A6/0x2A7)、实测各 ~188Hz，因此信息率上限就是 ~188Hz：
+    由「主臂出现新样本」驱动下发，既能吃满这个上限，又不会重复发同一个目标。
+    """
+
+    enabled: bool = True
+    # 兜底上限，防止主臂反馈异常高频时把 CAN 灌满
+    max_hz: float = 250.0
+    # 没有新样本时的轮询间隔。别用 precise_sleep：它尾部 10ms 忙等且持 GIL
+    idle_poll_s: float = 0.001
+    # 关节速度上限（rad/s）。限速器的职责是兜住异常（主臂被撞、读数跳变），
+    # 不是日常压抖 —— 日常压抖交给高频小阶跃。
+    max_joint_vel_rad_s: float = 6.0
+    # 指令允许领先实测位姿的最大量（rad）：从臂被卡住时防止指令跑飞，
+    # 否则障碍解除的瞬间会猛冲。
+    max_lead_rad: float = 0.5
+    can_filters: bool = True
+
+
+@dataclass
 class CollectionSpec:
     max_timesteps: int = 10000
-    # 每拍关节推进上限（rad），整条 6 维差向量等比缩放。调太大等于关掉限速。
-    max_joint_step_rad: float = 0.05
+    # 已废弃：每拍关节推进上限（rad）。语义随控制频率漂移，改用
+    # teleop.max_joint_vel_rad_s（rad/s）。这里留 None 以便识别用户是否显式设了它。
+    max_joint_step_rad: float | None = None
     use_back_event: bool = True
     dry_run: bool = False
 
@@ -125,6 +162,7 @@ class ViewSpec:
 @dataclass
 class RecordPiperConfig:
     arms: list[ArmSpec] = field(default_factory=lambda: [ArmSpec()])
+    teleop: TeleopSpec = field(default_factory=TeleopSpec)
     dataset: DatasetSpec = field(default_factory=DatasetSpec)
     collection: CollectionSpec = field(default_factory=CollectionSpec)
     cameras: list[CameraSpec] = field(default_factory=list)
@@ -237,17 +275,39 @@ class ArmPair:
 
         # send() 的省帧状态。0xAD 与 PiperMotorsBus.write 保持一致，换成 0x00 会改变
         # 从臂的动力学表现，别在没上机验证的情况下动它。
-        self.move_speed_ratio = 60
+        self.move_speed_ratio = spec.move_speed_ratio
         self.can_mit_flag = 0xAD
-        self.mode_refresh_interval_s = 1.0
-        self.gripper_deadband = 200  # 0.0002 m，小于这个的抖动不值得占一个 CAN 帧
+        self.mode_refresh_interval_s = spec.mode_refresh_interval_s
+        self.gripper_deadband = spec.gripper_deadband
+        self.joint_deadband_rad = spec.joint_deadband_rad
         self._last_mode_refresh = -1e9
         self._last_gripper: int | None = None
+        self._last_joints: np.ndarray | None = None
+        self._last_leader_ts = -1.0
+        self.limiter = JointSlewLimiter(max_vel_rad_s=0.0)  # 真正的参数在 configure_limiter 里给
 
-    def connect(self) -> None:
+    def configure_limiter(self, teleop: "TeleopSpec") -> None:
+        self.limiter = JointSlewLimiter(
+            max_vel_rad_s=teleop.max_joint_vel_rad_s, max_lead_rad=teleop.max_lead_rad
+        )
+
+    def connect(self, can_filters: bool = True) -> None:
         if not self.robot.is_connected:
             self.robot.connect(calibrate=False)
         self.leader.connect()
+        if can_filters:
+            apply_piper_can_filters(self.robot.bus.piper, "follower")
+            apply_piper_can_filters(self.leader.arm, "leader")
+
+    def leader_timestamp(self) -> float:
+        """主臂关节反馈帧的时间戳，用来判断"有没有新样本"。
+
+        返回 0 表示 SDK 没提供时间戳，调用方应退化成定时下发。
+        """
+        try:
+            return float(getattr(self.leader.arm.GetArmJointMsgs(), "time_stamp", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
     def disconnect(self) -> None:
         if self.leader is not None and getattr(self.leader, "is_connected", False):
@@ -283,7 +343,16 @@ class ArmPair:
             arm.MotionCtrl_2(0x01, 0x01, self.move_speed_ratio, self.can_mit_flag)
             self._last_mode_refresh = now
 
-        arm.JointCtrl(*(round(float(j) * factor) for j in joints[:6]))
+        # 关节死区：主臂静止时的游走不该变成 CAN 帧。省下的不只是带宽 —— 位置模式下
+        # 每条 JointCtrl 都会让内部轨迹发生器重新起步一次，噪声级的目标同样会抖。
+        joints6 = np.asarray(joints[:6], dtype=np.float32)
+        moved = (
+            self._last_joints is None
+            or float(np.abs(joints6 - self._last_joints).max()) >= self.joint_deadband_rad
+        )
+        if moved:
+            arm.JointCtrl(*(round(float(j) * factor) for j in joints6))
+            self._last_joints = joints6.copy()
 
         gripper = round(abs(float(joints[6])) * 1e6)
         if self._last_gripper is None or abs(gripper - self._last_gripper) >= self.gripper_deadband:
@@ -401,14 +470,28 @@ class PiperRecorder:
                 f"未知的 action_source {cfg.collection.action_source!r}；可选 {ACTION_SOURCES}"
             )
 
+        self._resolve_rate_limit()
+
         self.pairs = [ArmPair(spec) for spec in cfg.arms]
+        for pair in self.pairs:
+            pair.configure_limiter(cfg.teleop)
         self.cameras: dict = {}
         self.dataset = None
         self.view = None
         self.keys = None
-        self._pool = ThreadPoolExecutor(max_workers=max(2, self.n_arms + len(cfg.cameras)))
-        self._pending_sends: list = []
         self._pending_frame: dict | None = None
+
+        # 遥操作线程发布 / 采集线程消费的最新一拍。采集线程只读，不参与控制。
+        self._arm_snapshots: list[tuple[np.ndarray, np.ndarray] | None] = [None] * self.n_arms
+        self._snapshot_lock = threading.Lock()
+        self._teleop_threads: list[threading.Thread] = []
+        self._teleop_stop = threading.Event()
+        self._teleop_error: list[BaseException] = []
+        self._teleop_periods: list[list[float]] = [[] for _ in range(self.n_arms)]
+        # 指令侧 / 实测侧轨迹，收尾时各算一次 jitter_rms。两者的关系直接定位责任方：
+        # 实测远大于指令 = 从臂自己在振；两者相当 = 抖动来自主臂输入侧。
+        self._traj_cmd: list[deque] = [deque(maxlen=20000) for _ in range(self.n_arms)]
+        self._traj_meas: list[deque] = [deque(maxlen=20000) for _ in range(self.n_arms)]
 
         self._frame_queue: queue.Queue = queue.Queue(maxsize=cfg.dataset.writer_queue_maxsize)
         self._writer_thread: threading.Thread | None = None
@@ -436,12 +519,32 @@ class PiperRecorder:
         self._dropped_frames = 0
         self._encoder_dropped = 0
         # 分段耗时，用来回答"到底是哪一段吃掉了实时预算"
-        self._t_join: list[float] = []
         self._t_add: list[float] = []
         self._t_arms: list[float] = []
         self._t_cams: list[float] = []
         self._t_write: list[float] = []
         self._queue_peak = 0
+
+    def _resolve_rate_limit(self) -> None:
+        """把废弃的 max_joint_step_rad（每拍弧度）折算成 rad/s。
+
+        旧键的物理含义随控制频率漂移：同一个 0.05 在 30Hz 是 1.5 rad/s、25Hz 是
+        1.25 rad/s，而指令频率一旦提到主臂反馈率就变成 9 rad/s 以上。所以只做一次
+        折算并告警，让用户改用新键。
+        """
+        legacy = self.cfg.collection.max_joint_step_rad
+        if legacy is None:
+            return
+        converted = float(legacy) * self.cfg.dataset.fps
+        logger.warning(
+            "collection.max_joint_step_rad 已废弃（每拍弧度，含义随频率漂移）。"
+            "按 %.3f rad × %d Hz 折算成 teleop.max_joint_vel_rad_s=%.2f rad/s。"
+            "请改用新键，本次沿用折算值。",
+            legacy,
+            self.cfg.dataset.fps,
+            converted,
+        )
+        self.cfg.teleop.max_joint_vel_rad_s = converted
 
     # ------------------------------------------------------------- 进度条
     def _log(self, msg: str) -> None:
@@ -510,7 +613,7 @@ class PiperRecorder:
     def connect(self) -> None:
         cfg = self.cfg
         for pair in self.pairs:
-            pair.connect()
+            pair.connect(can_filters=cfg.teleop.can_filters)
             print(
                 f"[record] 已连接臂 {pair.spec.name}：主臂 {pair.spec.leader_port} / "
                 f"从臂 {pair.spec.follower_port}"
@@ -631,53 +734,119 @@ class PiperRecorder:
         df.to_parquet(path)
         logger.info("已写入 %d 条子任务到 %s", len(df), path)
 
-    # ------------------------------------------------------------- 每拍
-    def _map(self, fn, items):
-        items = list(items)
-        if len(items) < 2:
-            return [fn(x) for x in items]
-        return list(self._pool.map(fn, items))
+    # --------------------------------------------------------- 遥操作（高频）
+    def step_arm(self, pair: ArmPair, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        """一条臂的一次「读主臂 → 限速 → 下发」。"""
+        leader_action = pair.read_leader()
+        measured = pair.read_follower()
+        target = np.array([leader_action[k] for k in JOINT_ORDER], dtype=np.float32)
+        limited, saturated = pair.limiter(target, measured, dt)
+        self._saturated.append(bool(saturated))
+        if not self.cfg.collection.dry_run:
+            pair.send(limited)
+        return measured, limited
 
-    def _join_pending_sends(self) -> None:
-        for fut in self._pending_sends:
+    def _teleop_loop(self, index: int, pair: ArmPair) -> None:
+        """一条臂的下发回路，由它自己的主臂新样本驱动，与 dataset.fps 完全无关。
+
+        位置模式下每条指令都是一个位置阶跃，阶跃幅度正比于指令周期，所以这里跑得越快
+        手感越连续。主臂反馈实测 ~188Hz，因此稳态自然收敛到那个频率，并且不会把同一个
+        目标重复发一遍。
+
+        每条臂一个线程，而不是一个线程轮询所有臂：两条臂挂在各自独立的 CAN 总线上，
+        分开跑才能让写重叠，也才不会因为左臂来了新样本就顺带把右臂重发一遍。
+
+        等待用 time.sleep 而不是 precise_sleep —— 后者尾部 10ms 忙等且持 GIL，
+        会反过来拖慢它要服务的这条回路。
+        """
+        teleop = self.cfg.teleop
+        min_period = 1.0 / max(1e-6, teleop.max_hz)
+        last_t = time.perf_counter()
+        pair.limiter.reset(pair.read_follower())
+
+        warned_no_ts = False
+        while not self._teleop_stop.is_set():
+            ts = pair.leader_timestamp()
+            if ts == 0.0:
+                # SDK 没提供时间戳，退化成按 max_hz 定频下发。安全性由调用顺序保证：
+                # connect() + initialize() 已经跑过，SDK 缓存里必然有真实关节数据。
+                if not warned_no_ts:
+                    logger.warning(
+                        "[%s] 主臂反馈没有时间戳，退化成 %.0fHz 定频下发（无法按新样本驱动）。",
+                        pair.spec.name,
+                        teleop.max_hz,
+                    )
+                    warned_no_ts = True
+            elif ts == pair._last_leader_ts:
+                time.sleep(teleop.idle_poll_s)
+                continue
+            pair._last_leader_ts = ts
+
+            now = time.perf_counter()
+            dt = now - last_t
+            if dt < min_period:
+                time.sleep(min_period - dt)
+                now = time.perf_counter()
+                dt = now - last_t
+            last_t = now
+
+            measured, limited = self.step_arm(pair, dt)
+            with self._snapshot_lock:
+                self._arm_snapshots[index] = (measured, limited)
+            self._teleop_periods[index].append(dt)
+            self._traj_cmd[index].append(limited[:6].copy())
+            self._traj_meas[index].append(measured[:6].copy())
+
+    def start_teleop(self) -> None:
+        if not self.cfg.teleop.enabled:
+            logger.warning("teleop.enabled=false：不会给从臂下发任何指令。")
+            return
+
+        def run(index: int, pair: ArmPair):
             try:
-                fut.result()
-            except Exception:
-                logger.exception("下发失败")
-        self._pending_sends = []
+                self._teleop_loop(index, pair)
+            except BaseException as exc:  # 交给主线程抛，否则异常会被线程吞掉
+                self._teleop_error.append(exc)
 
-    def step_arms(self) -> tuple[np.ndarray, np.ndarray]:
-        cfg = self.cfg.collection
-        leader_actions = self._map(lambda p: p.read_leader(), self.pairs)
-        measured_list = self._map(lambda p: p.read_follower(), self.pairs)
+        self._teleop_stop.clear()
+        self._teleop_threads = [
+            threading.Thread(
+                target=run, args=(i, pair), name=f"piper-teleop-{pair.spec.name}", daemon=True
+            )
+            for i, pair in enumerate(self.pairs)
+        ]
+        for thread in self._teleop_threads:
+            thread.start()
 
-        limited_list = []
-        for leader_action, measured in zip(leader_actions, measured_list, strict=True):
-            target = np.array([leader_action[k] for k in JOINT_ORDER], dtype=np.float32)
-            limited, saturated = rate_limit_joints(target, measured, cfg.max_joint_step_rad)
-            limited_list.append(limited)
-            self._saturated.append(bool(saturated))
+    def stop_teleop(self) -> None:
+        self._teleop_stop.set()
+        for thread in self._teleop_threads:
+            thread.join(timeout=5.0)
+        self._teleop_threads = []
 
-        if not cfg.dry_run:
-            self._pending_sends = [
-                self._pool.submit(pair.send, limited)
-                for pair, limited in zip(self.pairs, limited_list, strict=True)
-            ]
+    def latest_snapshot(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """所有臂都发布过之后才给出快照 —— 缺一条臂的帧写进数据集就是错的。"""
+        with self._snapshot_lock:
+            if any(snap is None for snap in self._arm_snapshots):
+                return None
+            measured = [snap[0] for snap in self._arm_snapshots]
+            limited = [snap[1] for snap in self._arm_snapshots]
+        return np.concatenate(measured), np.concatenate(limited)
 
-        return np.concatenate(measured_list), np.concatenate(limited_list)
-
+    # --------------------------------------------------------- 采集（低频）
     def read_cameras(self) -> dict:
-        def grab(item):
-            name, cam = item
+        """read_latest 只是加锁取引用，串行比走线程池便宜 —— 两个相机时派发本身更贵。"""
+        images = {}
+        for name, cam in self.cameras.items():
             try:
                 reader = getattr(cam, "read_latest", None)
-                return name, (reader(max_age_ms=self._frame_max_age_ms) if reader else cam.async_read())
+                img = reader(max_age_ms=self._frame_max_age_ms) if reader else cam.async_read()
             except Exception as exc:
                 logger.warning("相机 %s 读取失败：%s", name, exc)
-                return name, None
-
-        results = self._map(grab, self.cameras.items())
-        return {name: img for name, img in results if img is not None}
+                continue
+            if img is not None:
+                images[name] = img
+        return images
 
     def build_frame(self, state: np.ndarray, action: np.ndarray, images: dict) -> dict:
 
@@ -912,6 +1081,7 @@ class PiperRecorder:
             ).start()
 
         self.start_writer()
+        self.start_teleop()
         self.print_usage()
         if cfg.collection.dry_run:
             print("[record] ⚠ DRY-RUN：只读不下发，从臂不会动。")
@@ -941,6 +1111,10 @@ class PiperRecorder:
         finally:
             stop.set()
             worker.join(timeout=5.0)
+            try:
+                self.stop_teleop()
+            except Exception:
+                logger.exception("停止遥操作线程失败")
             self._close_bar()
             self.keys.stop()
             self.flush_pending_frame()
@@ -951,6 +1125,8 @@ class PiperRecorder:
 
         if failure:
             raise failure[0]
+        if self._teleop_error:
+            raise self._teleop_error[0]
 
     def _control_loop(self, stop: "threading.Event") -> None:
         cfg = self.cfg
@@ -964,9 +1140,8 @@ class PiperRecorder:
                 meas_fps = 0.9 * meas_fps + 0.1 / (loop_t0 - prev_loop_t)
             prev_loop_t = loop_t0
 
-            t_join = time.perf_counter()
-            self._join_pending_sends()
-            self._t_join.append(time.perf_counter() - t_join)
+            if self._teleop_error:
+                raise self._teleop_error[0]
 
             self.keys.poll()
             for msg in self.keys.drain_messages():
@@ -993,10 +1168,16 @@ class PiperRecorder:
                 self._close_bar()
 
             t0 = time.perf_counter()
-            state, commanded = self.step_arms()
+            snapshot = self.latest_snapshot()
             t1 = time.perf_counter()
             images = self.read_cameras()
             t2 = time.perf_counter()
+
+            if snapshot is None:
+                # 遥操作线程还没发布过第一拍（或被关掉了）——这一拍没有可记的状态
+                precise_sleep(max(self.dt - (time.perf_counter() - loop_t0), 0.0))
+                continue
+            state, commanded = snapshot
 
             if self.keys.collecting:
                 if self.buffered_frames() >= cfg.collection.max_timesteps:
@@ -1037,6 +1218,40 @@ class PiperRecorder:
             "saved_frames": total_frames,
         }
 
+    def _print_jitter(self) -> None:
+        """指令侧 / 实测侧的二阶差分 RMS，用来判断抖动的责任方。
+
+        这是在真正的下发路径上量的，而不是 teleop_check 那条自己跑 30Hz 的诊断回路 ——
+        后者量不到这里的高频线程。
+        """
+        rows = []
+        for pair, periods, cmd, meas in zip(
+            self.pairs, self._teleop_periods, self._traj_cmd, self._traj_meas, strict=True
+        ):
+            if len(cmd) < 3 or not periods:
+                continue
+            dt = float(np.median(periods))
+            rows.append(
+                (
+                    pair.spec.name,
+                    jitter_rms(np.asarray(cmd), dt),
+                    jitter_rms(np.asarray(meas), dt),
+                )
+            )
+        if not rows:
+            return
+
+        print(f"\n抖动 (二阶差分 RMS, rad/s²)   {'指令侧':>10}{'实测侧':>10}")
+        for name, cmd_j, meas_j in rows:
+            print(f"  {name:<24}{cmd_j:>10.2f}{meas_j:>10.2f}")
+        worst = max(rows, key=lambda r: r[2])
+        if worst[2] > 5.0 and worst[2] > 2 * worst[1]:
+            print(f"  ⚠ [{worst[0]}] 实测抖动远大于指令：从臂自身在振。位置模式没有阻尼可调，")
+            print("    先降 arms[].move_speed_ratio，再看是否需要 MIT 阻抗（git show 518a03c8）。")
+        elif worst[1] > 5.0:
+            print(f"  ⚠ [{worst[0]}] 指令本身就抖：源头在主臂侧，调大 arms[].joint_deadband_rad，")
+            print("    或检查重力补偿 tx_ratio 是否过补偿（手臂会自己往上走）。")
+
     def print_summary(self) -> None:
         n = len(self._loop_periods)
         if n == 0:
@@ -1047,10 +1262,27 @@ class PiperRecorder:
         print("\n" + "=" * 66)
         print(f"目标 {self.cfg.dataset.fps:.1f} Hz -> 实测 {achieved:.1f} Hz（共 {n} 拍）")
 
+        slowest_hz = None
+        for pair, periods in zip(self.pairs, self._teleop_periods, strict=True):
+            if not periods:
+                continue
+            tp = np.asarray(periods) * 1e3
+            hz = 1e3 / np.percentile(tp, 50)
+            slowest_hz = hz if slowest_hz is None else min(slowest_hz, hz)
+            print(
+                f"\n遥操作线程 [{pair.spec.name}]  {len(tp)} 次下发，实测 {hz:.0f} Hz"
+                f"（周期 p50 {np.percentile(tp, 50):.2f}ms / p95 {np.percentile(tp, 95):.2f}ms"
+                f" / max {tp.max():.2f}ms）"
+            )
+        if slowest_hz is not None:
+            print("  位置模式下阶跃幅度正比于这个周期；它越小越接近连续跟随，与采集帧率无关。")
+            if slowest_hz < 100:
+                print("  ⚠ 指令频率偏低：主臂反馈约 188Hz，跑不到说明线程被 GIL 拖住了。")
+        self._print_jitter()
+
         print(f"\n分段耗时 (ms，预算 {budget_ms:.1f})    {'p50':>8}{'p95':>8}{'max':>8}")
         for label, samples in (
-            ("等上一拍 CAN 下发", self._t_join),
-            ("主从读写 (CAN)", self._t_arms),
+            ("取遥操作快照", self._t_arms),
             ("相机 read_latest", self._t_cams),
             ("写帧入队", self._t_write),
             ("[写帧线程] add_frame", self._t_add),
@@ -1062,15 +1294,15 @@ class PiperRecorder:
                 f"  {label:<22}{np.percentile(arr, 50):>8.2f}"
                 f"{np.percentile(arr, 95):>8.2f}{arr.max():>8.2f}"
             )
-        print("  （add_frame 在写帧线程里跑，不占控制回路预算，但它决定队列排不排得空）")
+        print("  （add_frame 在写帧线程里跑，不占采集回路预算，但它决定队列排不排得空）")
 
         print(
             f"\n写帧队列峰值 {self._queue_peak}/{self.cfg.dataset.writer_queue_maxsize}"
             "（持续接近上限说明视频编码跟不上，降分辨率或换更快的 video_codec）"
         )
-        print(f"限速饱和率 {sat:.1%}（max_joint_step_rad={self.cfg.collection.max_joint_step_rad}）")
+        print(f"限速饱和率 {sat:.1%}（max_joint_vel_rad_s={self.cfg.teleop.max_joint_vel_rad_s}）")
         if sat > 0.3:
-            print("  ⚠ 饱和率偏高：从臂跟不上主臂，请调大 max_joint_step_rad 后重采。")
+            print("  ⚠ 饱和率偏高：从臂跟不上主臂，请调大 teleop.max_joint_vel_rad_s 后重采。")
         if achieved < 0.9 * self.cfg.dataset.fps:
             print("  ⚠ 实测频率明显低于目标：看上面哪一段最贵 —— CAN 段贵就降 fps 或减臂，")
             print("    相机段贵就降分辨率 / 减相机；写帧入队本来就该接近 0，不为 0 说明队列满了。")
@@ -1084,6 +1316,11 @@ class PiperRecorder:
         print("=" * 66 + "\n")
 
     def close(self) -> None:
+        # 先停下发再断连：反过来会让遥操作线程往已经关掉的 CAN 上写
+        try:
+            self.stop_teleop()
+        except Exception:
+            logger.exception("停止遥操作线程失败")
         if self.view is not None:
             try:
                 self.view.stop()
@@ -1096,8 +1333,6 @@ class PiperRecorder:
                 cam.disconnect()
             except Exception:
                 logger.exception("相机 %s 断开失败", name)
-        if self._pool is not None:
-            self._pool.shutdown(wait=False)
 
 
 def record(cfg: RecordPiperConfig) -> None:

@@ -25,10 +25,9 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from lerobot.rlt.intervention import InterventionManager, InterventionResult, KeyboardEventListener
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.robot_utils import precise_sleep
-
-from lerobot.rlt.intervention import InterventionManager, InterventionResult, KeyboardEventListener
 
 logger = logging.getLogger(__name__)
 
@@ -44,22 +43,86 @@ LEADER_KEY_FOR_FOLLOWER = {
 
 
 def rate_limit_joints(
-    target: np.ndarray, current: np.ndarray, max_joint_step_rad: float
+    target: np.ndarray, anchor: np.ndarray, max_joint_step_rad: float
 ) -> tuple[np.ndarray, bool]:
     """Scale the whole step so no arm joint exceeds the per-step limit.
 
     Scaling uniformly (rather than clipping each joint) preserves the direction
     of the commanded motion; per-joint clipping would silently bend the
     trajectory. Returns the limited target and whether limiting kicked in.
+
+    `anchor` is what the step is measured from. Prefer the previously issued
+    command (see JointSlewLimiter) over the measured follower pose: anchoring on
+    the measurement turns saturation into positive feedback, because a follower
+    that lags pulls the next command back toward itself and can never catch up.
     """
-    delta = target[:6] - current[:6]
+    delta = target[:6] - anchor[:6]
     peak = float(np.abs(delta).max()) if delta.size else 0.0
     saturated = peak > max_joint_step_rad > 0
     if saturated:
         delta = delta * (max_joint_step_rad / peak)
     limited = target.copy()
-    limited[:6] = current[:6] + delta
+    limited[:6] = anchor[:6] + delta
     return limited, saturated
+
+
+class JointSlewLimiter:
+    """Per-arm slew-rate limiter expressed in rad/s and anchored on the last command.
+
+    Two things this fixes over calling `rate_limit_joints(target, measured, step)`:
+
+    * **Units.** A per-tick radian budget silently changes meaning whenever the
+      command rate changes — the same 0.05 was 1.5 rad/s at 30 Hz and 1.25 rad/s
+      at 25 Hz, and would become 9.4 rad/s once commands run at the leader's
+      ~188 Hz feedback rate. Holding the limit in rad/s keeps it physical.
+    * **Anchor.** Anchoring on the previous command makes this a true slew-rate
+      limiter, so follower encoder noise and torn CAN reads no longer leak into
+      the command.
+
+    `max_lead_rad` is the safety net that the measurement anchor used to provide
+    for free: it stops the command from running away from a physically blocked
+    arm (which would otherwise lunge once the obstruction clears). It only
+    engages once the command is already that far ahead, so it is never part of
+    the normal control path.
+    """
+
+    def __init__(self, max_vel_rad_s: float, max_lead_rad: float = 0.5):
+        self.max_vel_rad_s = max_vel_rad_s
+        self.max_lead_rad = max_lead_rad
+        self._prev_cmd: np.ndarray | None = None
+
+    @property
+    def seeded(self) -> bool:
+        return self._prev_cmd is not None
+
+    def reset(self, measured: np.ndarray) -> None:
+        """Re-seed from the measured pose — on init and on every takeover.
+
+        Without this the first command after a handover would step from a stale
+        target the arm has long since left.
+        """
+        self._prev_cmd = np.asarray(measured, dtype=np.float32).copy()
+
+    def __call__(
+        self, target: np.ndarray, measured: np.ndarray, dt: float
+    ) -> tuple[np.ndarray, bool]:
+        if self._prev_cmd is None:
+            self.reset(measured)
+
+        limited, saturated = rate_limit_joints(target, self._prev_cmd, self.max_vel_rad_s * dt)
+
+        # Clamp the emitted command, not the anchor: clamping the anchor would still
+        # let one full step be added on top, so the lead would settle at
+        # max_lead_rad + max_vel_rad_s * dt instead of the bound we asked for.
+        if self.max_lead_rad > 0:
+            lead = limited[:6] - measured[:6]
+            peak_lead = float(np.abs(lead).max()) if lead.size else 0.0
+            if peak_lead > self.max_lead_rad:
+                limited = limited.copy()
+                limited[:6] = measured[:6] + lead * (self.max_lead_rad / peak_lead)
+
+        self._prev_cmd = limited.astype(np.float32, copy=True)
+        return limited, saturated
 
 
 def jitter_rms(traj: np.ndarray, dt: float) -> float:
