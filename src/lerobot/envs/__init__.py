@@ -12,5 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configs import AlohaEnv, EnvConfig, HubEnvConfig, PushtEnv  # noqa: F401
 from . import gym_hil_spacemouse  # noqa: F401
+from .configs import AlohaEnv, EnvConfig, HubEnvConfig, PushtEnv  # noqa: F401
+from .robosuite_compat import patch_robosuite_log_path
+
+# Runs on `import lerobot.envs`, which always precedes `lerobot.envs.libero` — the
+# only place robosuite gets pulled in. See robosuite_compat for why.
+patch_robosuite_log_path()

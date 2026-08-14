@@ -371,7 +371,7 @@ def train(cfg: RLTOnlineTrainConfig):
                 print("[stage2] operator requested stop.")
                 break
 
-            warmup = env_steps < cfg.warmup_env_steps
+            warmup = env_steps < rl.warmup_env_steps
             learner.allow_actor_updates = not warmup
 
             # Critical-phase handover: run the base VLA until the operator
