@@ -45,9 +45,8 @@ from lerobot.policies.rlt import (
     SmolVLAPrefixExtractor,
     load_smolvla_policy,
 )
+from lerobot.rlt.train_rl_token import build_dataset_and_processors
 from lerobot.utils.constants import ACTION, OBS_STATE
-
-from .train_rl_token import build_dataset_and_processors
 
 
 @dataclass
@@ -174,7 +173,16 @@ def collect(cfg: RLTokenEvalConfig):
     ep_idx = torch.as_tensor(ep_idx) if not isinstance(ep_idx, Tensor) else ep_idx
     episodes = torch.unique(ep_idx)[: opt.n_episodes]
     frame_ids = torch.nonzero(torch.isin(ep_idx, episodes)).flatten()[: opt.max_frames]
+    # `max_frames` truncates from the front, so it can cut the tail episodes off
+    # entirely. Re-derive the episode list from what actually survived, or the
+    # split below hands every frame to the fit set and every probe returns NaN.
+    episodes = torch.unique(ep_idx[frame_ids])
     print(f"[eval] {len(episodes)} episodes, {len(frame_ids)} frames")
+    if len(episodes) < 2:
+        raise ValueError(
+            f"Only {len(episodes)} episode(s) fit in max_frames={opt.max_frames}; "
+            "the probes need at least two to split on. Raise max_frames."
+        )
 
     ep_len = {int(e): int((ep_idx == e).sum()) for e in episodes}
 
@@ -233,7 +241,9 @@ def evaluate(cfg: RLTokenEvalConfig) -> dict:
     data = collect(cfg)
     episode = data["episode"]
 
-    n_fit = max(int(len(data["episodes"]) * opt.train_frac), 1)
+    # At least one episode has to land on each side, or the probes score nothing.
+    n_eps = len(data["episodes"])
+    n_fit = min(max(int(n_eps * opt.train_frac), 1), n_eps - 1)
     fit_eps = data["episodes"][:n_fit]
     split = torch.isin(episode, fit_eps)
     print(
@@ -261,17 +271,47 @@ def evaluate(cfg: RLTokenEvalConfig) -> dict:
         "baseline: random projection", data["z_pool"] @ proj, targets, split, episode, opt
     )
 
-    rl, rnd = results["rl_token"], results["random_proj"]
+    rl, pool, rnd = results["rl_token"], results["mean_pooled"], results["random_proj"]
     print("\n[eval] verdict")
-    print(f"  progress R^2: z_rl {rl['r2_progress']:.3f} vs random {rnd['r2_progress']:.3f}")
+
+    # Every number here is only meaningful *relative to the baselines*. Absolute
+    # thresholds mislead: effective rank is largely a property of the data (a
+    # handful of episodes of one task family span few directions), and the
+    # episode-level probe split makes R^2 on high-dimensional targets go
+    # negative even for the raw features.
+    print(f"  progress R^2  : z_rl {rl['r2_progress']:.3f} | pooled {pool['r2_progress']:.3f} "
+          f"| random {rnd['r2_progress']:.3f}")
     if rl["r2_progress"] <= rnd["r2_progress"] + 0.05:
-        print("  WARNING: the token is no better than a random projection at encoding task")
-        print("           progress — the critic will have to learn phase from scratch.")
-    if rl["eff_rank"] < 0.05 * rl["dim"]:
-        print(f"  WARNING: effective rank {rl['eff_rank']:.1f} of {rl['dim']} dims — near-collapse.")
+        print("  WARNING: no better than a random projection at encoding task progress —")
+        print("           the critic would have to learn phase from scratch, which is the")
+        print("           sample efficiency the method is built on.")
+
+    print(f"  eff. rank     : z_rl {rl['eff_rank']:.1f}/{rl['dim']} | pooled "
+          f"{pool['eff_rank']:.1f}/{pool['dim']} | random {rnd['eff_rank']:.1f}/{rnd['dim']}")
+    if rl["eff_rank"] < 3.0:
+        print("  WARNING: near-collapse — the token carries almost no state information.")
+    elif rl["eff_rank"] < 0.6 * pool["eff_rank"]:
+        print("  NOTE: the token spans markedly fewer directions than the raw features it")
+        print("        compresses. Check whether what it dropped was task-relevant (compare")
+        print("        r2_action_chunk against the pooled baseline).")
+
+    print(f"  temporal ratio: z_rl {rl['temporal_ratio']:.3f} | pooled {pool['temporal_ratio']:.3f}")
     if rl["temporal_ratio"] > 0.7:
         print("  WARNING: consecutive frames are almost as far apart as random pairs;")
         print("           the TD target will see a jittery state.")
+
+    # Proprioception is concatenated onto x separately (x = (z_rl, s^p)), so a
+    # low r2_state is by design, not a defect. The action probe is the one that
+    # matters: it stands in for "can the critic tell situations apart finely
+    # enough for dQ/da to be informative".
+    print(f"  action R^2    : z_rl {rl['r2_action_chunk']:.3f} | pooled "
+          f"{pool['r2_action_chunk']:.3f}  (r2_state is not a defect: s^p is fed separately)")
+    if rl["r2_action_chunk"] < pool["r2_action_chunk"] - 1.0:
+        print("  NOTE: much worse than the raw features at predicting the VLA's own action.")
+        print("        The token may be turning into a pure progress detector; if the critic")
+        print("        cannot discriminate situations, dQ/da goes flat and the actor stalls.")
+        print("        Try a wider d_model, or drop_language_tokens=true to stop spending")
+        print("        capacity on the instruction embedding.")
     return results
 
 
