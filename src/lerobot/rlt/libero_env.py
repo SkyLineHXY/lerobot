@@ -27,11 +27,29 @@ from torch import Tensor
 from lerobot.envs.utils import preprocess_observation
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.processor.env_processor import LiberoProcessorStep
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.utils.constants import OBS_IMAGES, OBS_PREFIX
 
 from .intervention import InterventionResult
 
 logger = logging.getLogger(__name__)
+
+
+def _batch_robot_state_(frame: dict) -> None:
+    """Add the leading batch dim `preprocess_observation` gives images but not robot_state.
+
+    `lerobot_eval` drives a *vectorised* env, so its raw `robot_state` arrays already
+    carry a batch axis and only `pixels`/`agent_pos` need unsqueezing. RLT runs a
+    single env, where the nested state stays unbatched and `LiberoProcessorStep`
+    rejects it with "expected shape (B, 4)".
+    """
+    key = f"{OBS_PREFIX}robot_state"
+    state = frame.get(key)
+    if state is None:
+        return
+    for group in state.values():
+        for name, value in group.items():
+            if isinstance(value, Tensor) and value.ndim in (1, 2):
+                group[name] = value.unsqueeze(0)
 
 
 def _stage1_image_keys(preprocessor) -> list[str]:
@@ -58,6 +76,7 @@ class LiberoChunkEnv:
         control_mode: str = "relative",
         observation_size: int = 256,
         camera_name: str = "agentview_image,robot0_eye_in_hand_image",
+        image_keys: list[str] | None = None,
         seed: int = 0,
     ):
         if preprocessor is None or postprocessor is None:
@@ -67,22 +86,38 @@ class LiberoChunkEnv:
             )
         from lerobot.envs.libero import LiberoEnv, _get_suite, _parse_camera_names
 
-        # LiberoEnv's default mapping names the wrist camera `image2`, but the
-        # stage-1 processors were fitted on whatever the demo dataset called it
-        # (`wrist_image` for lerobot/libero_10). SmolVLA.prepare_images silently
-        # *skips* image keys missing from the batch, so a name mismatch costs a
-        # whole camera with no error at all — pin the mapping to stage 1 instead.
+        # Three naming conventions have to be reconciled here, and getting it wrong
+        # is silent: LiberoEnv calls the wrist camera `image2`, the stage-1
+        # processors use the demo dataset's names (`wrist_image` for
+        # lerobot/libero_10), and the VLA checkpoint declares its own
+        # (`camera1..3` for lerobot/smolvla_libero, trained on lerobot/libero).
+        # SmolVLA's vision tower is shared across cameras and keyed only by
+        # position in `config.image_features`, so what matters is *order*, not the
+        # names — but `prepare_images` skips keys missing from the batch without
+        # complaint, so a mismatch quietly drops a whole camera.
+        #
+        # `image_keys` therefore comes from the policy when the caller has one;
+        # otherwise fall back to what stage 1 was fitted on.
         cameras = _parse_camera_names(camera_name)
-        self.expected_image_keys = _stage1_image_keys(preprocessor)
-        if len(self.expected_image_keys) != len(cameras):
+        keys = list(image_keys) if image_keys else _stage1_image_keys(preprocessor)
+        if len(keys) < len(cameras):
             raise ValueError(
-                f"Stage 1 was trained with {len(self.expected_image_keys)} cameras "
-                f"{self.expected_image_keys}, but the env is configured with "
-                f"{len(cameras)}: {cameras}. The camera set must match the VLA's."
+                f"The policy declares {len(keys)} image features {keys}, fewer than "
+                f"the {len(cameras)} cameras configured: {cameras}."
             )
+        if len(keys) > len(cameras):
+            # smolvla_libero's config.json lists a camera3 its training data never
+            # had; SmolVLA pads or skips the surplus, so this is a note, not an error.
+            logger.warning(
+                "Policy declares %d image features %s but the env supplies %d cameras; "
+                "mapping the first %d in order.",
+                len(keys), keys, len(cameras), len(cameras),
+            )
+            keys = keys[: len(cameras)]
+        self.expected_image_keys = keys
         camera_name_mapping = {
             cam: key.removeprefix(f"{OBS_IMAGES}.")
-            for cam, key in zip(cameras, self.expected_image_keys, strict=True)
+            for cam, key in zip(cameras, keys, strict=True)
         }
 
         suite = _get_suite(task_suite_name)
@@ -124,6 +159,7 @@ class LiberoChunkEnv:
 
     def _single_obs_to_batch(self, obs: dict, device) -> dict[str, Tensor]:
         frame = preprocess_observation(obs)
+        _batch_robot_state_(frame)
         frame = self.env_preprocessor(frame)
         frame["task"] = self.task
         batch = self.preprocessor(frame)

@@ -21,9 +21,16 @@ def load_smolvla_policy(checkpoint: str, device: str = "cuda", dtype: str | None
     dtype: None keeps the checkpoint's mixed layout (bf16 VLM/expert weights,
     fp32 projections); "bfloat16"/"float32" casts the whole policy.
     """
+    from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
-    policy = SmolVLAPolicy.from_pretrained(checkpoint)
+    # `from_pretrained` loads the safetensors straight onto `config.device`, which
+    # comes from the checkpoint's own config.json ("cuda" = device 0). Without
+    # overriding it first, asking for cuda:1 still allocates on cuda:0 and only
+    # moves the weights afterwards — on a busy box that is an OOM, not a slowdown.
+    config = PreTrainedConfig.from_pretrained(checkpoint)
+    config.device = str(device)
+    policy = SmolVLAPolicy.from_pretrained(checkpoint, config=config)
     if dtype == "bfloat16":
         policy = policy.to(torch.bfloat16)
     elif dtype == "float32":

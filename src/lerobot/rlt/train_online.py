@@ -236,7 +236,7 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
     return policy, agent, controller
 
 
-def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener):
+def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener, policy=None):
     env_cfg, ac = cfg.env, cfg.rl.ac
 
     if isinstance(env_cfg, MockEnvConfig):
@@ -266,6 +266,9 @@ def build_env(cfg: RLTOnlineTrainConfig, keys: KeyboardEventListener):
             control_mode=env_cfg.control_mode,
             observation_size=env_cfg.observation_size,
             camera_name=env_cfg.camera_name,
+            # Camera keys must follow the *policy's* image features, not the
+            # dataset's; see LiberoChunkEnv.
+            image_keys=list(policy.config.image_features) if policy is not None else None,
             seed=cfg.seed,
         )
 
@@ -351,7 +354,7 @@ def train(cfg: RLTOnlineTrainConfig):
         # Build the env *before* putting stdin in cbreak mode: connecting the
         # leader can drop into the interactive calibration flow, whose `input()`
         # and Enter-detection do not work once the terminal is raw.
-        env = build_env(cfg, keys)
+        env = build_env(cfg, keys, policy=_policy)
         keys.start()
 
         mirror = ActorMirror(rl, device)
