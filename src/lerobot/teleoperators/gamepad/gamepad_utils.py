@@ -52,6 +52,10 @@ class InputController:
         """Get the current movement deltas (dx, dy, dz) in meters."""
         return 0.0, 0.0, 0.0
 
+    def get_rotation_deltas(self):
+        """Get the current wrist rotation deltas (roll, pitch, yaw) in radians."""
+        return 0.0, 0.0, 0.0
+
     def update(self):
         """Update controller state - call this once per frame."""
         pass
@@ -198,11 +202,31 @@ class KeyboardController(InputController):
 class GamepadController(InputController):
     """Generate motion deltas from gamepad input."""
 
-    def __init__(self, x_step_size=1.0, y_step_size=1.0, z_step_size=1.0, deadzone=0.1):
+    def __init__(
+        self,
+        x_step_size=1.0,
+        y_step_size=1.0,
+        z_step_size=1.0,
+        deadzone=0.1,
+        rotation_axes=(2, 4, 5),
+    ):
         super().__init__(x_step_size, y_step_size, z_step_size)
         self.deadzone = deadzone
+        self.rotation_axes = tuple(rotation_axes)
         self.joystick = None
         self.intervention_flag = False
+
+    def _axis(self, index: int) -> float:
+        """Read one axis with a deadzone; 0.0 if this pad does not have it.
+
+        Axis numbering is not standardised across controllers, so a
+        configuration naming an axis the pad lacks must degrade to "no input"
+        rather than raise mid-teleoperation.
+        """
+        if index < 0 or index >= self.joystick.get_numaxes():
+            return 0.0
+        value = self.joystick.get_axis(index)
+        return 0.0 if abs(value) < self.deadzone else value
 
     def start(self):
         """Initialize pygame and the gamepad."""
@@ -303,6 +327,16 @@ class GamepadController(InputController):
 
             return delta_x, delta_y, delta_z
 
+        except pygame.error:
+            logging.error("Error reading gamepad. Is it still connected?")
+            return 0.0, 0.0, 0.0
+
+    def get_rotation_deltas(self):
+        import pygame
+
+        try:
+            roll, pitch, yaw = (self._axis(i) for i in self.rotation_axes)
+            return -roll, -pitch, -yaw
         except pygame.error:
             logging.error("Error reading gamepad. Is it still connected?")
             return 0.0, 0.0, 0.0

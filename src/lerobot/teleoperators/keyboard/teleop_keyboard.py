@@ -156,20 +156,29 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         self.config = config
         self.misc_keys_queue = Queue()
 
+    # Chosen to avoid the keys the RLT trainer binds for the operator
+    # (s/f/r/space/esc) — both readers see the same global keystream.
+    ROTATION_KEYS = {
+        "u": ("delta_roll", 1.0),
+        "o": ("delta_roll", -1.0),
+        "i": ("delta_pitch", 1.0),
+        "k": ("delta_pitch", -1.0),
+        "j": ("delta_yaw", 1.0),
+        "l": ("delta_yaw", -1.0),
+    }
+
     @property
     def action_features(self) -> dict:
+        names = {"delta_x": 0, "delta_y": 1, "delta_z": 2}
+        idx = 3
+        if self.config.use_rotation:
+            for axis in ("delta_roll", "delta_pitch", "delta_yaw"):
+                names[axis] = idx
+                idx += 1
         if self.config.use_gripper:
-            return {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2, "gripper": 3},
-            }
-        else:
-            return {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2},
-            }
+            names["gripper"] = idx
+            idx += 1
+        return {"dtype": "float32", "shape": (idx,), "names": names}
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
@@ -178,6 +187,7 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         delta_y = 0.0
         delta_z = 0.0
         gripper_action = 1.0
+        rotation = dict.fromkeys(("delta_roll", "delta_pitch", "delta_yaw"), 0.0)
 
         # Generate action based on current key states
         for key, val in self.current_pressed.items():
@@ -198,6 +208,9 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 gripper_action = int(val) + 1
             elif key == keyboard.Key.ctrl_l:
                 gripper_action = int(val) - 1
+            elif self.config.use_rotation and getattr(key, "char", None) in self.ROTATION_KEYS:
+                axis, sign = self.ROTATION_KEYS[key.char]
+                rotation[axis] = sign * int(val)
             elif val:
                 # If the key is pressed, add it to the misc_keys_queue
                 # this will record key presses that are not part of the delta_x, delta_y, delta_z
@@ -211,6 +224,9 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             "delta_y": delta_y,
             "delta_z": delta_z,
         }
+
+        if self.config.use_rotation:
+            action_dict.update(rotation)
 
         if self.config.use_gripper:
             action_dict["gripper"] = gripper_action
@@ -255,6 +271,11 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
             keyboard.Key.ctrl_l,
         ]
         is_intervention = any(self.current_pressed.get(key, False) for key in movement_keys)
+        if self.config.use_rotation:
+            is_intervention = is_intervention or any(
+                pressed and getattr(key, "char", None) in self.ROTATION_KEYS
+                for key, pressed in self.current_pressed.items()
+            )
 
         # Check for episode control commands from misc_keys_queue
         terminate_episode = False

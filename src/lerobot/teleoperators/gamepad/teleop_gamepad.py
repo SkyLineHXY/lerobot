@@ -58,18 +58,16 @@ class GamepadTeleop(Teleoperator):
 
     @property
     def action_features(self) -> dict:
+        names = {"delta_x": 0, "delta_y": 1, "delta_z": 2}
+        idx = 3
+        if self.config.use_rotation:
+            for axis in ("delta_roll", "delta_pitch", "delta_yaw"):
+                names[axis] = idx
+                idx += 1
         if self.config.use_gripper:
-            return {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2, "gripper": 3},
-            }
-        else:
-            return {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2},
-            }
+            names["gripper"] = idx
+            idx += 1
+        return {"dtype": "float32", "shape": (idx,), "names": names}
 
     @property
     def feedback_features(self) -> dict:
@@ -83,7 +81,8 @@ class GamepadTeleop(Teleoperator):
         else:
             from .gamepad_utils import GamepadController as Gamepad
 
-        self.gamepad = Gamepad()
+        kwargs = {"rotation_axes": self.config.rotation_axes} if self.config.use_rotation else {}
+        self.gamepad = Gamepad(**kwargs)
         self.gamepad.start()
 
     @check_if_not_connected
@@ -102,6 +101,12 @@ class GamepadTeleop(Teleoperator):
             "delta_y": gamepad_action[1],
             "delta_z": gamepad_action[2],
         }
+
+        if self.config.use_rotation:
+            roll, pitch, yaw = self.gamepad.get_rotation_deltas()
+            action_dict["delta_roll"] = np.float32(roll)
+            action_dict["delta_pitch"] = np.float32(pitch)
+            action_dict["delta_yaw"] = np.float32(yaw)
 
         # Default gripper action is to stay
         gripper_action = GripperAction.STAY.value

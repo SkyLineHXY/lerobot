@@ -37,9 +37,15 @@ class KeyboardEndEffectorTeleopConfig(KeyboardTeleopConfig):
 
     Attributes:
         use_gripper: Whether to include gripper control in actions
+        use_rotation: Whether to expose the wrist rotation channels
+            (delta_roll/pitch/yaw), matching SpaceMouseTeleopConfig. Off by
+            default because the HIL-SERL pipeline reads only dx/dy/dz/gripper;
+            turn it on for 6-DoF delta-EE envs such as LIBERO, where tasks
+            needing a wrist turn cannot be demonstrated without it.
     """
 
     use_gripper: bool = True
+    use_rotation: bool = False
 
 
 @TeleoperatorConfig.register_subclass("keyboard_rover")
