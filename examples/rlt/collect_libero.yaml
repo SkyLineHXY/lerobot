@@ -1,0 +1,55 @@
+# 用键盘/手柄在 LIBERO 里人工示教，采集阶段 1 需要的演示数据集
+#
+#   python -m lerobot.rlt.collect_libero --config_path examples/rlt/collect_libero.yaml
+#   lerobot-rlt-collect-libero --config_path examples/rlt/collect_libero.yaml \
+#       --teleop.device=gamepad
+#
+# 产出的列与 lerobot/libero_10 完全一致，采完可以直接：
+#   lerobot-rlt-train-token --config_path examples/rlt/libero_rl_token.yaml \
+#       --dataset=local/libero_teleop --dataset_root=outputs/datasets/libero_teleop
+#
+# 算子键：
+#   空格   开始/暂停记录（松开时不推机械臂，也不写帧）
+#   s      本集成功，保存
+#   f      本集失败（默认丢弃，keep_failures=true 才保存）
+#   退格   丢弃本集
+#   Esc    结束采集
+#
+# 键盘遥操作键位：
+#   方向键         xy 平面
+#   Shift/右Shift  z 轴
+#   u/o i/k j/l    roll / pitch / yaw
+#   左Ctrl/右Ctrl  夹爪开合
+#
+# 依赖：pip install -e ".[libero]"；键盘/手柄需要图形界面（pynput / pygame）。
+
+suite: libero_10
+task_id: 0
+observation_size: 256
+camera_name: agentview_image,robot0_eye_in_hand_image
+max_episode_steps: 600
+n_episodes: 20
+seed: 0
+
+teleop:
+  device: keyboard          # keyboard / gamepad / spacemouse
+  use_rotation: true        # LIBERO 是 7 维 delta EE，需要手腕三轴
+  # 设备输出和 LIBERO 动作空间都是 [-1, 1]，这两个纯粹是增益。
+  # 示教时建议比在线纠正调得更小一点，动作更平滑、更像专家轨迹。
+  position_scale: 0.25
+  rotation_scale: 0.15
+
+dataset:
+  repo_id: local/libero_teleop
+  root: outputs/datasets/libero_teleop
+  # 采集帧率决定 delta 动作的物理含义：换了 fps 就等于换了动作空间，
+  # 不要在同一个数据集里混用两种。
+  fps: 20
+  resume: false
+  video_codec: libsvtav1
+  # 必须与 lerobot/libero_* 的相机键名一致，否则阶段 1 的处理器对不上
+  image_keys: [image, wrist_image]
+
+keyboard_backend: auto
+discard_key: backspace      # 方向键被遥操作占用了
+keep_failures: false
