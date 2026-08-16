@@ -22,6 +22,7 @@ from lerobot.utils.constants import OBS_STATE
 from .modeling_rlt_ac import RLTAgent
 from .modeling_rlt_token import RLTokenModule, SmolVLAPrefixExtractor
 
+
 class RLTController:
     def __init__(
         self,

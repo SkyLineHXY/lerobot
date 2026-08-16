@@ -7,6 +7,7 @@
 
 import numpy as np
 import pytest
+
 from lerobot.rlt.gravity_probe import N_JOINTS, joint_verdict, render
 
 

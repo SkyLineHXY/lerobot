@@ -9,7 +9,7 @@ import queue
 
 import pytest
 
-from lerobot.rlt.intervention import (
+from lerobot.rlt.teleop.keys import (
     KEY_DISCARD,
     KEY_FAILURE,
     KEY_HANDOVER,

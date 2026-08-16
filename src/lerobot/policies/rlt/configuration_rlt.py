@@ -163,6 +163,22 @@ class ChunkEnvConfig(draccus.ChoiceRegistry, abc.ABC):
         return self.get_choice_name(self.__class__)
 
 
+@dataclass
+class SimTeleopConfig:
+    """Hand-held device used for human interventions in simulation."""
+
+    # keyboard / gamepad / spacemouse. All three are matched to the env by
+    # channel *name*, so a device missing the rotation axes simply leaves them
+    # at zero rather than misaligning the vector.
+    device: str = "keyboard"
+    use_rotation: bool = True
+    # Device output is normalized to [-1, 1] and LIBERO's delta-EE box is also
+    # [-1, 1], so these are pure gain: 1.0 means "full stick = full step". Lower
+    # them for finer corrections near the object.
+    position_scale: float = 0.3
+    rotation_scale: float = 0.2
+
+
 @ChunkEnvConfig.register_subclass("mock")
 @dataclass
 class MockEnvConfig(ChunkEnvConfig):
@@ -172,6 +188,7 @@ class MockEnvConfig(ChunkEnvConfig):
     image_size: int = 256
     success_eps: float = 0.15
     prompt: str = "reach the target"
+    teleop: SimTeleopConfig | None = None
 
 
 @ChunkEnvConfig.register_subclass("libero")
@@ -184,6 +201,7 @@ class LiberoEnvConfig(ChunkEnvConfig):
     control_mode: str = "relative"
     observation_size: int = 256
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
+    teleop: SimTeleopConfig | None = None
 
 
 @dataclass
@@ -279,6 +297,11 @@ class RLTOnlineTrainConfig:
     # the keys work from an IDE console / nohup / roslaunch where stdin is a
     # pipe. "none" disables operator input entirely.
     keyboard_backend: str = "auto"
+
+    # Which key discards the current episode. `left` (arrow) collides with a
+    # keyboard teleop device, which steers with the arrows — both readers see
+    # the same global keystream, so the only fix is to rebind.
+    discard_key: str = "left"
 
     # Start every episode under the base VLA and hand control to the RL policy
     # when the operator presses `r` (paper Sec. V).

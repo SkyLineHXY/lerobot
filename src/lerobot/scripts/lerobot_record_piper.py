@@ -30,8 +30,8 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.datasets.repair import repair_dataset_consistency
 from lerobot.datasets.utils import DEFAULT_SUBTASKS_PATH
-from lerobot.rlt.intervention import start_key_backend
-from lerobot.rlt.piper_env import (
+from lerobot.rlt.teleop.keys import start_key_backend
+from lerobot.rlt.envs.piper import (
     JOINT_ORDER,
     JointSlewLimiter,
     build_piper_cameras,

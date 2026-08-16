@@ -20,6 +20,7 @@ from .configuration_rlt import (
     RLTokenConfig,
     RLTokenTrainConfig,
     RLTOnlineTrainConfig,
+    SimTeleopConfig,
 )
 from .modeling_rlt import RLTController
 from .modeling_rlt_ac import ChunkActor, ChunkCritic, RLTAgent
@@ -36,6 +37,7 @@ __all__ = [
     "MockEnvConfig",
     "OnlineRLConfig",
     "PiperEnvConfig",
+    "SimTeleopConfig",
     "PiperLeaderTeleopConfig",
     "RLTAgent",
     "RLTController",

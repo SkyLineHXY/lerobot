@@ -8,7 +8,7 @@
 import numpy as np
 import pytest
 
-from lerobot.rlt.piper_env import (
+from lerobot.rlt.envs.piper import (
     JOINT_ORDER,
     follower_action_to_leader,
     leader_action_to_follower,
@@ -267,7 +267,7 @@ def test_gravity_comp_params_are_configurable():
 # 从臂 MIT 无关，所以删掉那个文件时把它们迁到这里。
 def test_jitter_rms_ignores_smooth_motion():
     """匀速运动不算抖 —— 一阶差分恒定，二阶差分为 0。"""
-    from lerobot.rlt.piper_env import jitter_rms
+    from lerobot.rlt.envs.piper import jitter_rms
 
     t = np.arange(200)
     ramp = np.stack([t * 0.01] * 6, axis=1)
@@ -276,7 +276,7 @@ def test_jitter_rms_ignores_smooth_motion():
 
 def test_jitter_rms_catches_alternating_noise():
     """方向反复翻转的高频成分才是抖动。"""
-    from lerobot.rlt.piper_env import jitter_rms
+    from lerobot.rlt.envs.piper import jitter_rms
 
     t = np.arange(200)
     smooth = np.stack([t * 0.01] * 6, axis=1)
@@ -285,6 +285,6 @@ def test_jitter_rms_catches_alternating_noise():
 
 
 def test_jitter_rms_needs_three_samples():
-    from lerobot.rlt.piper_env import jitter_rms
+    from lerobot.rlt.envs.piper import jitter_rms
 
     assert np.isnan(jitter_rms(np.zeros((2, 6)), dt=1 / 30))

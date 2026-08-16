@@ -1,22 +1,12 @@
-"""Human-in-the-loop primitives for RLT online RL on a real robot.
+"""Operator keyboard: raw keypress backends and the latched key state machine.
 
-Two independent channels, matching the paper's system (Sec. V):
+This is the *sparse outcome label* channel of the paper's system (Sec. V): a
+human supervisor ends each episode with a success/failure keypress, success
+being the only source of reward (r_T = 1). The same listener carries the
+critical-phase handover key, the takeover toggle, and the discard/quit keys.
 
-* **Sparse outcome labels.** A human supervisor ends each episode with a
-  success/failure keypress; success is the only source of reward (r_T = 1).
-  The same listener carries the *critical-phase handover* key: episodes start
-  under the base VLA and the operator hands control to the RL policy at the
-  precise moment that matters, so data collection and credit assignment
-  concentrate there.
-* **Teleoperated interventions.** The operator may take over mid-episode. The
-  taken-over actions replace both the executed action *and* the stored VLA
-  reference in the replay buffer, which is what lets the actor's BC term pull
-  toward human corrections rather than toward the VLA's failed attempt.
-
-Interventions are decided while the chunk is running and the teleoperator has
-to step the arm itself to produce commands, so :meth:`InterventionManager.run_chunk`
-executes the whole chunk and returns everything the rollout worker would
-otherwise have gathered (the `InterventionResult` pattern from rlt-openpi).
+The teleoperation channel — the device that actually produces actions — lives
+in the sibling modules (`base`, `device`, `piper_leader`).
 """
 from __future__ import annotations
 
@@ -29,11 +19,6 @@ import termios
 import time
 import tty
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any
-
-import torch
-from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +33,6 @@ KEY_INTERVENE = "space"
 KEY_DISCARD = "left"
 KEY_QUIT = "esc"
 
-# The 6 arm joints (the gripper is excluded from the takeover safety check: it
-# is an opening in metres, not an angle, and a gripper mismatch is harmless).
-JOINT_KEYS_6 = [f"joint_{i}.pos" for i in range(1, 7)]
-
-
-@dataclass
-class InterventionResult:
-    """Outcome of a chunk driven by the human, mirroring the worker's own loop."""
-
-    action_chunk: Tensor  # (C, action_dim), normalized action space
-    obs_list: list[dict]  # observation after every executed step
-    rewards: Tensor  # (C,)
-    n_steps: int  # steps actually executed
-    done: bool = False
-    truncated: bool = False
-    info: dict[str, Any] = field(default_factory=dict)
-
 
 class _TermiosBackend:
     """Read raw keypresses from stdin. Only usable when stdin is a real pty.
@@ -75,10 +43,17 @@ class _TermiosBackend:
 
     name = "termios"
 
-    # Raw byte sequence -> canonical key name.
+    # Raw byte sequence -> canonical key name. The four arrows are all decoded
+    # even though only `left` is bound by default: a keyboard teleop device
+    # steers with the arrows, so the trainer rebinds discard onto `backspace`
+    # and the other three still have to arrive under a name it can ignore.
     _SEQUENCES = {
         " ": KEY_INTERVENE,
-        "\x1b[D": KEY_DISCARD,
+        "\x1b[A": "up",
+        "\x1b[B": "down",
+        "\x1b[C": "right",
+        "\x1b[D": "left",
+        "\x7f": "backspace",
         "\x1b": KEY_QUIT,
     }
 
@@ -242,12 +217,16 @@ class KeyboardEventListener:
     human-in-the-loop channel is gone.
     """
 
-    def __init__(self, backend: str = "auto") -> None:
+    def __init__(self, backend: str = "auto", discard_key: str = KEY_DISCARD) -> None:
         if backend not in ("auto", "termios", "pynput", "none"):
             raise ValueError(
                 f"unknown keyboard backend {backend!r}; use auto/termios/pynput/none"
             )
         self.backend = backend
+        # A keyboard teleop device steers with the arrow keys, which collides
+        # with the default `left` = discard. Rebinding is the only way out: both
+        # readers see the same global keystream.
+        self.discard_key = discard_key
         self._impl = None
         self._extra: deque[str] = deque(maxlen=64)
         self._success = False
@@ -298,7 +277,7 @@ class KeyboardEventListener:
                 self._handover = True
             elif key == KEY_INTERVENE:
                 self._intervene = not self._intervene
-            elif key == KEY_DISCARD:
+            elif key == self.discard_key:
                 self._discard = True
             elif key == KEY_QUIT:
                 self._quit = True
@@ -359,172 +338,6 @@ class KeyboardEventListener:
 
     def reset_episode_flags(self) -> None:
         self._success = self._failure = self._handover = self._discard = False
-
-
-class InterventionManager:
-    """No-op manager: never intervenes. Base class for real teleop devices."""
-
-    def check(self) -> bool:
-        return False
-
-    def run_chunk(self, chunk_len: int) -> InterventionResult | None:
-        return None
-
-    def on_reset(self) -> None:
-        """Called at every episode reset, before the first chunk."""
-        return None
-
-    def close(self) -> None:
-        return None
-
-
-class PiperLeaderIntervention(InterventionManager):
-    """Leader-arm teleoperation for a Piper follower.
-
-    The leader is a second Piper arm held under gravity compensation, so its
-    joints map 1:1 onto the follower's 7-dim action and no IK is involved. On
-    exit the leader is put back into command mode and driven to the follower's
-    current pose, so the next takeover does not begin with a jump.
-
-    The same alignment runs at every episode reset (:meth:`on_reset`), because
-    the leader enters gravity compensation the moment it connects: without it
-    the *first* takeover of a run would start from wherever the limp leader
-    happens to be resting and drag the follower there.
-    """
-
-    def __init__(
-        self,
-        leader,
-        env,
-        keys: KeyboardEventListener,
-        use_calibrated_offsets: bool = False,
-        max_takeover_delta_rad: float = 0.15,
-    ):
-        self.leader = leader
-        self.env = env  # PiperChunkEnv
-        self.keys = keys
-        # `get_action()` returns offsets from the calibrated neutral pose; the
-        # stage-1 dataset actions are absolute joint angles. Default to the
-        # absolute reading so human corrections land in the policy's own action
-        # space instead of being shifted by the leader's neutral pose.
-        self.use_calibrated_offsets = use_calibrated_offsets
-        self.max_takeover_delta_rad = max_takeover_delta_rad
-        self._active = False
-
-    # ------------------------------------------------------------------ leader
-    def _read_leader(self) -> dict[str, float]:
-        """One leader sample, already renamed to the follower's joint keys."""
-        from .piper_env import leader_action_to_follower
-
-        raw = (
-            self.leader.get_action()
-            if self.use_calibrated_offsets
-            else self.leader.get_raw_action()
-        )
-        return leader_action_to_follower(raw)
-
-    def _takeover_delta(self) -> float:
-        """Largest |leader - follower| over the 6 arm joints, in radians."""
-        leader = self._read_leader()
-        follower = self.env.raw_joint_action()
-        return max(abs(leader[k] - follower[k]) for k in JOINT_KEYS_6)
-
-    def check(self) -> bool:
-        return self.keys.intervening
-
-    def align(self) -> None:
-        """Drive the leader to the follower's pose and hold it in command mode."""
-        from .piper_env import follower_action_to_leader
-
-        self.leader.send_feedback(follower_action_to_leader(self.env.raw_joint_action()))
-        self.leader.set_manual_control(False)
-        self._active = False
-
-    def on_reset(self) -> None:
-        self.align()
-
-    def _enter(self) -> bool:
-        """Release the leader for the operator. False if it is unsafe to do so."""
-        if self._active:
-            return True
-        # The leader has been holding the follower's pose since the last exit
-        # (or since `on_reset`), so a large gap means the operator has already
-        # dragged it somewhere else — releasing now would make the follower
-        # chase that pose. Refuse and make them re-press after re-aligning.
-        delta = self._takeover_delta()
-        if delta > self.max_takeover_delta_rad > 0:
-            logger.warning(
-                "Intervention refused: leader is %.3f rad away from the follower "
-                "(limit %.3f). Re-aligning; press space again once the leader is "
-                "back on the robot's pose.",
-                delta,
-                self.max_takeover_delta_rad,
-            )
-            self.keys.clear_intervention()
-            self.align()
-            return False
-        logger.info("Intervention: leader arm released (gravity compensation).")
-        self.leader.set_manual_control(True)
-        self._active = True
-        return True
-
-    def _exit(self) -> None:
-        if not self._active:
-            return
-        # Hand the leader back to command mode and align it with the follower
-        # so the operator's next grab starts from the current robot pose.
-        self.align()
-        logger.info("Intervention: leader arm re-engaged.")
-
-    def run_chunk(self, chunk_len: int) -> InterventionResult | None:
-        if not self.check():
-            self._exit()
-            return None
-        if not self._enter():
-            return None
-
-        actions, rewards, obs_list = [], [], []
-        done = truncated = False
-        for _ in range(chunk_len):
-            raw = self._read_leader()  # {"joint_N.pos": float, ...}
-            norm_action = self.env.raw_action_to_normalized(raw)
-            obs, r, done, truncated = self.env.apply_action(norm_action)
-            actions.append(norm_action)
-            rewards.append(r)
-            obs_list.append(obs)
-            if done or truncated:
-                break
-            if not self.check():  # operator let go mid-chunk
-                break
-
-        n = len(actions)
-        chunk = torch.stack(actions)
-        if n < chunk_len:  # hold the last human command for the unused tail
-            chunk = torch.cat([chunk, chunk[-1:].expand(chunk_len - n, -1)], dim=0)
-        rew = torch.zeros(chunk_len)
-        rew[:n] = torch.tensor(rewards, dtype=torch.float32)
-
-        if not self.check():
-            self._exit()
-
-        return InterventionResult(
-            action_chunk=chunk,
-            obs_list=obs_list,
-            rewards=rew,
-            n_steps=n,
-            done=done,
-            truncated=truncated,
-            info={"intervention": True},
-        )
-
-    def close(self) -> None:
-        try:
-            self._exit()
-        finally:
-            # The leader owns a CAN handle and a 200 Hz gravity-compensation
-            # thread; leaving it connected keeps the arm enabled after the run.
-            if getattr(self.leader, "is_connected", False):
-                self.leader.disconnect()
 
 
 def wait_for_key(keys: KeyboardEventListener, prompt: str, poll_s: float = 0.05) -> bool:

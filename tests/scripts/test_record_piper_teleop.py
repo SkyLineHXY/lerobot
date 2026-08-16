@@ -30,7 +30,7 @@ class FakeLimiterPair:
         self._leader_hz = leader_hz
         self._t0 = time.perf_counter()
         self._last_leader_ts = -1.0
-        from lerobot.rlt.piper_env import JointSlewLimiter
+        from lerobot.rlt.envs.piper import JointSlewLimiter
 
         self.limiter = JointSlewLimiter(max_vel_rad_s=100.0, max_lead_rad=0.0)
 

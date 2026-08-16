@@ -36,8 +36,8 @@ from pathlib import Path
 import numpy as np
 
 from lerobot.configs import parser
-from lerobot.rlt.intervention import JOINT_KEYS_6, KeyboardEventListener
-from lerobot.rlt.piper_env import (
+from lerobot.rlt.envs.piper import (
+    JOINT_KEYS_6,
     JOINT_ORDER,
     build_piper_cameras,
     follower_action_to_leader,
@@ -45,6 +45,7 @@ from lerobot.rlt.piper_env import (
     leader_action_to_follower,
     rate_limit_joints,
 )
+from lerobot.rlt.teleop.keys import KeyboardEventListener
 from lerobot.utils.robot_utils import precise_sleep
 
 logger = logging.getLogger(__name__)
@@ -295,10 +296,10 @@ class TeleopChecker:
     def _load_normalizer(self) -> None:
         """Load the stage-1 preprocessor and pull out its action normalizer."""
         from lerobot.policies.rlt import load_stage1_processors
-        from lerobot.rlt.piper_env import _find_action_normalizer
+        from lerobot.rlt.envs.base import find_action_normalizer
 
         preprocessor, _post = load_stage1_processors(self.cfg.rl_token, device=self.cfg.device)
-        self.normalizer = _find_action_normalizer(preprocessor)
+        self.normalizer = find_action_normalizer(preprocessor)
         if self.normalizer is None:
             print("[check] 警告：阶段 1 preprocessor 里没找到动作 normalizer，跳过归一化验证")
         else:

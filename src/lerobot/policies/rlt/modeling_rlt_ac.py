@@ -21,6 +21,7 @@ from torch import Tensor, nn
 
 from .configuration_rlt import ActorCriticConfig, OnlineRLConfig
 
+
 def _mlp(in_dim: int, hidden_dim: int, out_dim: int, n_layers: int) -> nn.Sequential:
     layers: list[nn.Module] = []
     d = in_dim

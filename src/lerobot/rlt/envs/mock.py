@@ -1,12 +1,9 @@
-"""Environment interface for RLT online training + a mock env for smoke tests.
+"""A mock chunk env for smoke tests.
 
-A real deployment wraps a robot behind :class:`ChunkEnv` (see
-``piper_env.PiperChunkEnv``) or a simulator (``libero_env.LiberoChunkEnv``).
-
-The mock environment is a 6-DoF abstract reaching task (SO-100-like action
-space, matching ``smolvla_base``) with three synthetic camera views. It exists
-purely to exercise the plumbing — frozen VLA forward, RL token, actor-critic,
-replay, updates — without a robot.
+A 6-DoF abstract reaching task (SO-100-like action space, matching
+``smolvla_base``) with three synthetic camera views. It exists purely to
+exercise the plumbing — frozen VLA forward, RL token, actor-critic, replay,
+updates — without a robot.
 
 It is **not** a validation signal for the algorithm: its reward depends only on
 the first 2 of 6 state dims, `done == success` so episodes never terminate on
@@ -14,8 +11,6 @@ failure, and it treats normalized actions as physical quantities (no
 un-normalisation boundary at all). Use LIBERO for evidence that RLT works.
 """
 from __future__ import annotations
-
-from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -26,45 +21,11 @@ from lerobot.utils.constants import (
     OBS_STATE,
 )
 
-from .intervention import InterventionResult
+from ..teleop.base import InterventionManager, InterventionResult
+from ..teleop.keys import KeyboardEventListener
 
 SMOLVLM_TOKENIZER = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
 
-class ChunkEnv(Protocol):
-    """Minimal single-env protocol used by the online trainer."""
-
-    action_dim: int
-    max_episode_steps: int
-
-
-    def reset(self) -> dict: ...
-
-    def step(self, action: Tensor) -> tuple[dict, float, bool]:
-        """Apply one control step; returns (obs, reward, done)."""
-        ...
-
-    def obs_to_batch(self, obs_list: list[dict], device) -> dict[str, Tensor]:
-        """Convert raw observations to a SmolVLA-preprocessed model batch."""
-        ...
-
-    def run_intervention(self, chunk_len: int) -> InterventionResult | None:
-        """Let a human drive the next chunk, if one is taking over right now.
-
-        Interventions are decided *during* execution on a real robot, and the
-        teleoperator has to step the arm itself to produce the commands. So the
-        manager runs the whole chunk and hands back everything the rollout
-        worker would otherwise have collected; returning None means "no human,
-        execute the policy chunk normally".
-        """
-        ...
-
-    def intervention_pending(self) -> bool:
-        """Is a human about to take over the next chunk?
-
-        Cheap, side-effect free probe: the rollout worker uses it to skip the
-        VLA action sampling whose result an intervention would discard.
-        """
-        ...
 
 def _tokenize_prompt(prompt: str, max_length: int = 48) -> tuple[Tensor, Tensor]:
     """Tokenize with the SmolVLM2 tokenizer if cached, else dummy ids.
@@ -115,6 +76,8 @@ class MockManipEnv:
         success_eps: float = 0.15,
         prompt: str = "reach the target",
         seed: int = 0,
+        keys: KeyboardEventListener | None = None,
+        intervention: InterventionManager | None = None,
     ):
         self.action_dim = action_dim
         self.max_episode_steps = max_episode_steps
@@ -122,28 +85,46 @@ class MockManipEnv:
         self.success_eps = success_eps
         self.rng = torch.Generator().manual_seed(seed)
         self.tokens, self.token_mask = _tokenize_prompt(prompt)
+        self.keys = keys or KeyboardEventListener(backend="none")
+        self.intervention = intervention or InterventionManager()
         self._state: Tensor | None = None
         self._t = 0
+
+    @property
+    def action_names(self) -> list[str]:
+        return [f"delta_{i}" for i in range(self.action_dim)]
 
     def reset(self) -> dict:
         self._state = torch.rand(self.action_dim, generator=self.rng) * 1.6 - 0.8
         self._t = 0
+        self.intervention.on_reset()
         return self._obs()
 
-    def step(self, action: Tensor) -> tuple[dict, float, bool]:
+    def apply_action(self, action: Tensor) -> tuple[dict, float, bool, bool]:
         action = action.detach().cpu().clamp(-1, 1)
         self._state = (self._state + 0.05 * action).clamp(-1, 1)
         self._t += 1
         dist = self._state[:2].norm().item()
         success = dist < self.success_eps
-        reward = 1.0 if success else 0.0
-        return self._obs(), reward, success
+        truncated = (not success) and self._t >= self.max_episode_steps
+        return self._obs(), 1.0 if success else 0.0, success, truncated
+
+    def step(self, action: Tensor) -> tuple[dict, float, bool]:
+        obs, reward, done, _ = self.apply_action(action)
+        return obs, reward, done
+
+    def env_action_to_normalized(self, raw) -> Tensor:
+        """Identity: the mock has no normalisation boundary at all."""
+        return torch.as_tensor(raw, dtype=torch.float32).reshape(-1)[: self.action_dim]
 
     def run_intervention(self, chunk_len: int) -> InterventionResult | None:
-        return None
+        return self.intervention.run_chunk(chunk_len)
 
     def intervention_pending(self) -> bool:
-        return False
+        return self.intervention.check()
+
+    def close(self) -> None:
+        self.intervention.close()
 
     def _obs(self) -> dict:
         return {"state": self._state.clone(), "t": self._t}

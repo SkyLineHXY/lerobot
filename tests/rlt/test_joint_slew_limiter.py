@@ -8,7 +8,7 @@
 import numpy as np
 import pytest
 
-from lerobot.rlt.piper_env import JointSlewLimiter, rate_limit_joints
+from lerobot.rlt.envs.piper import JointSlewLimiter, rate_limit_joints
 
 
 def _v(*vals) -> np.ndarray:

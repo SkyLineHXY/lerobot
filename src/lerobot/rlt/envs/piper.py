@@ -25,13 +25,20 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from lerobot.rlt.intervention import InterventionManager, InterventionResult, KeyboardEventListener
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.robot_utils import precise_sleep
+
+from ..teleop.base import InterventionManager, InterventionResult
+from ..teleop.keys import KeyboardEventListener
+from .base import ActionNormalizer
 
 logger = logging.getLogger(__name__)
 
 JOINT_ORDER = [f"joint_{i}.pos" for i in range(1, 8)]
+
+# The 6 arm joints. The gripper is excluded wherever a joint *angle* comparison
+# is made — it is an opening in metres, so a mismatch there is harmless.
+JOINT_KEYS_6 = JOINT_ORDER[:6]
 
 # PiperLeader keeps PIPER_ACTION_KEYS and calls the gripper `gripper.pos`, while
 # the Piper follower treats it as a 7th joint `joint_7.pos`. The physical
@@ -185,6 +192,8 @@ def follower_action_to_leader(action: dict[str, float]) -> dict[str, float]:
 class PiperChunkEnv:
     """Single real Piper arm behind the :class:`ChunkEnv` protocol."""
 
+    action_names = JOINT_ORDER
+
     def __init__(
         self,
         robot,
@@ -227,7 +236,7 @@ class PiperChunkEnv:
         self._steps = 0
         self._last_joints: np.ndarray | None = None
         self._last_velocity = np.zeros(len(JOINT_ORDER), dtype=np.float32)
-        self._action_normalizer = None
+        self._action_normalizer = ActionNormalizer(preprocessor, action_dim)
 
         if not self.robot.is_connected:
             self.robot.connect()
@@ -363,30 +372,8 @@ class PiperChunkEnv:
         # here too would drive the arm to the safe pose twice.
         self.robot.disconnect()
 
-    # ------------------------------------------------------ teleop conversion
     def raw_action_to_normalized(self, raw: dict[str, float]) -> Tensor:
-        """Leader-arm joint dict -> normalized action, matching the VLA space.
-
-        Reuses the stage-1 normalizer step rather than re-deriving the
-        transform, so mean/std vs min/max modes cannot drift apart between the
-        policy's actions and the human's.
-        """
-        joints = torch.tensor([raw[k] for k in JOINT_ORDER], dtype=torch.float32)
-        if self._action_normalizer is None:
-            self._action_normalizer = _find_action_normalizer(self.preprocessor)
-        if self._action_normalizer is None:
-            raise RuntimeError(
-                "No action normalizer found in the stage-1 preprocessor; human "
-                "interventions cannot be expressed in the policy's action space."
-            )
-        norm = self._action_normalizer._normalize_action(joints, inverse=False)
-        return norm[: self.action_dim]
-
-
-def _find_action_normalizer(preprocessor):
-    """Return the pipeline step that knows how to normalize an ACTION tensor."""
-    for step in getattr(preprocessor, "steps", []):
-        stats = getattr(step, "stats", None)
-        if stats and ACTION in stats and hasattr(step, "_normalize_action"):
-            return step
-    return None
+        """Leader-arm joint dict -> normalized action, matching the VLA space."""
+        return self._action_normalizer(
+            torch.tensor([raw[k] for k in JOINT_ORDER], dtype=torch.float32)
+        )

@@ -7,7 +7,7 @@
 import numpy as np
 import pytest
 
-from lerobot.rlt.piper_env import JOINT_ORDER
+from lerobot.rlt.envs.piper import JOINT_ORDER
 from lerobot.scripts import lerobot_record_piper as rp
 from lerobot.scripts.lerobot_record_piper import (
     ArmPair,
@@ -244,7 +244,7 @@ class FakeArmPair:
         self.limiter = None
 
     def configure_limiter(self, teleop):
-        from lerobot.rlt.piper_env import JointSlewLimiter
+        from lerobot.rlt.envs.piper import JointSlewLimiter
 
         self.limiter = JointSlewLimiter(
             max_vel_rad_s=teleop.max_joint_vel_rad_s, max_lead_rad=teleop.max_lead_rad

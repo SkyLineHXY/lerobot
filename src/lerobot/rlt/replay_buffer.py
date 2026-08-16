@@ -32,6 +32,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
+
 @dataclass
 class ChunkRecord:
     """Data gathered while executing one C-step chunk."""

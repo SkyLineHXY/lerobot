@@ -29,7 +29,9 @@ from lerobot.processor import PolicyProcessorPipeline
 from lerobot.processor.env_processor import LiberoProcessorStep
 from lerobot.utils.constants import OBS_IMAGES, OBS_PREFIX
 
-from .intervention import InterventionResult
+from ..teleop.base import InterventionManager, InterventionResult
+from ..teleop.keys import KeyboardEventListener
+from .base import ActionNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,19 @@ def _stage1_image_keys(preprocessor) -> list[str]:
 class LiberoChunkEnv:
     """Single LIBERO task behind the :class:`ChunkEnv` protocol."""
 
+    # robosuite OSC_POSE, all channels in [-1, 1]. The names match what the
+    # LeRobot teleoperators emit, so `DeviceIntervention` can assemble the
+    # vector by name instead of by position.
+    action_names = [
+        "delta_x",
+        "delta_y",
+        "delta_z",
+        "delta_roll",
+        "delta_pitch",
+        "delta_yaw",
+        "gripper",
+    ]
+
     def __init__(
         self,
         preprocessor,
@@ -78,6 +93,8 @@ class LiberoChunkEnv:
         camera_name: str = "agentview_image,robot0_eye_in_hand_image",
         image_keys: list[str] | None = None,
         seed: int = 0,
+        keys: KeyboardEventListener | None = None,
+        intervention: InterventionManager | None = None,
     ):
         if preprocessor is None or postprocessor is None:
             raise ValueError(
@@ -138,6 +155,9 @@ class LiberoChunkEnv:
         self.action_dim = action_dim
         self.max_episode_steps = max_episode_steps
         self.seed = seed
+        self.keys = keys or KeyboardEventListener(backend="none")
+        self.intervention = intervention or InterventionManager()
+        self._action_normalizer = ActionNormalizer(preprocessor, action_dim)
         # Same step the eval script inserts for LIBERO; without it the policy
         # receives a nested robot_state dict instead of `observation.state`.
         self.env_preprocessor = PolicyProcessorPipeline(steps=[LiberoProcessorStep()])
@@ -179,30 +199,50 @@ class LiberoChunkEnv:
         arr = np.asarray(out[0].detach().cpu(), dtype=np.float32)
         return arr[: self.action_dim]
 
-    def step(self, action: Tensor) -> tuple[dict, float, bool]:
+    def env_action_to_normalized(self, raw) -> Tensor:
+        """Teleop command in LIBERO's [-1, 1] delta-EE box -> normalized action."""
+        return self._action_normalizer(raw)
+
+    def apply_action(self, action: Tensor) -> tuple[dict, float, bool, bool]:
+        """Execute one normalized action; returns (obs, reward, done, truncated)."""
         env_action = self._normalized_to_env_action(action)
         obs, _reward, terminated, _truncated, info = self._env.step(env_action)
         self._steps += 1
 
         success = bool(info.get("is_success", False))
+        # The failure key is the operator's only way to end a doomed episode:
+        # the simulator itself never reports failure, so without it a bad
+        # rollout burns the full step limit before the buffer sees a terminal.
+        _key_success, key_failure = self.keys.poll_outcome()
         reward = 1.0 if success else 0.0
+        done = terminated or success or key_failure
+        truncated = (not done) and self._steps >= self.max_episode_steps
         # LiberoEnv.step auto-resets on termination, so on a terminal step `obs`
         # already belongs to the *next* episode. Safe only because a terminal
         # transition masks its bootstrap — never use it as a non-terminal x_next.
-        return obs, reward, terminated or success
+        return obs, reward, done, truncated
+
+    def step(self, action: Tensor) -> tuple[dict, float, bool]:
+        obs, reward, done, _ = self.apply_action(action)
+        return obs, reward, done
 
     def run_intervention(self, chunk_len: int) -> InterventionResult | None:
-        return None  # no human in the loop in simulation
+        return self.intervention.run_chunk(chunk_len)
 
     def intervention_pending(self) -> bool:
-        return False
+        return self.intervention.check()
 
-    # ------------------------------------------------------------------ reset
     def reset(self) -> dict:
         obs, _info = self._env.reset(seed=self.seed + self._episode)
         self._steps = 0
         self._episode += 1
+        self.keys.reset_episode_flags()
+        self.keys.clear_intervention()
+        self.intervention.on_reset()
         return obs
 
     def close(self) -> None:
-        self._env.close()
+        try:
+            self.intervention.close()
+        finally:
+            self._env.close()

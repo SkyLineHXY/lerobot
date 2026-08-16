@@ -28,7 +28,7 @@ import time
 
 import numpy as np
 
-from lerobot.rlt.intervention import KeyboardEventListener
+from lerobot.rlt.teleop.keys import KeyboardEventListener
 from lerobot.teleoperators.piper_leader import PiperLeader, PiperLeaderConfig
 
 logger = logging.getLogger(__name__)
