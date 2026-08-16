@@ -13,16 +13,17 @@ policy:
   vlm_model_name: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
   load_vlm_weights: true
 
-  freeze_vision_encoder: true
+  freeze_vision_encoder: false
   train_expert_only: false
   num_steps: 10
 
 dataset:
-  # LeRobot 的 libero_* 数据集特征布局都是 observation.images.image +
-  # observation.images.wrist_image + observation.state(8) + action(7)；下面 env 的
-  # camera_name_mapping 就是照着这两个图像键写的。
-  # 本地已下载的是 $HF_LEROBOT_HOME/lerobot/libero_10（379 集 / 101469 帧 / 10 个任务）。
-  repo_id: lerobot/libero_goal
+  # 别用 IPEC-COMMUNITY/libero_goal_no_noops_1.0.0_lerobot：数据本身没问题（和这个
+  # 仓库逐帧相同），但它是 v2.1、Hub 上没有版本 tag，而且夹爪动作是 {0,1} 且方向相反
+  # （1=张开），送进 LIBERO 仿真会永远张不开手。lerobot/ 这版已经换算成 {-1,+1}。
+  # 图像是 PNG 存储，约 6.3GB；只想省流量可以用已在本地的 lerobot/libero_10（0.65GB，
+  # 视频存储），env.task 同步改成 libero_10。
+  repo_id: lerobot/libero_goal_image
   root: null
   video_backend: pyav
   use_imagenet_stats: false
@@ -46,8 +47,8 @@ env:
   task_ids: [0, 1]
   max_parallel_tasks: 1
 
-output_dir: outputs/train/smolvla_libero_10
-job_name: smolvla_libero_10
+output_dir: outputs/train/smolvla_sft_libero_goal_20260816
+job_name: smolvla_sft_libero_goal_20260816
 seed: 1000
 
 steps: 40000

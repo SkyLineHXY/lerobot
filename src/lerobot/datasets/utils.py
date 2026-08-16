@@ -30,6 +30,7 @@ import pandas
 import pandas as pd
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
+import requests
 import torch
 from datasets import Dataset
 from datasets.table import embed_table_storage
@@ -527,16 +528,28 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     hub_versions = get_repo_versions(repo_id)
 
     if not hub_versions:
+        # huggingface_hub >= 1.0 made `response` a required kwarg on HfHubHTTPError subclasses.
+        # Raising without it dies with a TypeError inside the raise, hiding the message below —
+        # so the user sees an unrelated traceback instead of "your dataset has no version tag".
+        response = requests.Response()
+        response.status_code = 404
         raise RevisionNotFoundError(
-            f"""Your dataset must be tagged with a codebase version.
-            Assuming _version_ is the codebase_version value in the info.json, you can run this:
+            f"""The dataset '{repo_id}' has no codebase version tag on the Hub, so its layout version
+            cannot be resolved. Third-party conversions are often published untagged; a v2.x dataset also
+            has to be converted to v3.0 before this codebase can read it:
+            ```bash
+            python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
+                --repo-id={repo_id} --push-to-hub=false
+            ```
+            If the dataset is already in the right layout, tag it with its codebase_version from info.json:
             ```python
             from huggingface_hub import HfApi
 
             hub_api = HfApi()
             hub_api.create_tag("{repo_id}", tag="_version_", repo_type="dataset")
             ```
-            """
+            """,
+            response=response,
         )
 
     if target_version in hub_versions:
