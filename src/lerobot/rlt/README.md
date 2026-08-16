@@ -34,14 +34,14 @@
 
 ---
 
-## 2. 模块地图
+## 2. 代码架构
 
 ```
 rlt/
-├── train_rl_token.py     阶段 1 入口
-├── eval_rl_token.py      阶段 1 表征质量诊断（重建/坍缩/线性可解码/时序结构）
-├── train_online.py       阶段 2 入口：只做装配 + 主循环 + 收尾
-├── rollout.py            RolloutWorker：规划一个 chunk、执行、组装 ChunkRecord
+├── train_rl_token.py     RLtoken 阶段 1 表征学习训练入口
+├── eval_rl_token.py      阶段 1 表征质量诊断（重建/表征坍缩/线性可解码/时序结构）
+├── train_online.py       阶段 2 在线强化学习入口
+├── rollout.py            RolloutWorker：规划一个 chunk、执行 ChunkRecord
 ├── learner.py            LearnerThread + ActorMirror：异步梯度步与权重发布
 ├── replay_buffer.py      ChunkReplayBuffer：chunk 级 transition，stride 子采样
 ├── collect_libero.py     用键盘/手柄在 LIBERO 里示教，采集成 LeRobotDataset
