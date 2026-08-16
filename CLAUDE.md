@@ -55,6 +55,7 @@ lerobot-replay-piper --root=<dataset_root> --repo_id=<repo_id> --episode=0
 
 # RLT online RL
 lerobot-rlt-train-token / lerobot-rlt-train-online / lerobot-rlt-eval-token
+lerobot-rlt-collect-libero --config_path examples/rlt/collect_libero.yaml  # keyboard/gamepad demos in sim
 lerobot-eval --config_path examples/rlt/eval_libero_smolvla.yaml   # stage-2 baseline: frozen VLA before RL token/critic
 ```
 
@@ -172,7 +173,7 @@ gripper frame on change.
 `JointCtrl` with the arm's current pose (avoids snapping to a stale latched target), then requests
 CAN mode. Only raises — asking for a physical power-cycle — after `recover_attempts` rounds fail.
 
-**`rate_limit_joints()` (`rlt/piper_env.py`) scales the whole vector uniformly** to preserve
+**`rate_limit_joints()` (`rlt/envs/piper.py`) scales the whole vector uniformly** to preserve
 direction. A high saturation rate at exit means the recorded action no longer matches human intent —
 raise `max_joint_step_rad` and re-collect.
 
