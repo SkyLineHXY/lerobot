@@ -27,6 +27,7 @@ import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from torch import Tensor
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.envs.configs import EnvConfig
 from lerobot.processor import RobotObservation
@@ -128,6 +129,47 @@ def env_to_policy_features(env_cfg: EnvConfig) -> dict[str, PolicyFeature]:
         policy_features[policy_key] = feature
 
     return policy_features
+
+
+def check_env_policy_image_keys(
+    env_cfg: EnvConfig,
+    policy_cfg: PreTrainedConfig,
+    rename_map: dict[str, str] | None = None,
+) -> None:
+    """Check that the images the env emits are keyed the way the policy reads them.
+
+    Policies look their cameras up by key and ignore everything else in the batch, so a naming
+    mismatch drops a whole camera without raising anything: the eval then reports a success rate for
+    a policy that was running on fewer views than it was trained with.
+    """
+    expected = set(policy_cfg.image_features)
+    if not expected:
+        return
+
+    rename_map = rename_map or {}
+    provided = {
+        rename_map.get(key, key)
+        for key, ft in env_to_policy_features(env_cfg).items()
+        if ft.type is FeatureType.VISUAL
+    }
+    missing = sorted(expected - provided)
+    if not missing:
+        return
+
+    unused = sorted(provided - expected)
+    hint = (
+        "Set `env.camera_name_mapping` to the dataset's camera keys"
+        if "libero" in env_cfg.type
+        else "Use `--rename_map` to align the env keys with the policy's"
+    )
+    message = (
+        f"Env '{env_cfg.type}' does not provide the image keys {missing} that the policy expects"
+        f"{f'; it provides unused {unused} instead' if unused else ''}. "
+        f"{hint}; the policy would otherwise silently run without those cameras."
+    )
+    if unused:
+        raise ValueError(message)
+    warnings.warn(message, UserWarning, stacklevel=2)
 
 
 def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:

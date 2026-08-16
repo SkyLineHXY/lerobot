@@ -3,52 +3,48 @@
 #   python -m lerobot.scripts.lerobot_train \
 #     --config_path examples/rlt/train_smolvla_libero.yaml \
 #     --policy.device=cuda:1 --policy.push_to_hub=false
-#
-# 注意用 `python -m`，不要用 lerobot-train：~/.local/bin 下有一个指向已删除解释器
-# 的同名旧脚本会把 PATH 抢走。
-#
-# --policy.push_to_hub=false 不能省：smolvla_base 的 config.json 里 push_to_hub 为
-# true，validate() 会要求配套的 policy.repo_id，否则报 "'policy.repo_id' argument
-# missing"。要推到 Hub 就改成
-#     --policy.push_to_hub=true --policy.repo_id=<你的用户名>/smolvla_libero
-#
-# 断点续训：
-#   python -m lerobot.scripts.lerobot_train \
-#     --config_path outputs/train/smolvla_libero_10/checkpoints/last/pretrained_model/train_config.json \
-#     --resume=true
-#
-# 为什么要自己训：lerobot/smolvla_libero 实测不可用 —— libero_10 上 0/100 成功，
-# libero_spatial 同样 0%，开环动作 MSE 只有「什么都不做」基线的 0.65 倍（好的策略
-# 应该远低于 0.1）。稀疏奖励的 stage-2 在 0% 基座上拿不到任何学习信号。
-
 policy:
   type: smolvla
   pretrained_path: lerobot/smolvla_base
   chunk_size: 50
-  n_action_steps: 50
+  n_action_steps: 30
   max_state_dim: 32
   max_action_dim: 32
   vlm_model_name: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
   load_vlm_weights: true
-  # 冻结视觉塔：显存从约 22GB 降到能塞进单张 4090 的量级，也是 SmolVLA 官方微调
-  # recipe 的默认档。显存宽裕时可以打开重训视觉塔。
+
   freeze_vision_encoder: true
   train_expert_only: false
   num_steps: 10
 
 dataset:
-  # 本地已有：$HF_LEROBOT_HOME/lerobot/libero_10，379 集 / 101469 帧 / 10 个任务。
-  # 特征布局 observation.images.image + observation.images.wrist_image +
-  # observation.state(8) + action(7)，与 LiberoChunkEnv 喂给策略的完全一致。
-  repo_id: lerobot/libero_10
+  # LeRobot 的 libero_* 数据集特征布局都是 observation.images.image +
+  # observation.images.wrist_image + observation.state(8) + action(7)；下面 env 的
+  # camera_name_mapping 就是照着这两个图像键写的。
+  # 本地已下载的是 $HF_LEROBOT_HOME/lerobot/libero_10（379 集 / 101469 帧 / 10 个任务）。
+  repo_id: lerobot/libero_goal
   root: null
   video_backend: pyav
   use_imagenet_stats: false
 
-# 训练中不开仿真评估：LiberoEnv 的 features_map 把腕部相机硬编码成
-# observation.images.image2，与本数据集的 wrist_image 对不上，在线评估会静默丢一路
-# 相机。评估改用外部脚本按 LiberoChunkEnv 的真实路径跑。
-env: null
+# 训练中的仿真评估。camera_name_mapping 是关键：LIBERO 原始相机名要映射到本数据集
+# 的图像键，否则腕部相机会被映射成 image2，而策略只认 wrist_image，会被静默丢掉一路
+# 相机（现在 check_env_policy_image_keys 会直接报错，不再静默）。
+# task 必须和 dataset.repo_id 的 suite 一致，否则评的是另一批任务。
+env:
+  type: libero
+  task: libero_goal
+  camera_name: agentview_image,robot0_eye_in_hand_image
+  camera_name_mapping:
+    agentview_image: image
+    robot0_eye_in_hand_image: wrist_image
+  obs_type: pixels_agent_pos
+  observation_height: 256
+  observation_width: 256
+  # 只评前两个任务：一次完整 rollout 要跑几百步仿真 + 策略前向，全 suite 评一轮
+  # 比训练本身还慢。想看全量成功率就删掉 task_ids，用 lerobot-eval 单独跑。
+  task_ids: [0, 1]
+  max_parallel_tasks: 1
 
 output_dir: outputs/train/smolvla_libero_10
 job_name: smolvla_libero_10
@@ -61,6 +57,11 @@ num_workers: 8
 log_freq: 100
 save_freq: 5000
 save_checkpoint: true
+eval_freq: 5000
+eval:
+  n_episodes: 10
+  batch_size: 5
+  use_async_envs: false
 
 wandb:
   enable: false

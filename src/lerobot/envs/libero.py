@@ -30,6 +30,7 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.processor import RobotObservation
+from lerobot.utils.constants import LIBERO_DEFAULT_CAMERA_NAME_MAPPING
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -130,16 +131,14 @@ class LiberoEnv(gym.Env):
             camera_name
         )  # agentview_image (main) or robot0_eye_in_hand_image (wrist)
 
-        # Map raw camera names to "image1" and "image2".
-        # The preprocessing step `preprocess_observation` will then prefix these with `.images.*`,
-        # following the LeRobot convention (e.g., `observation.images.image`, `observation.images.image2`).
-        # This ensures the policy consistently receives observations in the
-        # expected format regardless of the original camera naming.
-        if camera_name_mapping is None:
-            camera_name_mapping = {
-                "agentview_image": "image",
-                "robot0_eye_in_hand_image": "image2",
-            }
+        # Map raw camera names to the dataset's image keys: `preprocess_observation` prefixes them
+        # with `observation.images.`, and the policy looks its cameras up by that name. A camera the
+        # policy does not declare is dropped without an error, so the mapping must match the dataset
+        # the policy was trained on (`camera_name_mapping` on `LiberoEnv` config).
+        camera_name_mapping = dict(camera_name_mapping or LIBERO_DEFAULT_CAMERA_NAME_MAPPING)
+        unmapped = [cam for cam in self.camera_name if cam not in camera_name_mapping]
+        if unmapped:
+            raise ValueError(f"camera_name_mapping has no entry for cameras {unmapped}.")
         self.camera_name_mapping = camera_name_mapping
         self.num_steps_wait = num_steps_wait
         self.episode_index = episode_index

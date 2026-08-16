@@ -92,3 +92,12 @@ LIBERO_KEY_JOINTS_POS = "robot_state/joints/pos"
 LIBERO_KEY_JOINTS_VEL = "robot_state/joints/vel"
 LIBERO_KEY_PIXELS_AGENTVIEW = "pixels/agentview_image"
 LIBERO_KEY_PIXELS_EYE_IN_HAND = "pixels/robot0_eye_in_hand_image"
+LIBERO_PIXELS_PREFIX = "pixels/"
+# LIBERO camera -> LeRobot image key suffix, i.e. `observation.images.<suffix>`. The default matches
+# the `HuggingFaceVLA/libero` conversion; datasets converted differently (`lerobot/libero_10` names
+# the wrist camera `wrist_image`) must override it via `LiberoEnv.camera_name_mapping`, otherwise the
+# policy silently receives one camera fewer than it was trained on.
+LIBERO_DEFAULT_CAMERA_NAME_MAPPING = {
+    "agentview_image": "image",
+    "robot0_eye_in_hand_image": "image2",
+}

@@ -32,7 +32,7 @@ from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.utils import close_envs
+from lerobot.envs.utils import check_env_policy_image_keys, close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -242,6 +242,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+
+    if cfg.env is not None and is_main_process:
+        check_env_policy_image_keys(cfg.env, policy.config, cfg.rename_map)
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")

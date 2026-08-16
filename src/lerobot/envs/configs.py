@@ -23,6 +23,7 @@ from lerobot.robots import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.constants import (
     ACTION,
+    LIBERO_DEFAULT_CAMERA_NAME_MAPPING,
     LIBERO_KEY_EEF_MAT,
     LIBERO_KEY_EEF_POS,
     LIBERO_KEY_EEF_QUAT,
@@ -30,8 +31,7 @@ from lerobot.utils.constants import (
     LIBERO_KEY_GRIPPER_QVEL,
     LIBERO_KEY_JOINTS_POS,
     LIBERO_KEY_JOINTS_VEL,
-    LIBERO_KEY_PIXELS_AGENTVIEW,
-    LIBERO_KEY_PIXELS_EYE_IN_HAND,
+    LIBERO_PIXELS_PREFIX,
     OBS_ENV_STATE,
     OBS_IMAGE,
     OBS_IMAGES,
@@ -230,6 +230,7 @@ class ResetConfig:
 @dataclass
 class HILSerlProcessorConfig:
     """Configuration for environment processing pipeline."""
+
     control_mode: str = "gamepad"
     observation: ObservationConfig | None = None
     image_preprocessing: ImagePreprocessingConfig | None = None
@@ -248,7 +249,7 @@ class HILSerlRobotEnvConfig(EnvConfig):
     robot: RobotConfig | None = None
     teleop: TeleoperatorConfig | None = None
     processor: HILSerlProcessorConfig = field(default_factory=HILSerlProcessorConfig)
-    type:str = "gym_manipulator"
+    type: str = "gym_manipulator"
     name: str = "real_robot"
 
     @property
@@ -268,8 +269,10 @@ class LiberoEnv(EnvConfig):
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
     camera_name_mapping: dict[str, str] | None = None
-    observation_height: int = 360
-    observation_width: int = 360
+    # LIBERO datasets are rendered at 256x256; keep the env identical or the policy sees a different
+    # field of view at eval than it was trained on.
+    observation_height: int = 256
+    observation_width: int = 256
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -285,27 +288,39 @@ class LiberoEnv(EnvConfig):
             LIBERO_KEY_GRIPPER_QVEL: f"{OBS_STATE}.gripper_qvel",
             LIBERO_KEY_JOINTS_POS: f"{OBS_STATE}.joint_pos",
             LIBERO_KEY_JOINTS_VEL: f"{OBS_STATE}.joint_vel",
-            LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
-            LIBERO_KEY_PIXELS_EYE_IN_HAND: f"{OBS_IMAGES}.image2",
         }
     )
     control_mode: str = "relative"  # or "absolute"
 
+    @property
+    def camera_names(self) -> list[str]:
+        return [c.strip() for c in self.camera_name.split(",") if c.strip()]
+
     def __post_init__(self):
-        if self.obs_type == "pixels":
-            self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
+        if self.obs_type not in ("pixels", "pixels_agent_pos"):
+            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+        cameras = self.camera_names
+        if not cameras:
+            raise ValueError("`camera_name` must name at least one LIBERO camera.")
+        mapping = dict(self.camera_name_mapping or LIBERO_DEFAULT_CAMERA_NAME_MAPPING)
+        unmapped = [cam for cam in cameras if cam not in mapping]
+        if unmapped:
+            raise ValueError(
+                f"`camera_name_mapping` has no entry for {unmapped}. Every camera in `camera_name` "
+                f"must be mapped to the `{OBS_IMAGES}.<key>` the policy was trained with."
+            )
+        # The gym env, the policy features and the normalizer stats all key cameras through this
+        # mapping. Deriving them from one place is what stops eval from silently feeding the policy
+        # a camera name it does not know — policies skip unknown image keys without complaining.
+        self.camera_name_mapping = {cam: mapping[cam] for cam in cameras}
+        for cam, key in self.camera_name_mapping.items():
+            self.features[f"{LIBERO_PIXELS_PREFIX}{cam}"] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
             )
-            self.features[LIBERO_KEY_PIXELS_EYE_IN_HAND] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
-        elif self.obs_type == "pixels_agent_pos":
-            self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
-            self.features[LIBERO_KEY_PIXELS_EYE_IN_HAND] = PolicyFeature(
-                type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
-            )
+            self.features_map[f"{LIBERO_PIXELS_PREFIX}{cam}"] = f"{OBS_IMAGES}.{key}"
+
+        if self.obs_type == "pixels_agent_pos":
             self.features[LIBERO_KEY_EEF_POS] = PolicyFeature(
                 type=FeatureType.STATE,
                 shape=(3,),
@@ -334,12 +349,16 @@ class LiberoEnv(EnvConfig):
                 type=FeatureType.STATE,
                 shape=(7,),
             )
-        else:
-            raise ValueError(f"Unsupported obs_type: {self.obs_type}")
 
     @property
     def gym_kwargs(self) -> dict:
-        kwargs: dict[str, Any] = {"obs_type": self.obs_type, "render_mode": self.render_mode}
+        kwargs: dict[str, Any] = {
+            "obs_type": self.obs_type,
+            "render_mode": self.render_mode,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+            "camera_name_mapping": self.camera_name_mapping,
+        }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
         return kwargs

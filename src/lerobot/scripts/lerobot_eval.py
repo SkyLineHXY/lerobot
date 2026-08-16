@@ -75,6 +75,7 @@ from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import (
     add_envs_task,
     check_env_attributes_and_types,
+    check_env_policy_image_keys,
     close_envs,
     preprocess_observation,
 )
@@ -532,6 +533,7 @@ def eval_main(cfg: EvalPipelineConfig):
     )
 
     policy.eval()
+    check_env_policy_image_keys(cfg.env, policy.config, cfg.rename_map)
 
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
