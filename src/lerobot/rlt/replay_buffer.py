@@ -250,11 +250,20 @@ class ChunkReplayBuffer:
         self._episode_added += 1
 
     # ------------------------------------------------------------- sampling
-    def sample(self, batch_size: int) -> dict[str, Tensor]:
+    def sample(self, batch_size: int) -> dict[str, Tensor] | None:
+        """Draw a batch, or None if the buffer is empty right now.
+
+        The caller's `len(buffer) >= batch_size` check cannot be trusted: the
+        rollout thread may call `discard_episode` in between, which shrinks the
+        buffer and can empty it outright. So emptiness is re-tested here, under
+        the same lock that does the gather.
+        """
         # The host-side gather happens under the lock; only the (asynchronous)
         # host-to-device copies are left outside it, so a concurrent write can
         # never land in a row this batch is still reading.
         with self._lock:
+            if self.size == 0:
+                return None
             idx = torch.randint(0, self.size, (batch_size,), generator=self._gen)
             batch = {
                 "x": self.x[idx],

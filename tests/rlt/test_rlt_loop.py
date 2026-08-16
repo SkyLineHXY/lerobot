@@ -292,3 +292,10 @@ def test_discard_episode_drops_the_whole_episode():
     for _ in range(4):
         worker.run_chunk(use_actor=False)
     assert len(buffer) > 0
+
+
+def test_mock_env_can_be_closed():
+    """train() 的 finally 无条件调 env.close()；缺这个方法会盖掉真正的异常。"""
+    env = MockManipEnv(action_dim=D, max_episode_steps=40)
+    env.reset()
+    env.close()

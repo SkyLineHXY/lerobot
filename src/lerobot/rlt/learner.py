@@ -187,6 +187,8 @@ class LearnerThread(threading.Thread):
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
                 batch = self.buffer.sample(cfg.batch_size)
+                if batch is None:  # operator discarded the episode mid-burst
+                    break
                 metrics = self.agent.update(batch, allow_actor=self.allow_actor_updates)
                 self._recent.append(metrics)
                 self.updates += 1
