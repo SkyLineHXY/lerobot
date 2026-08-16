@@ -26,6 +26,7 @@ is dropped rather than stored with a fabricated next state.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,15 +86,24 @@ class ChunkReplayBuffer:
         self._pending: ChunkRecord | None = None
         self._gammas = discount ** torch.arange(chunk_len).float()
         self._gen = torch.Generator().manual_seed(seed)
+        # The rollout thread writes and the learner thread samples. Appending
+        # alone would be safe enough (rows are filled before `size` moves), but
+        # `discard_episode` *rewinds* the write pointer and shrinks `size`, so a
+        # concurrent `sample` can draw rows that are about to be overwritten.
+        # Write bursts are microseconds; sampling is the only hot path.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------- assembly
+    # Everything below the public methods runs with `self._lock` already held;
+    # `_store` and the `_emit_*` helpers must never take it themselves.
     def start_episode(self) -> None:
-        if self._pending is not None:
-            # Previous episode ended without an explicit terminal/truncation
-            # signal; we have no trustworthy next state, so drop it.
-            self._pending = None
-        self._episode_ptr = self._ptr
-        self._episode_added = 0
+        with self._lock:
+            if self._pending is not None:
+                # Previous episode ended without an explicit terminal/truncation
+                # signal; we have no trustworthy next state, so drop it.
+                self._pending = None
+            self._episode_ptr = self._ptr
+            self._episode_added = 0
 
     def discard_episode(self) -> int:
         """Drop everything the current episode has stored. Returns the count.
@@ -107,29 +117,31 @@ class ChunkReplayBuffer:
         wrong transitions. In that case we keep them and say so — a real run
         (200k capacity, ~10^2 transitions per episode) never gets there.
         """
-        self._pending = None
-        n = self._episode_added
-        if n == 0:
-            return 0
-        if self.size >= self.capacity or n > self.size:
-            self._episode_ptr = self._ptr
+        with self._lock:
+            self._pending = None
+            n = self._episode_added
+            if n == 0:
+                return 0
+            if self.size >= self.capacity or n > self.size:
+                self._episode_ptr = self._ptr
+                self._episode_added = 0
+                return 0
+            self._ptr = self._episode_ptr
+            self.size -= n
+            self.total_added -= n  # keep the learner's UTD pacing honest
             self._episode_added = 0
-            return 0
-        self._ptr = self._episode_ptr
-        self.size -= n
-        self.total_added -= n  # keep the learner's UTD pacing honest
-        self._episode_added = 0
-        return n
+            return n
 
     def add_chunk(self, rec: ChunkRecord) -> None:
         """Feed one executed chunk; emits transitions for the previous one."""
-        if self._pending is not None:
-            self._emit_pair(self._pending, rec)
-        if rec.done:
-            self._flush_terminal(rec)
-            self._pending = None
-        else:
-            self._pending = rec
+        with self._lock:
+            if self._pending is not None:
+                self._emit_pair(self._pending, rec)
+            if rec.done:
+                self._flush_terminal(rec)
+                self._pending = None
+            else:
+                self._pending = rec
 
     def end_episode(self, x_last: Tensor | None = None) -> None:
         """Call when an episode ends without `done` (e.g. time-limit truncation).
@@ -138,9 +150,10 @@ class ChunkReplayBuffer:
         required to bootstrap a truncated window; without it the pending chunk
         is dropped instead of being stored against a fabricated next state.
         """
-        if self._pending is not None:
-            self._flush_terminal(self._pending, truncated=True, x_last=x_last)
-        self._pending = None
+        with self._lock:
+            if self._pending is not None:
+                self._flush_terminal(self._pending, truncated=True, x_last=x_last)
+            self._pending = None
 
     def _emit_pair(self, k: ChunkRecord, k1: ChunkRecord) -> None:
         c = self.chunk_len
@@ -238,18 +251,24 @@ class ChunkReplayBuffer:
 
     # ------------------------------------------------------------- sampling
     def sample(self, batch_size: int) -> dict[str, Tensor]:
-        idx = torch.randint(0, self.size, (batch_size,), generator=self._gen)
-        dev = self.device
-        return {
-            "x": self.x[idx].to(dev),
-            "action": self.action[idx].to(dev),
-            "ref": self.ref[idx].to(dev),
-            "reward_disc": self.reward_disc[idx].to(dev),
-            "x_next": self.x_next[idx].to(dev),
-            "ref_next": self.ref_next[idx].to(dev),
-            "done": self.done[idx].to(dev),
-            "actual_steps": self.actual_steps[idx].to(dev),
-        }
+        # The host-side gather happens under the lock; only the (asynchronous)
+        # host-to-device copies are left outside it, so a concurrent write can
+        # never land in a row this batch is still reading.
+        with self._lock:
+            idx = torch.randint(0, self.size, (batch_size,), generator=self._gen)
+            batch = {
+                "x": self.x[idx],
+                "action": self.action[idx],
+                "ref": self.ref[idx],
+                "reward_disc": self.reward_disc[idx],
+                "x_next": self.x_next[idx],
+                "ref_next": self.ref_next[idx],
+                "done": self.done[idx],
+                "actual_steps": self.actual_steps[idx],
+            }
+        if self.device.type != "cuda":
+            return batch
+        return {k: v.pin_memory().to(self.device, non_blocking=True) for k, v in batch.items()}
 
     def __len__(self) -> int:
         return self.size
@@ -257,6 +276,10 @@ class ChunkReplayBuffer:
     # ------------------------------------------------------------------- io
     def save(self, path: str | Path) -> None:
         """Persist the buffer so a real-robot run can resume after a stop."""
+        with self._lock:
+            self._save_locked(path)
+
+    def _save_locked(self, path: str | Path) -> None:
         n = self.size
         torch.save(
             {

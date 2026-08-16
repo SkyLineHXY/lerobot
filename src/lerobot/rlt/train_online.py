@@ -37,6 +37,7 @@ overridden on the command line:
   python -m lerobot.rlt.train_online --config_path examples/rlt/piper_online.yaml \
     --env.dry_run=true
 """
+import logging
 import time
 from pathlib import Path
 
@@ -57,6 +58,8 @@ from .learner import ActorMirror, LearnerThread
 from .replay_buffer import ChunkReplayBuffer
 from .rollout import RolloutWorker
 from .teleop.keys import KeyboardEventListener
+
+logger = logging.getLogger(__name__)
 
 
 def load_rl_token(path: str | Path, device: str) -> tuple[RLTokenModule, RLTokenConfig]:
@@ -143,6 +146,7 @@ def train(cfg: RLTOnlineTrainConfig):
         t0 = time.time()
 
         while env_steps < rl.total_env_steps:
+            learner.raise_if_failed()
             if keys.should_quit():
                 print("[stage2] operator requested stop.")
                 break
@@ -189,21 +193,38 @@ def train(cfg: RLTOnlineTrainConfig):
                 )
 
             if env_steps // cfg.save_freq != prev_steps // cfg.save_freq:
-                torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
-                buffer.save(out_dir / "replay_buffer.pt")
+                _checkpoint(agent, buffer, out_dir, learner)
     finally:
-        keys.stop()
-        try:
-            learner.stop()
-            learner.join(timeout=5.0)
-        except (NameError, RuntimeError):
-            pass
-        if env is not None:
-            env.close()
+        # Each step gets its own try/except: an exception raised while tearing
+        # down masks whatever actually ended the run.
+        for label, teardown in (
+            ("keyboard", keys.stop),
+            ("learner", lambda: (learner.stop(), learner.join(timeout=5.0))),
+            ("env", (env.close if env is not None else lambda: None)),
+        ):
+            try:
+                teardown()
+            except Exception:
+                logger.exception("[stage2] %s teardown failed", label)
 
-    torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
-    buffer.save(out_dir / "replay_buffer.pt")
+    _checkpoint(agent, buffer, out_dir)
     print(f"[stage2] done; {episodes} episodes, saved to {out_dir / 'rlt_agent.pt'}")
+
+
+def _checkpoint(agent, buffer, out_dir: Path, learner=None) -> None:
+    """Write the agent and buffer with the learner held between gradient steps.
+
+    `agent.state_dict()` runs on the main thread; without pausing it can land
+    mid-optimizer-step and persist an actor and critic that disagree.
+    """
+    if learner is not None and not learner.pause():
+        logger.warning("[stage2] learner did not pause in time; checkpoint may be torn")
+    try:
+        torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
+        buffer.save(out_dir / "replay_buffer.pt")
+    finally:
+        if learner is not None:
+            learner.resume()
 
 
 @parser.wrap()
