@@ -207,7 +207,6 @@ class TeleopChecker:
         self.leader = None
         self.normalizer = None
 
-        # Timing buffers
         self.t_leader: list[float] = []
         self.t_obs: list[float] = []
         self.t_map: list[float] = []
@@ -398,7 +397,6 @@ class TeleopChecker:
                     self._on_disengage()
                 prev_engaged = engaged
 
-                # 1) leader reading
                 t0 = time.perf_counter()
                 leader_action = self.read_leader()
                 self.t_leader.append(time.perf_counter() - t0)
@@ -407,7 +405,7 @@ class TeleopChecker:
                 self.stale_leader.append(ts <= last_ts)
                 last_ts = ts
 
-                # 2) follower observation (cameras included), same cost as training
+                # Cameras included, so this costs what it costs during training.
                 t0 = time.perf_counter()
                 _obs, measured = self.read_follower()
                 self.t_obs.append(time.perf_counter() - t0)
@@ -423,13 +421,11 @@ class TeleopChecker:
                 if engaged:
                     self.saturated.append(bool(saturated))
 
-                # 4) send
                 t0 = time.perf_counter()
                 if engaged and not cfg.dry_run:
                     self._send_to_follower(limited)
                 self.t_write.append(time.perf_counter() - t0)
 
-                # 5) normalisation round-trip (optional)
                 if self.normalizer is not None:
                     self._check_normalization(target)
 

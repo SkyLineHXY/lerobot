@@ -249,10 +249,6 @@ class KeyboardEventListener:
             )
         self.backend = backend
         self._impl = None
-        # Keys the six built-in bindings don't claim. `_read_keys` drains the
-        # backend in one go, so a caller that polls the backend itself would
-        # always find it empty — tools with their own hotkeys must read them
-        # from here instead. Bounded so stray typing can't grow without limit.
         self._extra: deque[str] = deque(maxlen=64)
         self._success = False
         self._failure = False
@@ -405,7 +401,7 @@ class PiperLeaderIntervention(InterventionManager):
         max_takeover_delta_rad: float = 0.15,
     ):
         self.leader = leader
-        self.env = env  # PiperChunkEnv; used for stepping and observations
+        self.env = env  # PiperChunkEnv
         self.keys = keys
         # `get_action()` returns offsets from the calibrated neutral pose; the
         # stage-1 dataset actions are absolute joint angles. Default to the

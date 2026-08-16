@@ -205,7 +205,6 @@ def collect(cfg: RLTokenEvalConfig):
         recon_errs.append(float(loss))
 
         z_rl_all.append(z_rl.float().cpu())
-        # Baseline: mean-pooled raw VLA embeddings over valid tokens.
         m = mask.unsqueeze(-1).float()
         z_pool_all.append(((z * m).sum(1) / m.sum(1).clamp(min=1)).float().cpu())
 
