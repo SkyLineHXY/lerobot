@@ -493,6 +493,32 @@ python -m lerobot.rlt.gravity_probe --port can1
 
 ## 8. 排障
 
+### 「mode=processes 时进程无限自我复制 / 一开就卡死」
+
+自己写的驱动脚本没有 `if __name__ == "__main__":` 保护。多进程后端用 `spawn`
+（CUDA context 不能安全 fork），子进程会重新导入主模块，没有保护就会再次执行建后端
+的代码，递归拉起进程。
+
+仓库自带的入口（`python -m lerobot.rlt.train_online`、`lerobot-rlt-train-online`）
+都有这个保护，不受影响。
+
+---
+
+### 「mode=processes 连不上 learner，每个 RPC 都是 UNAVAILABLE，报的端口还不是我配的」
+
+gRPC 默认会走 `http_proxy` / `https_proxy`。客户端已显式关掉
+`grpc.enable_http_proxy`，如果仍然出现，先确认没有别的中间件在劫持本机回环。
+
+---
+
+### 「mode=processes 时 learner 只做了几十次更新就再也不动了」
+
+先看 learner 进程自己的 stderr：它的异常不会出现在 rollout 的日志里，rollout 只会
+报 `RLT learner process exited with code N`。
+
+---
+
+
 ### 「按键完全没反应」
 
 如果 stdin 不是终端，同时系统中又没有 DISPLAY，那么 `termios` 和 `pynput` 两个后端都无法正常启动。
