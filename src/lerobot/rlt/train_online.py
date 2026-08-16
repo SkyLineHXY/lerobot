@@ -53,9 +53,8 @@ from lerobot.policies.rlt import (
     load_smolvla_policy,
 )
 
+from .backends import make_backend
 from .envs import make_chunk_env
-from .learner import ActorMirror, LearnerThread
-from .replay_buffer import ChunkReplayBuffer
 from .rollout import RolloutWorker
 from .teleop.keys import KeyboardEventListener
 
@@ -100,7 +99,6 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
 
 
 def train(cfg: RLTOnlineTrainConfig):
-    device = cfg.device
     rl = cfg.rl
     torch.manual_seed(cfg.seed)
 
@@ -108,24 +106,11 @@ def train(cfg: RLTOnlineTrainConfig):
 
     out_dir = Path(cfg.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     x_dim = rl.ac.rl_token_dim + rl.ac.proprio_dim
-    buffer = ChunkReplayBuffer(
-        capacity=rl.buffer_capacity,
-        x_dim=x_dim,
-        chunk_len=rl.ac.chunk_len,
-        action_dim=rl.ac.action_dim,
-        discount=rl.discount,
-        stride=rl.subsample_stride,
-        device=device,
-        seed=cfg.seed,
-    )
-    if cfg.resume_buffer:
-        buffer.load(cfg.resume_buffer)
-        print(f"[stage2] resumed buffer with {len(buffer)} transitions")
 
     keys = KeyboardEventListener(backend=cfg.keyboard_backend, discard_key=cfg.discard_key)
     env = None
+    backend = None
     try:
         # Build the env *before* putting stdin in cbreak mode: connecting the
         # leader can drop into the interactive calibration flow, whose `input()`
@@ -133,26 +118,24 @@ def train(cfg: RLTOnlineTrainConfig):
         env = make_chunk_env(cfg, keys, policy=_policy)
         keys.start()
 
-        mirror = ActorMirror(rl, device)
-        controller.agent = mirror  # rollout reads published weights, not live ones
-        worker = RolloutWorker(env, controller, buffer, rl.subsample_stride, keys=keys)
-
-        learner = LearnerThread(agent, buffer, rl)
-        mirror.sync(learner)
-        learner.start()
+        backend = make_backend(cfg, agent, x_dim)
+        controller.agent = backend.mirror  # plan with published weights, not live ones
+        worker = RolloutWorker(env, controller, backend.buffer, rl.subsample_stride, keys=keys)
+        backend.start()
+        print(f"[stage2] concurrency mode: {backend.mode}")
 
         env_steps, episodes, ep_results = 0, 0, []
         worker.reset(critical_phase=cfg.critical_phase)
         t0 = time.time()
 
         while env_steps < rl.total_env_steps:
-            learner.raise_if_failed()
+            backend.check_health()
             if keys.should_quit():
                 print("[stage2] operator requested stop.")
                 break
 
             warmup = env_steps < rl.warmup_env_steps
-            learner.allow_actor_updates = not warmup
+            backend.set_warmup(warmup)
 
             # Critical-phase handover: run the base VLA until the operator
             # presses `r`, then let the RL policy take over for the rest of the
@@ -162,7 +145,7 @@ def train(cfg: RLTOnlineTrainConfig):
                 print("[stage2] handover -> RL policy")
 
             use_actor = (not warmup) and worker.rl_engaged
-            mirror.sync(learner)
+            backend.sync_mirror()
             prev_steps = env_steps
             n_steps, ep_done, ep_success, intervened = worker.run_chunk(use_actor=use_actor)
             env_steps += n_steps
@@ -170,8 +153,8 @@ def train(cfg: RLTOnlineTrainConfig):
             if keys.poll_discard():
                 # `env_steps` is not rolled back: the arm really did move, and
                 # the budget is a wear/time budget, not a data counter.
-                dropped = buffer.discard_episode()
-                print(f"[stage2] episode discarded by operator ({dropped} transitions dropped)")
+                dropped = backend.buffer.discard_episode()
+                print(f"[stage2] episode discarded by operator ({dropped} dropped)")
                 worker.reset(critical_phase=cfg.critical_phase)
                 continue
 
@@ -184,22 +167,22 @@ def train(cfg: RLTOnlineTrainConfig):
                 recent = ep_results[-20:]
                 sr = sum(recent) / max(len(recent), 1)
                 speed = env_steps / (time.time() - t0)
-                m = " ".join(f"{k}={v:.4f}" for k, v in learner.metrics().items())
+                m = " ".join(f"{k}={v:.4f}" for k, v in backend.metrics().items())
                 print(
-                    f"[stage2] steps={env_steps} eps={episodes} buffer={len(buffer)} "
+                    f"[stage2] steps={env_steps} eps={episodes} buffer={len(backend.buffer)} "
                     f"success20={sr:.2f} {'(warmup) ' if warmup else ''}"
                     f"{'(interv) ' if intervened else ''}{m} ({speed:.1f} steps/s)",
                     flush=True,
                 )
 
             if env_steps // cfg.save_freq != prev_steps // cfg.save_freq:
-                _checkpoint(agent, buffer, out_dir, learner)
+                backend.checkpoint(out_dir)
     finally:
         # Each step gets its own try/except: an exception raised while tearing
         # down masks whatever actually ended the run.
         for label, teardown in (
             ("keyboard", keys.stop),
-            ("learner", lambda: (learner.stop(), learner.join(timeout=5.0))),
+            ("backend", (backend.stop if backend is not None else lambda: None)),
             ("env", (env.close if env is not None else lambda: None)),
         ):
             try:
@@ -207,24 +190,9 @@ def train(cfg: RLTOnlineTrainConfig):
             except Exception:
                 logger.exception("[stage2] %s teardown failed", label)
 
-    _checkpoint(agent, buffer, out_dir)
-    print(f"[stage2] done; {episodes} episodes, saved to {out_dir / 'rlt_agent.pt'}")
-
-
-def _checkpoint(agent, buffer, out_dir: Path, learner=None) -> None:
-    """Write the agent and buffer with the learner held between gradient steps.
-
-    `agent.state_dict()` runs on the main thread; without pausing it can land
-    mid-optimizer-step and persist an actor and critic that disagree.
-    """
-    if learner is not None and not learner.pause():
-        logger.warning("[stage2] learner did not pause in time; checkpoint may be torn")
-    try:
-        torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
-        buffer.save(out_dir / "replay_buffer.pt")
-    finally:
-        if learner is not None:
-            learner.resume()
+    if backend is not None:
+        backend.checkpoint(out_dir)
+    print(f"[stage2] done; {episodes} episodes, saved under {out_dir}")
 
 
 @parser.wrap()

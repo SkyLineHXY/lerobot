@@ -164,6 +164,35 @@ class ChunkEnvConfig(draccus.ChoiceRegistry, abc.ABC):
 
 
 @dataclass
+class ConcurrencyConfig:
+    """How the rollout and the learner are separated.
+
+    `threads` is the default and the reference implementation. `processes`
+    removes GIL contention and the shared-CUDA-stream drain, but **not** GPU
+    compute contention — the two processes still time-share the SMs, so the
+    gradient-burst cap still matters. Needs grpcio: `pip install -e ".[async]"`.
+    """
+
+    mode: str = "threads"  # threads | processes
+    learner_host: str = "127.0.0.1"
+    learner_port: int = 50061
+    # How often the learner pushes actor weights. The rollout only reads them at
+    # chunk boundaries, so pushing faster than that is wasted bandwidth.
+    parameters_push_hz: float = 10.0
+    # Bound on undelivered buffer ops. Reaching it blocks the rollout, which is
+    # visible and recoverable; dropping data instead would look like RL quietly
+    # not working.
+    max_pending_ops: int = 4096
+    # Intra-op threads inside the learner process. The actor-critic is a 2-layer
+    # MLP on batches of 256, so torch's default (one thread per core) spends far
+    # more on synchronisation than it saves: measured 6.7 updates/s at 48
+    # threads versus 163 at 1. It also stops the learner from saturating every
+    # core and starving the rollout. `torch.set_num_threads` is global, which is
+    # why only the process backend can set it without also throttling the VLA.
+    learner_torch_threads: int = 1
+
+
+@dataclass
 class SimTeleopConfig:
     """Hand-held device used for human interventions in simulation."""
 
@@ -291,6 +320,7 @@ class RLTOnlineTrainConfig:
 
     env: ChunkEnvConfig = field(default_factory=MockEnvConfig)
     rl: OnlineRLConfig = field(default_factory=OnlineRLConfig)
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
     # Operator-key backend: "auto" prefers termios (needs stdin to be a real
     # terminal) and falls back to pynput's global X11 hook, which is what makes
