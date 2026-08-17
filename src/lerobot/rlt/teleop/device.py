@@ -13,12 +13,11 @@ with the channels the device lacks left at zero rather than shifted into the
 wrong slot.
 
 **The takeover gate is the trainer's own keyboard listener, not the device's
-`get_teleop_events()`.** `KeyboardEndEffectorTeleop.get_action()` clears the
-`current_pressed` set that `get_teleop_events()` reads, so whichever of the two
-is called second sees nothing — there is no call order that makes both work.
-Routing takeover, success, failure and discard through `KeyboardEventListener`
-sidesteps that entirely and gives the operator identical keys in sim and on
-hardware.
+`get_teleop_events()`.** Routing takeover, success, failure and discard through
+`KeyboardEventListener` keeps those operator commands identical in sim and on
+hardware, independently of the device-specific motion keys. `use_device_events`
+additionally folds the device's own buttons into that same listener — needed for
+a gamepad, where both hands are off the keyboard — without ever bypassing it.
 """
 
 from __future__ import annotations
@@ -27,6 +26,8 @@ import logging
 
 import numpy as np
 import torch
+
+from lerobot.teleoperators.utils import TeleopEvents
 
 from .base import InterventionManager, InterventionResult
 from .keys import KeyboardEventListener
@@ -53,6 +54,7 @@ class DeviceIntervention(InterventionManager):
         rotation_scale: float = 1.0,
         gripper_open_value: float = -1.0,
         gripper_close_value: float = 1.0,
+        use_device_events: bool = False,
     ):
         self.teleop = teleop
         self.env = env
@@ -61,6 +63,12 @@ class DeviceIntervention(InterventionManager):
         self.rotation_scale = rotation_scale
         self.gripper_open_value = gripper_open_value
         self.gripper_close_value = gripper_close_value
+        self.use_device_events = use_device_events and hasattr(teleop, "get_teleop_events")
+        if use_device_events and not self.use_device_events:
+            logger.warning(
+                "%s has no get_teleop_events(); takeover and success/failure stay on the keyboard.",
+                type(teleop).__name__,
+            )
 
         self.action_names = list(getattr(env, "action_names", []))
         if not self.action_names:
@@ -86,7 +94,23 @@ class DeviceIntervention(InterventionManager):
         self._gripper = gripper_open_value
 
     def check(self) -> bool:
-        return self.keys.intervening
+        return self._poll_device_events() or self.keys.intervening
+
+    def _poll_device_events(self) -> bool:
+        """Fold the device's own buttons into the operator key state.
+
+        Returns whether the device is asking for a takeover. Success/failure are
+        pushed into the keyboard listener instead of returned, because the env
+        reads them from there on every step.
+        """
+        if not self.use_device_events:
+            return False
+        events = self.teleop.get_teleop_events()
+        if events.get(TeleopEvents.SUCCESS):
+            self.keys.latch_outcome(success=True)
+        elif events.get(TeleopEvents.TERMINATE_EPISODE):
+            self.keys.latch_outcome(failure=True)
+        return bool(events.get(TeleopEvents.IS_INTERVENTION))
 
     def _to_env_action(self, raw: dict[str, float]) -> np.ndarray:
         vec = np.zeros(len(self.action_names), dtype=np.float32)
@@ -124,6 +148,7 @@ class DeviceIntervention(InterventionManager):
             actions.append(norm_action)
             rewards.append(r)
             obs_list.append(obs)
+            self.notify_step(obs)
             if done or truncated:
                 break
             if not self.check():  # operator released the takeover toggle
@@ -165,7 +190,13 @@ def make_teleop_device(cfg):
     elif cfg.device == "gamepad":
         from lerobot.teleoperators.gamepad import GamepadTeleop, GamepadTeleopConfig
 
-        teleop = GamepadTeleop(GamepadTeleopConfig(use_rotation=cfg.use_rotation))
+        teleop = GamepadTeleop(
+            GamepadTeleopConfig(
+                use_rotation=cfg.use_rotation,
+                deadzone=cfg.gamepad_deadzone,
+                bindings=dict(cfg.gamepad_bindings),
+            )
+        )
     elif cfg.device == "spacemouse":
         from lerobot.teleoperators.spacemouse import SpaceMouseTeleop, SpaceMouseTeleopConfig
 
@@ -196,4 +227,5 @@ def build_sim_intervention(cfg, env, keys: KeyboardEventListener) -> DeviceInter
         keys,
         position_scale=cfg.position_scale,
         rotation_scale=cfg.rotation_scale,
+        use_device_events=cfg.use_device_events,
     )

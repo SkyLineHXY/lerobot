@@ -165,9 +165,13 @@ class ProcessBackend:
 
 def _learner_entry(serve, cfg, x_dim: int, shutdown_event) -> None:
     """Child-process entry point. Must be importable at module level for spawn."""
+    from lerobot.utils.multiprocess_compat import patch_resource_tracker
     from lerobot.utils.utils import init_logging
 
     init_logging()
+    # A spawned child re-imports everything, so the parent's patch does not carry
+    # over; without this the learner's exit noise buries the real failure.
+    patch_resource_tracker()
     threads = cfg.concurrency.learner_torch_threads
     if threads > 0:
         torch.set_num_threads(threads)

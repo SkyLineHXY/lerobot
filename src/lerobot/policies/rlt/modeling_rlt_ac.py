@@ -125,9 +125,6 @@ class RLTAgent:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
 
         self._update_count = 0
-        # Sparse binary rewards => Q in [0, 1/(1-gamma^C)]. Clamping the
-        # bootstrap to that range is a hard guard against value divergence at
-        # UTD 5 (paper cites Hussing et al. 2024 for exactly this failure).
         gamma_c = cfg.discount**cfg.ac.chunk_len
         self.q_max = cfg.target_q_clip_scale / max(1.0 - gamma_c, 1e-6)
 

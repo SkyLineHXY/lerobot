@@ -155,6 +155,10 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         super().__init__(config)
         self.config = config
         self.misc_keys_queue = Queue()
+        # pynput may emit repeated press callbacks while a key is held. Keep a
+        # listener-side set so control events are edge-triggered, while motion
+        # remains active until the matching release callback arrives.
+        self._listener_pressed = set()
 
     # Chosen to avoid the keys the RLT trainer binds for the operator
     # (s/f/r/space/esc) — both readers see the same global keystream.
@@ -166,6 +170,28 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         "j": ("delta_yaw", 1.0),
         "l": ("delta_yaw", -1.0),
     }
+    MISC_KEYS = frozenset({"s", "r", "q"})
+
+    def _on_press(self, key):
+        """Queue raw pynput keys so both special and character keys work."""
+        if key in self._listener_pressed:
+            return
+
+        self._listener_pressed.add(key)
+        self.event_queue.put((key, True))
+
+        char = getattr(key, "char", None)
+        if isinstance(char, str):
+            char = char.lower()
+            if char in self.MISC_KEYS:
+                self.misc_keys_queue.put(char)
+
+    def _on_release(self, key):
+        self._listener_pressed.discard(key)
+        self.event_queue.put((key, False))
+        if key == keyboard.Key.esc:
+            logging.info("ESC pressed, disconnecting.")
+            self.disconnect()
 
     @property
     def action_features(self) -> dict:
@@ -203,21 +229,14 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 delta_z = -int(val)
             elif key == keyboard.Key.shift_r:
                 delta_z = int(val)
-            elif key == keyboard.Key.ctrl_r:
+            elif key == keyboard.Key.ctrl_r and val:
                 # Gripper actions are expected to be between 0 (close), 1 (stay), 2 (open)
-                gripper_action = int(val) + 1
-            elif key == keyboard.Key.ctrl_l:
-                gripper_action = int(val) - 1
+                gripper_action = 2.0
+            elif key == keyboard.Key.ctrl_l and val:
+                gripper_action = 0.0
             elif self.config.use_rotation and getattr(key, "char", None) in self.ROTATION_KEYS:
                 axis, sign = self.ROTATION_KEYS[key.char]
                 rotation[axis] = sign * int(val)
-            elif val:
-                # If the key is pressed, add it to the misc_keys_queue
-                # this will record key presses that are not part of the delta_x, delta_y, delta_z
-                # this is useful for retrieving other events like interventions for RL, episode success, etc.
-                self.misc_keys_queue.put(key)
-
-        self.current_pressed.clear()
 
         action_dict = {
             "delta_x": delta_x,
@@ -258,6 +277,8 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 TeleopEvents.SUCCESS: False,
                 TeleopEvents.RERECORD_EPISODE: False,
             }
+
+        self._drain_pressed_keys()
 
         # Check if any movement keys are currently pressed (indicates intervention)
         movement_keys = [

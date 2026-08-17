@@ -127,6 +127,7 @@ class PiperLeaderIntervention(InterventionManager):
             actions.append(norm_action)
             rewards.append(r)
             obs_list.append(obs)
+            self.notify_step(obs)
             if done or truncated:
                 break
             if not self.check():  # operator let go mid-chunk

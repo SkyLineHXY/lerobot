@@ -256,6 +256,14 @@ class PiperChunkEnv:
         self._last_velocity = velocity
         return {"joints": joints, "velocity": velocity, "raw": raw}
 
+    def render_frames(self, obs: dict) -> dict[str, np.ndarray]:
+        """Camera frames out of one observation, for the operator view."""
+        return {
+            key: np.asarray(value)
+            for key, value in (obs.get("raw") or {}).items()
+            if key not in JOINT_ORDER and getattr(value, "ndim", 0) == 3
+        }
+
     def raw_joint_action(self) -> dict[str, float]:
         """Current measured joints as a robot action dict (for leader sync)."""
         joints = self._last_joints

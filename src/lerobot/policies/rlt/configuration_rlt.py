@@ -206,6 +206,14 @@ class SimTeleopConfig:
     # them for finer corrections near the object.
     position_scale: float = 0.3
     rotation_scale: float = 0.2
+    # Gamepad only: overrides for `DEFAULT_GAMEPAD_BINDINGS`, e.g.
+    # {"delta_yaw": "-rightx"} to flip one stick without restating the layout.
+    gamepad_bindings: dict[str, str] = field(default_factory=dict)
+    gamepad_deadzone: float = 0.1
+    # Accept the device's own buttons for takeover / success / failure as well as
+    # the keyboard. Off by default so sim and hardware share one operator-key
+    # story; on for a gamepad, where both hands are off the keyboard anyway.
+    use_device_events: bool = False
 
 
 @ChunkEnvConfig.register_subclass("mock")
@@ -288,6 +296,24 @@ class PiperEnvConfig(ChunkEnvConfig):
     teleop: PiperLeaderTeleopConfig | None = None
 
 
+@dataclass
+class RolloutViewConfig:
+    """OpenCV operator window for the stage-2 rollout.
+
+    Disabled by default: an unattended run has no one to look at it, and a
+    headless box has no display to put it on (it degrades to a no-op there
+    anyway). Turn it on whenever a human is in the loop.
+    """
+
+    enabled: bool = False
+    max_width: int = 960
+    panel_height: int = 200
+    tile_height: int = 320
+    # Redraw is per env step. Cap it when the env is much faster than the eye —
+    # 0 means "every step".
+    min_period_s: float = 0.0
+
+
 # ------------------------------------------------------------- entry points
 @dataclass
 class RLTokenTrainConfig:
@@ -336,6 +362,15 @@ class RLTOnlineTrainConfig:
     # Start every episode under the base VLA and hand control to the RL policy
     # when the operator presses `r` (paper Sec. V).
     critical_phase: bool = False
+
+    # Engage the takeover toggle automatically at the start of every *warmup*
+    # episode, so the human demonstrates the prefill instead of watching the base
+    # VLA fail at it. Worth turning on whenever the base policy's success rate is
+    # near zero: warmup exists to give the critic a reward signal to learn from,
+    # and it cannot do that from trajectories that never score.
+    warmup_human_control: bool = False
+
+    view: RolloutViewConfig = field(default_factory=RolloutViewConfig)
     num_inference_steps: int | None = None
     resume_buffer: str | None = None
     log_freq: int = 200

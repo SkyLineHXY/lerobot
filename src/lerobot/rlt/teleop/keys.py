@@ -336,6 +336,17 @@ class KeyboardEventListener:
         """
         self._intervene = bool(value)
 
+    def latch_outcome(self, success: bool = False, failure: bool = False) -> None:
+        """Raise the outcome flags from something other than the keyboard.
+
+        A gamepad's own buttons are the practical case: with both hands on the
+        pad the operator cannot reach `s`/`f`. Forwarding into this listener
+        rather than reading the device directly keeps one place where an outcome
+        is latched, so the env's `poll_outcome` still sees every source.
+        """
+        self._success = self._success or success
+        self._failure = self._failure or failure
+
     def reset_episode_flags(self) -> None:
         self._success = self._failure = self._handover = self._discard = False
 

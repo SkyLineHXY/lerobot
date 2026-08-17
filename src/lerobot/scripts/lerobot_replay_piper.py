@@ -157,10 +157,6 @@ def _joint_labels(meta, key: str, dim: int) -> list[str]:
 
 # ------------------------------------------------------------------ 可视化
 def plot_state_action(episode: dict, output_path: Path) -> None:
-    """上下两条曲线：observation.state 与 action。
-
-    两者叠在一起看最有用 —— 从臂跟不上时，action 会明显领先 state 一段。
-    """
     import matplotlib
 
     matplotlib.use("Agg")

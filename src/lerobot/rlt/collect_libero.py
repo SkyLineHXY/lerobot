@@ -41,11 +41,11 @@ import torch
 
 from lerobot.configs import parser
 from lerobot.policies.rlt import SimTeleopConfig
+from lerobot.rlt.teleop.device import make_teleop_device
+from lerobot.rlt.teleop.keys import KeyboardEventListener
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.robot_utils import precise_sleep
-
-from .teleop.device import make_teleop_device
-from .teleop.keys import KeyboardEventListener
+from lerobot.utils.status_view import StatusView
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,14 @@ class CollectDatasetConfig:
 
 
 @dataclass
+class CollectViewConfig:
+    enabled: bool = True
+    max_width: int = 1280
+    panel_height: int = 190
+    tile_height: int = 360
+
+
+@dataclass
 class CollectLiberoConfig:
     suite: str = "libero_10"
     task_id: int = 0
@@ -88,6 +96,7 @@ class CollectLiberoConfig:
 
     teleop: SimTeleopConfig = field(default_factory=SimTeleopConfig)
     dataset: CollectDatasetConfig = field(default_factory=CollectDatasetConfig)
+    view: CollectViewConfig = field(default_factory=CollectViewConfig)
 
     keyboard_backend: str = "auto"
     # 方向键被键盘遥操作占用了，所以丢弃键默认改成退格。
@@ -124,12 +133,11 @@ class LiberoTeleopCollector:
 
     def __init__(self, cfg: CollectLiberoConfig):
         self.cfg = cfg
-        self.keys = KeyboardEventListener(
-            backend=cfg.keyboard_backend, discard_key=cfg.discard_key
-        )
+        self.keys = KeyboardEventListener(backend=cfg.keyboard_backend, discard_key=cfg.discard_key)
         self.env = None
         self.teleop = None
         self.dataset = None
+        self.view = None
         self._gripper = -1.0  # robosuite: -1 张开 / +1 闭合，stay 时保持不变
         self._channel_index = None
 
@@ -169,6 +177,19 @@ class LiberoTeleopCollector:
                 missing,
             )
 
+    def setup_view(self) -> None:
+        if not self.cfg.view.enabled:
+            return
+        cfg = self.cfg.view
+        self.view = StatusView(
+            camera_names=list(self.cfg.dataset.image_keys),
+            bgr=True,
+            max_width=cfg.max_width,
+            window_name="LIBERO Collect",
+            panel_height=cfg.panel_height,
+            tile_height=cfg.tile_height,
+        ).start()
+
     def setup_dataset(self) -> None:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         from lerobot.datasets.repair import repair_dataset_consistency
@@ -183,11 +204,9 @@ class LiberoTeleopCollector:
                     f"{root} 已存在。加 --dataset.resume=true 续采，或换一个 root。"
                     "（LeRobotDatasetMetadata.create 用的是 mkdir(exist_ok=False)）"
                 )
-            # 上次运行如果是被 kill -9 掐掉的，元数据与 data 的 episode 数会对不上，
-            # 此时 LeRobotDataset.__init__ 会退回去请求 HF Hub 并卡死在本地 repo_id 上。
+
             repair_dataset_consistency(root)
             self.dataset = LeRobotDataset(repo_id=cfg.repo_id, root=root, tolerance_s=1e-4)
-            # 续采得到的 episode_buffer 是 None，不先建好，丢弃空集时会解引用 None。
             self.dataset.episode_buffer = self.dataset.create_episode_buffer()
             print(f"[collect] 续采：已有 {self.dataset.meta.total_episodes} 集")
             return
@@ -204,7 +223,6 @@ class LiberoTeleopCollector:
         )
         print(f"[collect] 已新建数据集：{root}")
 
-    # --------------------------------------------------------------- 采集
     def _env_action(self) -> np.ndarray:
         raw = self.teleop.get_action()
         vec = np.zeros(len(ACTION_NAMES), dtype=np.float32)
@@ -231,12 +249,48 @@ class LiberoTeleopCollector:
         frame = {"task": task}
         for key in self.cfg.dataset.image_keys:
             img = obs["pixels"][key]
-            # LiberoProcessorStep 在推理时把图像旋转 180 度；数据集必须以同样的
-            # 朝向落盘，否则训练和评估看到的是上下颠倒的两个世界。
             frame[f"{OBS_IMAGES}.{key}"] = np.ascontiguousarray(img[::-1, ::-1])
         frame[OBS_STATE] = self._flat_state(obs)
         frame["action"] = action.astype(np.float32)
         return frame
+
+    def _view_images(self, obs: dict) -> dict:
+        return {
+            key: np.ascontiguousarray(obs["pixels"][key][::-1, ::-1]) for key in self.cfg.dataset.image_keys
+        }
+
+    def _render_view(
+        self,
+        obs: dict,
+        *,
+        task: str,
+        episode_index: int,
+        n_frames: int,
+        recording: bool,
+        elapsed: float,
+        fps: float,
+    ) -> bool:
+        """更新一次仿真画面；窗口内 q/Esc 返回 False。"""
+        if self.view is None or not self.view.enabled:
+            return True
+
+        meta = self.dataset.meta
+        self.view.update(
+            self._view_images(obs),
+            {
+                "task": getattr(self.env, "task_description", task),
+                "step": n_frames,
+                "fps": fps,
+                "elapsed": elapsed,
+                "recording": recording,
+                "episode_index": episode_index + 1,
+                "buffered_frames": n_frames,
+                "saved_episodes": meta.total_episodes,
+                "saved_frames": meta.total_frames,
+                "hint": "SPACE record/pause | S success | F failure | BACKSPACE discard | Q/ESC quit",
+            },
+        )
+        return self.view.render_once()
 
     @staticmethod
     def _flat_state(obs: dict) -> np.ndarray:
@@ -265,6 +319,9 @@ class LiberoTeleopCollector:
         task = self.env.task
         dt = 1.0 / self.cfg.dataset.fps
         n_frames = 0
+        episode_start = time.perf_counter()
+        measured_fps = float(self.cfg.dataset.fps)
+        previous_loop_t = None
 
         print(
             f"[collect] 第 {index + 1} 集 | 任务：{task}\n"
@@ -272,6 +329,10 @@ class LiberoTeleopCollector:
         )
         for _ in range(self.cfg.max_episode_steps):
             t0 = time.perf_counter()
+            if previous_loop_t is not None and t0 > previous_loop_t:
+                measured_fps = 0.9 * measured_fps + 0.1 / (t0 - previous_loop_t)
+            previous_loop_t = t0
+
             if self.keys.should_quit():
                 return "quit"
             if self.keys.poll_discard():
@@ -282,9 +343,19 @@ class LiberoTeleopCollector:
             if failure_key:
                 return "failure"
 
-            # 没按空格时既不推机械臂也不写帧：操作员需要时间摆位和看清场景，
-            # 把这段静止画面写进数据集只会教策略"原地不动"。
-            if not self.keys.intervening:
+            recording = self.keys.intervening
+            if not self._render_view(
+                obs,
+                task=task,
+                episode_index=index,
+                n_frames=n_frames,
+                recording=recording,
+                elapsed=t0 - episode_start,
+                fps=measured_fps,
+            ):
+                return "quit"
+
+            if not recording:
                 precise_sleep(max(dt - (time.perf_counter() - t0), 0.0))
                 continue
 
@@ -323,7 +394,6 @@ class LiberoTeleopCollector:
 
     def run(self) -> None:
         from lerobot.datasets.video_utils import VideoEncodingManager
-
         saved = 0
         with VideoEncodingManager(self.dataset):
             for index in range(self.cfg.n_episodes):
@@ -334,18 +404,16 @@ class LiberoTeleopCollector:
                     break
                 if self._finish_episode(outcome):
                     saved += 1
-                # 每 10 集合上 parquet writer：footer 只在 close() 时写，
-                # 不定期落盘的话崩溃会丢掉这中间所有集的数据。
                 if saved and saved % 10 == 0:
                     self.dataset._close_writer()
                     self.dataset._writer_closed_for_reading = True
-        # VideoEncodingManager 只收编码器，不收 parquet writer。少了这一步，
-        # data 和 meta 的 parquet 都没有 footer，数据集根本读不回来。
+
         self.dataset.finalize()
         print(f"[collect] 完成：共保存 {saved} 集 -> {self.cfg.dataset.root}")
 
     def close(self) -> None:
         for label, teardown in (
+            ("view", (self.view.stop if self.view is not None else lambda: None)),
             ("keyboard", self.keys.stop),
             ("teleop", (self.teleop.disconnect if self.teleop is not None else lambda: None)),
             ("env", (self.env.close if self.env is not None else lambda: None)),
@@ -355,14 +423,12 @@ class LiberoTeleopCollector:
             except Exception:
                 logger.exception("[collect] %s 收尾失败", label)
 
-
 def collect(cfg: CollectLiberoConfig) -> None:
     collector = LiberoTeleopCollector(cfg)
     try:
         collector.setup_env()
         collector.setup_dataset()
-        # 遥操作设备和键盘后端都放在最后：连接设备可能要打开显示/输入子系统，
-        # 而 termios 后端一旦把 stdin 切进 cbreak，交互式提示就用不了了。
+        collector.setup_view()
         collector.setup_teleop()
         collector.keys.start()
         if not collector.keys.available:
@@ -374,11 +440,9 @@ def collect(cfg: CollectLiberoConfig) -> None:
     finally:
         collector.close()
 
-
 @parser.wrap()
 def main(cfg: CollectLiberoConfig):
     collect(cfg)
-
 
 if __name__ == "__main__":
     main()

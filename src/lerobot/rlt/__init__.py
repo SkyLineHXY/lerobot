@@ -10,6 +10,8 @@ See `README.md` for the pipeline, the buffer's write ordering, and the
 concurrency model.
 """
 
+from lerobot.utils.multiprocess_compat import patch_resource_tracker
+
 from .learner import ActorMirror, LearnerThread
 from .replay_buffer import ChunkRecord, ChunkReplayBuffer
 from .rollout import RolloutWorker
@@ -19,6 +21,12 @@ from .teleop import (
     InterventionResult,
     KeyboardEventListener,
 )
+
+# LIBERO drags in `multiprocess`, whose resource tracker raises at interpreter
+# exit on CPython 3.12.0 and buries whatever really ended the run. Patched here
+# rather than at the LIBERO import because a spawned learner re-imports from
+# scratch and only ever reaches this package.
+patch_resource_tracker()
 
 __all__ = [
     "ActorMirror",

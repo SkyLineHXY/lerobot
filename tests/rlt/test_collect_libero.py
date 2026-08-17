@@ -5,6 +5,8 @@
 往返测试才抓得到。
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -35,8 +37,7 @@ def _obs(rng):
     """与 LiberoEnv 的 pixels_agent_pos 观测同构的假观测。"""
     return {
         "pixels": {
-            key: rng.integers(0, 255, (SIZE, SIZE, 3), dtype=np.uint8)
-            for key in ("image", "wrist_image")
+            key: rng.integers(0, 255, (SIZE, SIZE, 3), dtype=np.uint8) for key in ("image", "wrist_image")
         },
         "robot_state": {
             "eef": {
@@ -58,9 +59,9 @@ def test_flat_state_matches_the_processor_used_at_inference():
     assert flat.shape == (STATE_DIM,)
     assert flat.dtype == np.float32
     eef = obs["robot_state"]["eef"]
-    expected_axisangle = LiberoProcessorStep()._quat2axisangle(
-        torch.as_tensor(eef["quat"]).reshape(1, 4)
-    ).reshape(-1)
+    expected_axisangle = (
+        LiberoProcessorStep()._quat2axisangle(torch.as_tensor(eef["quat"]).reshape(1, 4)).reshape(-1)
+    )
     assert np.allclose(flat[:3], eef["pos"])
     assert np.allclose(flat[3:6], expected_axisangle.numpy(), atol=1e-6)
     assert np.allclose(flat[6:], obs["robot_state"]["gripper"]["qpos"])
@@ -96,6 +97,45 @@ def test_images_are_rotated_to_the_libero_dataset_convention(tmp_path):
     assert np.array_equal(stored[0, 0], raw[-1, -1])
 
 
+def test_status_view_receives_upright_rgb_frames_and_collection_status(tmp_path):
+    cfg = _cfg(tmp_path / "ds")
+    collector = LiberoTeleopCollector(cfg)
+    obs = _obs(np.random.default_rng(3))
+
+    class FakeView:
+        enabled = True
+
+        def update(self, images, status):
+            self.images = images
+            self.status = status
+
+        def render_once(self):
+            return False
+
+    collector.view = FakeView()
+    collector.env = SimpleNamespace(task_description="pick up the bowl")
+    collector.dataset = SimpleNamespace(meta=SimpleNamespace(total_episodes=2, total_frames=42))
+
+    keep_running = collector._render_view(
+        obs,
+        task="pick_up_the_bowl",
+        episode_index=3,
+        n_frames=7,
+        recording=True,
+        elapsed=1.5,
+        fps=19.5,
+    )
+
+    assert keep_running is False
+    assert np.array_equal(collector.view.images["image"], obs["pixels"]["image"][::-1, ::-1])
+    assert collector.view.images["image"].flags.c_contiguous
+    assert collector.view.status["task"] == "pick up the bowl"
+    assert collector.view.status["recording"] is True
+    assert collector.view.status["buffered_frames"] == 7
+    assert collector.view.status["saved_episodes"] == 2
+    assert collector.view.status["saved_frames"] == 42
+
+
 def test_dataset_roundtrip(tmp_path):
     cfg = _cfg(tmp_path / "ds")
     collector = LiberoTeleopCollector(cfg)
@@ -109,9 +149,7 @@ def test_dataset_roundtrip(tmp_path):
         for _ in range(6):
             action = rng.random(len(ACTION_NAMES)).astype(np.float32)
             actions.append(action)
-            collector.dataset.add_frame(
-                collector._frame(_obs(rng), action, task="pick up the bowl")
-            )
+            collector.dataset.add_frame(collector._frame(_obs(rng), action, task="pick up the bowl"))
         collector.dataset.save_episode()
         collector.dataset.meta._flush_metadata_buffer()
     collector.dataset.finalize()

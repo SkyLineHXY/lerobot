@@ -196,7 +196,6 @@ class PiperMotorsBus:
                 joint_6 (float): 关节6角度 -90000 ~ 90000 / 57324.840764
                 gripper_range: 夹爪角度 0~0.08
         """
-
         j0 = round(_to_float(target_joint[0]) * self.joint_factor)
         j1 = round(_to_float(target_joint[1]) * self.joint_factor)
         j2 = round(_to_float(target_joint[2]) * self.joint_factor)
@@ -205,7 +204,7 @@ class PiperMotorsBus:
         j5 = round(_to_float(target_joint[5]) * self.joint_factor)
         gripper_range = round(_to_float(target_joint[6]) * 1000 * 1000)
 
-        self.piper.MotionCtrl_2(0x01, 0x01, 100, 0xAD)
+        self.piper.MotionCtrl_2(0x01, 0x01, 60, 0xAD)
         self.piper.JointCtrl(j0, j1, j2, j3, j4, j5)
         self.piper.GripperCtrl(abs(gripper_range), 1000, 0x01, 0)
     def read(self) -> Dict:

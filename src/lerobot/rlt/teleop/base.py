@@ -30,8 +30,18 @@ class InterventionResult:
 class InterventionManager:
     """No-op manager: never intervenes. Base class for real teleop devices."""
 
+    # Set by the rollout worker when an operator view is running. The manager
+    # steps the env itself, so without this hook the picture would only refresh
+    # once the whole takeover chunk is over — a chunk late, which is exactly the
+    # feedback the human is steering by.
+    on_step = None
+
     def check(self) -> bool:
         return False
+
+    def notify_step(self, obs) -> None:
+        if self.on_step is not None:
+            self.on_step(obs)
 
     def run_chunk(self, chunk_len: int) -> InterventionResult | None:
         return None

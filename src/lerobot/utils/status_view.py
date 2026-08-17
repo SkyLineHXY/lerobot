@@ -14,8 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""数据采集时给操作员看的实时视图：相机画面横向拼接 + 状态面板。
-
+"""
 线程模型：OpenCV 的 HighGUI 只有从**主线程**才能可靠地建窗口和重绘（Anaconda 下尤其
 明显，torch / pynput 各自会拉起自己的 Qt/X11，后台线程建的窗口会静默地不显示）。
 所以 :meth:`start` 和 :meth:`render_once` 必须在主线程调，:meth:`update` 才是任意线程
@@ -83,7 +82,6 @@ class StatusView:
             logger.warning("StatusView 已禁用：导入 OpenCV 失败 (%s)。", exc)
             return self
 
-        # 没有显示环境就别碰 GUI 调用，否则会把 GUI 后端搞崩
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             logger.warning(
                 "StatusView 已禁用：没有 DISPLAY/WAYLAND_DISPLAY。"
@@ -208,9 +206,24 @@ class StatusView:
             return panel
         return cv2.vconcat([strip, panel])
 
-    def _draw_panel(self, panel: np.ndarray, status: dict) -> None:
+    # 子类（如 RLT 的 rollout 视图）复用这两个画字助手，面板内容自己重写
+    def _put(self, panel, text, x, y, color=(235, 235, 235), scale=0.5, thick=1) -> None:
+        cv2 = self._cv2
+        cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+    def _put_fit(self, panel, text, x, y, color, scale, thick, max_w) -> None:
+        """字号自动缩小到不超过 max_w 像素为止。"""
         cv2 = self._cv2
         font = cv2.FONT_HERSHEY_SIMPLEX
+        s = scale
+        while s > 0.4:
+            (tw, _th), _ = cv2.getTextSize(text, font, s, thick)
+            if tw <= max_w:
+                break
+            s -= 0.1
+        cv2.putText(panel, text, (x, y), font, s, color, thick, cv2.LINE_AA)
+
+    def _draw_panel(self, panel: np.ndarray, status: dict) -> None:
         white = (235, 235, 235)
         grey = (150, 150, 150)
         yellow = (0, 230, 230)
@@ -218,17 +231,10 @@ class StatusView:
         red = (60, 60, 235)
 
         def put(text, x, y, color=white, scale=0.5, thick=1):
-            cv2.putText(panel, text, (x, y), font, scale, color, thick, cv2.LINE_AA)
+            self._put(panel, text, x, y, color, scale, thick)
 
         def put_fit(text, x, y, color, scale, thick, max_w):
-            """字号自动缩小到不超过 max_w 像素为止。"""
-            s = scale
-            while s > 0.4:
-                (tw, _th), _ = cv2.getTextSize(text, font, s, thick)
-                if tw <= max_w:
-                    break
-                s -= 0.1
-            cv2.putText(panel, text, (x, y), font, s, color, thick, cv2.LINE_AA)
+            self._put_fit(panel, text, x, y, color, scale, thick, max_w)
 
         y = 24
 
@@ -251,7 +257,6 @@ class StatusView:
 
         if status.get("recording") is not None:
             rec = bool(status.get("recording"))
-            back = bool(status.get("back"))
             ep = status.get("episode_index")
             buffered = status.get("buffered_frames")
             if rec:
@@ -261,14 +266,17 @@ class StatusView:
                 put(f"REC{extra}", 10, y, red, 0.6, 2)
             else:
                 put("idle", 10, y, grey, 0.6, 2)
-            put(
-                "BACK=1" if back else "back=0",
-                panel.shape[1] - 130,
-                y,
-                red if back else grey,
-                0.6,
-                2,
-            )
+            # back 是 Piper 的错误帧标记；其他采集器不传该字段时不显示。
+            if "back" in status:
+                back = bool(status.get("back"))
+                put(
+                    "BACK=1" if back else "back=0",
+                    panel.shape[1] - 130,
+                    y,
+                    red if back else grey,
+                    0.6,
+                    2,
+                )
             y += 26
 
             saved_eps = status.get("saved_episodes")
@@ -276,6 +284,11 @@ class StatusView:
             if saved_eps is not None and saved_frames is not None:
                 put(f"dataset: {saved_eps} episodes | {saved_frames} steps saved", 10, y, green, 0.5)
                 y += 24
+
+        hint = status.get("hint")
+        if hint:
+            put_fit(str(hint), 10, y, grey, 0.5, 1, max_w=panel.shape[1] - 20)
+            y += 24
 
         # 子任务故意画得比别的行大约三倍，操作员隔着工位一眼就能看清
         skill_text = status.get("skill_text")

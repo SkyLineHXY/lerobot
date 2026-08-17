@@ -21,6 +21,7 @@ from .configuration_rlt import (
     RLTokenConfig,
     RLTokenTrainConfig,
     RLTOnlineTrainConfig,
+    RolloutViewConfig,
     SimTeleopConfig,
 )
 from .modeling_rlt import RLTController
@@ -39,6 +40,7 @@ __all__ = [
     "MockEnvConfig",
     "OnlineRLConfig",
     "PiperEnvConfig",
+    "RolloutViewConfig",
     "SimTeleopConfig",
     "PiperLeaderTeleopConfig",
     "RLTAgent",

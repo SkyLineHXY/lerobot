@@ -25,20 +25,27 @@ class RolloutWorker:
         buffer: ChunkReplayBuffer,
         stride: int,
         keys: KeyboardEventListener | None = None,
+        view=None,
     ):
         self.env = env
         self.controller = controller
         self.buffer = buffer
         self.stride = stride
         self.keys = keys
+        self.view = view
         self.device = next(controller.rl_token.parameters()).device
         self.obs = None
         self.ep_steps = 0
         self.ep_return = 0.0
         self.ep_interventions = 0
+        # Display-only step counter for the stretch the human is driving; the
+        # authoritative count still comes from InterventionResult.n_steps.
+        self._live_steps = 0
         # Critical-phase mode starts every episode under the base VLA and only
         # switches to the RL policy when the operator says so.
         self.rl_engaged = True
+        if view is not None and hasattr(env, "intervention"):
+            env.intervention.on_step = self._intervention_step
 
     def reset(self, critical_phase: bool = False) -> None:
         self.obs = self.env.reset()
@@ -47,6 +54,24 @@ class RolloutWorker:
         self.ep_interventions = 0
         self.rl_engaged = not critical_phase
         self.buffer.start_episode()
+        self._draw(human=False)
+
+    def _draw(self, *, human: bool, extra_steps: int = 0) -> None:
+        if self.view is None:
+            return
+        self.view.on_step(
+            self.obs,
+            ep_step=self.ep_steps + extra_steps,
+            ep_return=self.ep_return,
+            ep_interventions=self.ep_interventions + (1 if human else 0),
+            human=human,
+        )
+
+    def _intervention_step(self, obs) -> None:
+        """Called by the intervention manager after every step it executes."""
+        self.obs = obs
+        self._live_steps += 1
+        self._draw(human=True, extra_steps=self._live_steps)
 
     def _states_for(self, obs_list: list[dict]) -> list[torch.Tensor]:
         if not obs_list:
@@ -74,6 +99,7 @@ class RolloutWorker:
             else self._plan(batch, use_actor, deterministic)
         )
 
+        self._live_steps = 0
         intervention = self.env.run_intervention(c)
 
         if intervention is not None:
@@ -115,6 +141,7 @@ class RolloutWorker:
                 n_exec = j + 1
                 self.ep_steps += 1
                 self.ep_return += r
+                self._draw(human=False)
                 if terminated:
                     break
                 if self.ep_steps >= self.env.max_episode_steps:

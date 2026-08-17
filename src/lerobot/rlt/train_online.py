@@ -11,7 +11,13 @@ Rollout-and-update loop:
     replace both the executed action and the stored reference (paper Sec. V),
   * with `--critical-phase` the episode starts under the base VLA and the
     operator presses `r` to hand control to the RL policy, so data collection
-    concentrates on the precise segment that decides success.
+    concentrates on the precise segment that decides success,
+  * in a sim env, digit keys 0-9 switch the LIBERO task of the current suite
+    between episodes,
+  * `view.enabled` opens an OpenCV window showing the cameras plus the RL state
+    (phase, who is driving, success rate, buffer, learner metrics), and
+    `warmup_human_control` puts the human in charge for the whole warmup so the
+    prefill contains trajectories that actually score.
 
 Rollout and learning run concurrently: the learner owns the agent in its own
 thread and publishes actor weights, the rollout thread reads them through a
@@ -52,11 +58,11 @@ from lerobot.policies.rlt import (
     RLTOnlineTrainConfig,
     load_smolvla_policy,
 )
-
-from .backends import make_backend
-from .envs import make_chunk_env
-from .rollout import RolloutWorker
-from .teleop.keys import KeyboardEventListener
+from lerobot.rlt.backends import make_backend
+from lerobot.rlt.envs import make_chunk_env
+from lerobot.rlt.rollout import RolloutWorker
+from lerobot.rlt.teleop.keys import KeyboardEventListener
+from lerobot.rlt.view import RolloutView
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +104,32 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
     return policy, agent, controller
 
 
+def poll_task_switch(env, keys) -> int | None:
+    """Digit keys 0-9 select a task of the current suite; returns the new id.
+
+    Only the sim envs expose `set_task_id`; on hardware a digit is just an
+    unclaimed key. `poll_extra` is the only legal way to read one — the listener
+    drains its backend in a single pass, so a second reader would see nothing.
+    """
+    if not hasattr(env, "set_task_id"):
+        return None
+    wanted = None
+    for key in keys.poll_extra():
+        if len(key) == 1 and key.isdigit():
+            wanted = int(key)
+    if wanted is None:
+        return None
+    try:
+        if not env.set_task_id(wanted):
+            print(f"[stage2] already on task {wanted}")
+            return None
+    except ValueError as exc:
+        print(f"[stage2] {exc}")
+        return None
+    print(f"[stage2] task -> {wanted}: {env.task_description}")
+    return wanted
+
+
 def train(cfg: RLTOnlineTrainConfig):
     rl = cfg.rl
     torch.manual_seed(cfg.seed)
@@ -111,6 +143,7 @@ def train(cfg: RLTOnlineTrainConfig):
     keys = KeyboardEventListener(backend=cfg.keyboard_backend, discard_key=cfg.discard_key)
     env = None
     backend = None
+    view = None
     try:
         # Build the env *before* putting stdin in cbreak mode: connecting the
         # leader can drop into the interactive calibration flow, whose `input()`
@@ -120,12 +153,42 @@ def train(cfg: RLTOnlineTrainConfig):
 
         backend = make_backend(cfg, agent, x_dim)
         controller.agent = backend.mirror  # plan with published weights, not live ones
-        worker = RolloutWorker(env, controller, backend.buffer, rl.subsample_stride, keys=keys)
+        view = RolloutView(
+            env,
+            enabled=cfg.view.enabled,
+            max_width=cfg.view.max_width,
+            panel_height=cfg.view.panel_height,
+            tile_height=cfg.view.tile_height,
+            min_period_s=cfg.view.min_period_s,
+        ).start()
+        worker = RolloutWorker(
+            env, controller, backend.buffer, rl.subsample_stride, keys=keys, view=view
+        )
         backend.start()
         print(f"[stage2] concurrency mode: {backend.mode}")
+        hints = ["space=takeover", "s=success", "f=failure", f"{cfg.discard_key}=discard", "esc=quit"]
+        if hasattr(env, "set_task_id"):
+            hints.append(f"0-9=task (0..{env.n_tasks - 1})")
+            print(f"[stage2] task {env.task_id}: {env.task_description}")
+        print(f"[stage2] operator keys: {' | '.join(hints)}")
+        view.set(
+            task=getattr(env, "task_description", None) or getattr(env, "task", None),
+            task_id=getattr(env, "task_id", None),
+            total_env_steps=rl.total_env_steps,
+            max_episode_steps=env.max_episode_steps,
+            hint=" | ".join(hints),
+        )
 
         env_steps, episodes, ep_results = 0, 0, []
-        worker.reset(critical_phase=cfg.critical_phase)
+
+        def reset_episode() -> None:
+            worker.reset(critical_phase=cfg.critical_phase)
+            # Must come after reset: `env.reset()` clears the takeover toggle, so
+            # engaging it beforehand would be undone on the very next tick.
+            if cfg.warmup_human_control and env_steps < rl.warmup_env_steps:
+                keys.set_intervening(True)
+
+        reset_episode()
         t0 = time.time()
 
         while env_steps < rl.total_env_steps:
@@ -133,6 +196,15 @@ def train(cfg: RLTOnlineTrainConfig):
             if keys.should_quit():
                 print("[stage2] operator requested stop.")
                 break
+            if view.quit_requested:
+                print("[stage2] operator closed the view.")
+                break
+
+            if poll_task_switch(env, keys) is not None:
+                backend.buffer.discard_episode()
+                view.set(task=env.task_description, task_id=env.task_id)
+                reset_episode()
+                continue
 
             warmup = env_steps < rl.warmup_env_steps
             backend.set_warmup(warmup)
@@ -145,6 +217,18 @@ def train(cfg: RLTOnlineTrainConfig):
                 print("[stage2] handover -> RL policy")
 
             use_actor = (not warmup) and worker.rl_engaged
+            recent = ep_results[-20:]
+            view.set(
+                phase="WARMUP" if warmup else ("RL" if use_actor else "VLA"),
+                env_steps=env_steps,
+                episodes=episodes,
+                success_rate=sum(recent) / max(len(recent), 1),
+                successes=int(sum(ep_results)),
+                buffer=len(backend.buffer),
+                fps=env_steps / max(time.time() - t0, 1e-6),
+                elapsed=time.time() - t0,
+                metrics=backend.metrics(),
+            )
             backend.sync_mirror()
             prev_steps = env_steps
             n_steps, ep_done, ep_success, intervened = worker.run_chunk(use_actor=use_actor)
@@ -155,13 +239,13 @@ def train(cfg: RLTOnlineTrainConfig):
                 # the budget is a wear/time budget, not a data counter.
                 dropped = backend.buffer.discard_episode()
                 print(f"[stage2] episode discarded by operator ({dropped} dropped)")
-                worker.reset(critical_phase=cfg.critical_phase)
+                reset_episode()
                 continue
 
             if ep_done:
                 episodes += 1
                 ep_results.append(1.0 if ep_success else 0.0)
-                worker.reset(critical_phase=cfg.critical_phase)
+                reset_episode()
 
             if env_steps // cfg.log_freq != prev_steps // cfg.log_freq:
                 recent = ep_results[-20:]
@@ -181,6 +265,7 @@ def train(cfg: RLTOnlineTrainConfig):
         # Each step gets its own try/except: an exception raised while tearing
         # down masks whatever actually ended the run.
         for label, teardown in (
+            ("view", (view.stop if view is not None else lambda: None)),
             ("keyboard", keys.stop),
             ("backend", (backend.stop if backend is not None else lambda: None)),
             ("env", (env.close if env is not None else lambda: None)),

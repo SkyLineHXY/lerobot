@@ -183,10 +183,8 @@ def make_env(
         )
     elif "metaworld" in cfg.type:
         from lerobot.envs.metaworld import create_metaworld_envs
-
         if cfg.task is None:
             raise ValueError("MetaWorld requires a task to be specified")
-
         return create_metaworld_envs(
             task=cfg.task,
             n_envs=n_envs,

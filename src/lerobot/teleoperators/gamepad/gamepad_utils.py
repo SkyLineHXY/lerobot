@@ -199,8 +199,176 @@ class KeyboardController(InputController):
         return delta_x, delta_y, delta_z
 
 
+STICK_CONTROLS = ("leftx", "lefty", "rightx", "righty")
+TRIGGER_CONTROLS = ("lefttrigger", "righttrigger")
+BUTTON_CONTROLS = (
+    "a",
+    "b",
+    "x",
+    "y",
+    "leftshoulder",
+    "rightshoulder",
+    "leftstick",
+    "rightstick",
+    "back",
+    "start",
+    "guide",
+    "dpup",
+    "dpdown",
+    "dpleft",
+    "dpright",
+)
+CONTROL_NAMES = frozenset(STICK_CONTROLS + TRIGGER_CONTROLS + BUTTON_CONTROLS)
+
+
+def parse_binding(expression: str) -> tuple[str | None, str | None]:
+    """`"righttrigger-lefttrigger"` -> `("righttrigger", "lefttrigger")`.
+
+    A leading "-" leaves the positive side empty, so `"-lefty"` negates the axis;
+    an empty expression disables the channel.
+    """
+    parts = [part.strip() for part in expression.split("-")]
+    if len(parts) > 2:
+        raise ValueError(f"binding {expression!r} has more than one '-'; write it as 'positive-negative'")
+    positive = parts[0]
+    negative = parts[1] if len(parts) == 2 else ""
+    for name in (positive, negative):
+        if name and name not in CONTROL_NAMES:
+            raise ValueError(f"unknown gamepad control {name!r}; pick from {sorted(CONTROL_NAMES)}")
+    return positive or None, negative or None
+
+
+class _ControllerPad:
+    """SDL's game-controller layer, which normalises every pad to one layout.
+
+    Raw joystick numbering is per-device and unusable as a default: the pad this
+    was developed against reports `lefttrigger` as axis 5 and `righttrigger` as
+    axis 4, and its face buttons as 0/1/3/4. Worse, an axis the pad does not
+    have reads a constant -1.0 rather than 0.0, so a wrong index does not go
+    quiet — it looks like a stick held hard over, which is how the old default
+    `rotation_axes=(2, 4, 5)` produced a wrist that span continuously.
+    """
+
+    def __init__(self, index: int):
+        import pygame
+        from pygame._sdl2 import controller
+
+        self._pygame = pygame
+        self._controller = controller.Controller(index)
+        self.name = self._controller.name
+        self._axes = {
+            "leftx": pygame.CONTROLLER_AXIS_LEFTX,
+            "lefty": pygame.CONTROLLER_AXIS_LEFTY,
+            "rightx": pygame.CONTROLLER_AXIS_RIGHTX,
+            "righty": pygame.CONTROLLER_AXIS_RIGHTY,
+            "lefttrigger": pygame.CONTROLLER_AXIS_TRIGGERLEFT,
+            "righttrigger": pygame.CONTROLLER_AXIS_TRIGGERRIGHT,
+        }
+        self._buttons = {
+            "a": pygame.CONTROLLER_BUTTON_A,
+            "b": pygame.CONTROLLER_BUTTON_B,
+            "x": pygame.CONTROLLER_BUTTON_X,
+            "y": pygame.CONTROLLER_BUTTON_Y,
+            "leftshoulder": pygame.CONTROLLER_BUTTON_LEFTSHOULDER,
+            "rightshoulder": pygame.CONTROLLER_BUTTON_RIGHTSHOULDER,
+            "leftstick": pygame.CONTROLLER_BUTTON_LEFTSTICK,
+            "rightstick": pygame.CONTROLLER_BUTTON_RIGHTSTICK,
+            "back": pygame.CONTROLLER_BUTTON_BACK,
+            "start": pygame.CONTROLLER_BUTTON_START,
+            "guide": pygame.CONTROLLER_BUTTON_GUIDE,
+            "dpup": pygame.CONTROLLER_BUTTON_DPAD_UP,
+            "dpdown": pygame.CONTROLLER_BUTTON_DPAD_DOWN,
+            "dpleft": pygame.CONTROLLER_BUTTON_DPAD_LEFT,
+            "dpright": pygame.CONTROLLER_BUTTON_DPAD_RIGHT,
+        }
+
+    def pump(self) -> bool:
+        try:
+            self._pygame.event.pump()
+        except self._pygame.error:
+            logging.error("Error reading gamepad. Is it still connected?")
+            return False
+        return True
+
+    def read(self, control: str) -> float:
+        if control in self._axes:
+            return max(-1.0, min(1.0, self._controller.get_axis(self._axes[control]) / 32767.0))
+        return float(self._controller.get_button(self._buttons[control]))
+
+    def close(self) -> None:
+        self._controller.quit()
+
+
+class _JoystickPad:
+    """Raw-index fallback for pads SDL has no game-controller mapping for."""
+
+    # The layout most generic dual-stick pads expose. It is a guess by
+    # construction, which is why _ControllerPad is always tried first.
+    AXES = {"leftx": 0, "lefty": 1, "rightx": 2, "righty": 3}
+    TRIGGERS = {"lefttrigger": 4, "righttrigger": 5}
+    BUTTONS = {
+        "a": 0,
+        "b": 1,
+        "x": 2,
+        "y": 3,
+        "leftshoulder": 4,
+        "rightshoulder": 5,
+        "back": 6,
+        "start": 7,
+        "leftstick": 8,
+        "rightstick": 9,
+        "guide": 10,
+    }
+    HAT = {"dpup": (1, 1), "dpdown": (1, -1), "dpleft": (0, -1), "dpright": (0, 1)}
+
+    def __init__(self, index: int):
+        import pygame
+
+        self._pygame = pygame
+        self._joystick = pygame.joystick.Joystick(index)
+        self._joystick.init()
+        self.name = self._joystick.get_name()
+
+    def pump(self) -> bool:
+        try:
+            self._pygame.event.pump()
+        except self._pygame.error:
+            logging.error("Error reading gamepad. Is it still connected?")
+            return False
+        return True
+
+    def read(self, control: str) -> float:
+        if control in self.AXES:
+            return self._axis(self.AXES[control])
+        if control in self.TRIGGERS:
+            # Unipolar triggers rest at -1.0 on the raw interface.
+            return (self._axis(self.TRIGGERS[control], resting=-1.0) + 1.0) / 2.0
+        if control in self.HAT:
+            if self._joystick.get_numhats() == 0:
+                return 0.0
+            component, sign = self.HAT[control]
+            return float(self._joystick.get_hat(0)[component] == sign)
+        index = self.BUTTONS[control]
+        if index >= self._joystick.get_numbuttons():
+            return 0.0
+        return float(self._joystick.get_button(index))
+
+    def _axis(self, index: int, resting: float = 0.0) -> float:
+        if index >= self._joystick.get_numaxes():
+            return resting
+        return self._joystick.get_axis(index)
+
+    def close(self) -> None:
+        self._joystick.quit()
+
+
 class GamepadController(InputController):
-    """Generate motion deltas from gamepad input."""
+    """Generate motion deltas from gamepad input.
+
+    Channels are bound to *named* controls (`"righttrigger-lefttrigger"`) rather
+    than raw axis indices, so one binding table works across pads. See
+    `configuration_gamepad.DEFAULT_GAMEPAD_BINDINGS`.
+    """
 
     def __init__(
         self,
@@ -208,138 +376,113 @@ class GamepadController(InputController):
         y_step_size=1.0,
         z_step_size=1.0,
         deadzone=0.1,
-        rotation_axes=(2, 4, 5),
+        bindings=None,
     ):
+        from .configuration_gamepad import DEFAULT_GAMEPAD_BINDINGS
+
         super().__init__(x_step_size, y_step_size, z_step_size)
         self.deadzone = deadzone
-        self.rotation_axes = tuple(rotation_axes)
-        self.joystick = None
-        self.intervention_flag = False
-
-    def _axis(self, index: int) -> float:
-        """Read one axis with a deadzone; 0.0 if this pad does not have it.
-
-        Axis numbering is not standardised across controllers, so a
-        configuration naming an axis the pad lacks must degrade to "no input"
-        rather than raise mid-teleoperation.
-        """
-        if index < 0 or index >= self.joystick.get_numaxes():
-            return 0.0
-        value = self.joystick.get_axis(index)
-        return 0.0 if abs(value) < self.deadzone else value
+        self.bindings = {**DEFAULT_GAMEPAD_BINDINGS, **(bindings or {})}
+        unknown = sorted(set(self.bindings) - set(DEFAULT_GAMEPAD_BINDINGS))
+        if unknown:
+            raise ValueError(f"unknown gamepad binding channels {unknown}")
+        self._terms = {channel: parse_binding(expr) for channel, expr in self.bindings.items()}
+        self.pad = None
+        self._pressed: dict[str, bool] = {}
 
     def start(self):
         """Initialize pygame and the gamepad."""
         import pygame
+        from pygame._sdl2 import controller
 
         pygame.init()
         pygame.joystick.init()
+        controller.init()
 
         if pygame.joystick.get_count() == 0:
             logging.error("No gamepad detected. Please connect a gamepad and try again.")
             self.running = False
             return
 
-        self.joystick = pygame.joystick.Joystick(0)
-        self.joystick.init()
-        logging.info(f"Initialized gamepad: {self.joystick.get_name()}")
-
-        print("Gamepad controls:")
-        print("  Left analog stick: Move in X-Y plane")
-        print("  Right analog stick (vertical): Move in Z axis")
-        print("  B/Circle button: Exit")
-        print("  Y/Triangle button: End episode with SUCCESS")
-        print("  A/Cross button: End episode with FAILURE")
-        print("  X/Square button: Rerecord episode")
+        if controller.is_controller(0):
+            self.pad = _ControllerPad(0)
+        else:
+            self.pad = _JoystickPad(0)
+            logging.warning(
+                "SDL has no game-controller mapping for %r, so the raw axis/button layout is a "
+                "guess. Verify it with `lerobot-find-gamepad`, and if it is wrong export a mapping "
+                "string in SDL_GAMECONTROLLERCONFIG.",
+                self.pad.name,
+            )
+        logging.info("Initialized gamepad: %s", self.pad.name)
+        print(f"Gamepad: {self.pad.name}")
+        for channel, expression in self.bindings.items():
+            print(f"  {channel:<14} {expression or '(disabled)'}")
 
     def stop(self):
         """Clean up pygame resources."""
         import pygame
 
+        if self.pad is not None:
+            self.pad.close()
+            self.pad = None
         if pygame.joystick.get_init():
-            if self.joystick:
-                self.joystick.quit()
             pygame.joystick.quit()
         pygame.quit()
 
     def update(self):
         """Process pygame events to get fresh gamepad readings."""
-        import pygame
+        if self.pad is None or not self.pad.pump():
+            return
 
-        for event in pygame.event.get():
-            if event.type == pygame.JOYBUTTONDOWN:
-                if event.button == 3:
-                    self.episode_end_status = TeleopEvents.SUCCESS
-                # A button (1) for failure
-                elif event.button == 1:
-                    self.episode_end_status = TeleopEvents.FAILURE
-                # X button (0) for rerecord
-                elif event.button == 0:
-                    self.episode_end_status = TeleopEvents.RERECORD_EPISODE
+        for channel, status in (
+            ("success", TeleopEvents.SUCCESS),
+            ("failure", TeleopEvents.FAILURE),
+            ("rerecord", TeleopEvents.RERECORD_EPISODE),
+        ):
+            if self._pressed_edge(channel):
+                self.episode_end_status = status
 
-                # RB button (6) for closing gripper
-                elif event.button == 6:
-                    self.close_gripper_command = True
+        self.close_gripper_command = self.channel("gripper_close") > 0.5
+        self.open_gripper_command = self.channel("gripper_open") > 0.5
+        self.intervention_flag = self.channel("intervention") > 0.5
 
-                # LT button (7) for opening gripper
-                elif event.button == 7:
-                    self.open_gripper_command = True
+    def channel(self, name: str) -> float:
+        """Current value of one bound channel, in [-1, 1]."""
+        if self.pad is None:
+            return 0.0
+        positive, negative = self._terms[name]
+        return self._read(positive) - self._read(negative)
 
-            # Reset episode status on button release
-            elif event.type == pygame.JOYBUTTONUP:
-                if event.button in [0, 2, 3]:
-                    self.episode_end_status = None
+    def _read(self, control: str | None) -> float:
+        if control is None:
+            return 0.0
+        value = self.pad.read(control)
+        # Buttons and triggers rest at exactly 0, so one deadzone covers both
+        # them and the sticks, whose centre drifts by a percent or two.
+        return 0.0 if abs(value) < self.deadzone else value
 
-                elif event.button == 6:
-                    self.close_gripper_command = False
-
-                elif event.button == 7:
-                    self.open_gripper_command = False
-
-            # Check for RB button (typically button 5) for intervention flag
-            if self.joystick.get_button(5):
-                self.intervention_flag = True
-            else:
-                self.intervention_flag = False
+    def _pressed_edge(self, channel: str) -> bool:
+        """True only on the frame a channel goes from released to pressed."""
+        down = self.channel(channel) > 0.5
+        was_down = self._pressed.get(channel, False)
+        self._pressed[channel] = down
+        return down and not was_down
 
     def get_deltas(self):
         """Get the current movement deltas from gamepad state."""
-        import pygame
-
-        try:
-            # Read joystick axes
-            # Left stick X and Y (typically axes 0 and 1)
-            y_input = self.joystick.get_axis(0)  # Up/Down (often inverted)
-            x_input = self.joystick.get_axis(1)  # Left/Right
-
-            # Right stick Y (typically axis 3 or 4)
-            z_input = self.joystick.get_axis(3)  # Up/Down for Z
-
-            # Apply deadzone to avoid drift
-            x_input = 0 if abs(x_input) < self.deadzone else x_input
-            y_input = 0 if abs(y_input) < self.deadzone else y_input
-            z_input = 0 if abs(z_input) < self.deadzone else z_input
-
-            # Calculate deltas (note: may need to invert axes depending on controller)
-            delta_x = -x_input * self.x_step_size  # Forward/backward
-            delta_y = -y_input * self.y_step_size  # Left/right
-            delta_z = -z_input * self.z_step_size  # Up/down
-
-            return delta_x, delta_y, delta_z
-
-        except pygame.error:
-            logging.error("Error reading gamepad. Is it still connected?")
-            return 0.0, 0.0, 0.0
+        return (
+            self.channel("delta_x") * self.x_step_size,
+            self.channel("delta_y") * self.y_step_size,
+            self.channel("delta_z") * self.z_step_size,
+        )
 
     def get_rotation_deltas(self):
-        import pygame
-
-        try:
-            roll, pitch, yaw = (self._axis(i) for i in self.rotation_axes)
-            return -roll, -pitch, -yaw
-        except pygame.error:
-            logging.error("Error reading gamepad. Is it still connected?")
-            return 0.0, 0.0, 0.0
+        return (
+            self.channel("delta_roll"),
+            self.channel("delta_pitch"),
+            self.channel("delta_yaw"),
+        )
 
 
 class GamepadControllerHID(InputController):

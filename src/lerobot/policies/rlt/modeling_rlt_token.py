@@ -26,6 +26,7 @@ from lerobot.utils.constants import (
 
 from .configuration_rlt import RLTokenConfig
 
+
 class SmolVLAPrefixExtractor:
     """Frozen-VLA feature extraction mirroring ``VLAFlowMatching.sample_actions``.
 

@@ -102,44 +102,36 @@ class LiberoChunkEnv:
                 "simulation runs the exact normalisation the RL token was trained with."
             )
         from lerobot.envs.libero import LiberoEnv, _get_suite, _parse_camera_names
-
-        # Three naming conventions have to be reconciled here, and getting it wrong
-        # is silent: LiberoEnv calls the wrist camera `image2`, the stage-1
-        # processors use the demo dataset's names (`wrist_image` for
-        # lerobot/libero_10), and the VLA checkpoint declares its own
-        # (`camera1..3` for lerobot/smolvla_libero, trained on lerobot/libero).
-        # SmolVLA's vision tower is shared across cameras and keyed only by
-        # position in `config.image_features`, so what matters is *order*, not the
-        # names — but `prepare_images` skips keys missing from the batch without
-        # complaint, so a mismatch quietly drops a whole camera.
-        #
-        # `image_keys` therefore comes from the policy when the caller has one;
-        # otherwise fall back to what stage 1 was fitted on.
         cameras = _parse_camera_names(camera_name)
-        keys = list(image_keys) if image_keys else _stage1_image_keys(preprocessor)
-        if len(keys) < len(cameras):
+        # Never call this `keys`: that name is the operator's KeyboardEventListener,
+        # and shadowing it here leaves `self.keys` holding a list of image keys,
+        # which only surfaces much later as "'list' object has no attribute
+        # reset_episode_flags" on the first env reset.
+        img_keys = list(image_keys) if image_keys else _stage1_image_keys(preprocessor)
+        if len(img_keys) < len(cameras):
             raise ValueError(
-                f"The policy declares {len(keys)} image features {keys}, fewer than "
+                f"The policy declares {len(img_keys)} image features {img_keys}, fewer than "
                 f"the {len(cameras)} cameras configured: {cameras}."
             )
-        if len(keys) > len(cameras):
+        if len(img_keys) > len(cameras):
             # smolvla_libero's config.json lists a camera3 its training data never
             # had; SmolVLA pads or skips the surplus, so this is a note, not an error.
             logger.warning(
                 "Policy declares %d image features %s but the env supplies %d cameras; "
                 "mapping the first %d in order.",
-                len(keys), keys, len(cameras), len(cameras),
+                len(img_keys), img_keys, len(cameras), len(cameras),
             )
-            keys = keys[: len(cameras)]
-        self.expected_image_keys = keys
+            img_keys = img_keys[: len(cameras)]
+        self.expected_image_keys = img_keys
         camera_name_mapping = {
             cam: key.removeprefix(f"{OBS_IMAGES}.")
-            for cam, key in zip(cameras, keys, strict=True)
+            for cam, key in zip(cameras, img_keys, strict=True)
         }
 
-        suite = _get_suite(task_suite_name)
+        self._suite = _get_suite(task_suite_name)
+        self.suite_name = task_suite_name
         self._env = LiberoEnv(
-            task_suite=suite,
+            task_suite=self._suite,
             task_id=task_id,
             task_suite_name=task_suite_name,
             obs_type="pixels_agent_pos",
@@ -158,8 +150,6 @@ class LiberoChunkEnv:
         self.keys = keys or KeyboardEventListener(backend="none")
         self.intervention = intervention or InterventionManager()
         self._action_normalizer = ActionNormalizer(preprocessor, action_dim)
-        # Same step the eval script inserts for LIBERO; without it the policy
-        # receives a nested robot_state dict instead of `observation.state`.
         self.env_preprocessor = PolicyProcessorPipeline(steps=[LiberoProcessorStep()])
 
         self._steps = 0
@@ -169,13 +159,62 @@ class LiberoChunkEnv:
     def task(self) -> str:
         return self._env.task
 
+    @property
+    def task_description(self) -> str:
+        return self._env.task_description
+
+    @property
+    def task_id(self) -> int:
+        return self._env.task_id
+
+    @property
+    def n_tasks(self) -> int:
+        return self._suite.n_tasks
+
+    def set_task_id(self, task_id: int) -> bool:
+        """Switch to another task of the same suite. Returns whether it changed.
+
+        Rebuilding the simulator takes a second or two, so this is a between-episode
+        operation: the caller has to `reset()` afterwards. Note that the RL token,
+        the critic and everything already in the replay buffer are conditioned on
+        the task language, so mixing tasks within one run is only sound for
+        collecting demonstrations — not for a single-task RL curve.
+        """
+        if not 0 <= task_id < self.n_tasks:
+            raise ValueError(f"task_id {task_id} out of range for {self.suite_name} (0..{self.n_tasks - 1})")
+        if task_id == self.task_id:
+            return False
+        self._env.set_task(self._suite, task_id)
+        self._episode = 0
+        return True
+
+    def render_frames(self, obs: dict) -> dict[str, np.ndarray]:
+        """Display-ready copies of this observation's cameras, for the operator view.
+
+        LIBERO renders with the OpenGL origin at the bottom left and its datasets
+        store `img[::-1, ::-1]`, so the same rotation is what makes the picture
+        match both the dataset and the operator's mental model.
+        """
+        pixels = obs.get("pixels") or {}
+        return {key: np.ascontiguousarray(img[::-1, ::-1]) for key, img in pixels.items()}
+
     # ------------------------------------------------------------ observation
     def obs_to_batch(self, obs_list: list[dict], device) -> dict[str, Tensor]:
         batches = [self._single_obs_to_batch(o, device) for o in obs_list]
         if len(batches) == 1:
             return batches[0]
-        keys = batches[0].keys()
-        return {k: torch.cat([b[k] for b in batches], dim=0) for k in keys}
+        # The processor pipeline returns the whole transition frame, not just the
+        # model inputs: `action` is None until a policy has written one, and
+        # `task`/`info`/`next.reward` are plain Python objects. Concatenating
+        # blindly dies on the first of those, so stack the tensors, extend the
+        # per-sample lists, and take everything else from the first observation.
+        merged = dict(batches[0])
+        for key, value in batches[0].items():
+            if isinstance(value, Tensor):
+                merged[key] = torch.cat([b[key] for b in batches], dim=0)
+            elif isinstance(value, list):
+                merged[key] = [item for b in batches for item in b[key]]
+        return merged
 
     def _single_obs_to_batch(self, obs: dict, device) -> dict[str, Tensor]:
         frame = preprocess_observation(obs)
@@ -209,11 +248,17 @@ class LiberoChunkEnv:
         obs, _reward, terminated, _truncated, info = self._env.step(env_action)
         self._steps += 1
 
-        success = bool(info.get("is_success", False))
-        # The failure key is the operator's only way to end a doomed episode:
-        # the simulator itself never reports failure, so without it a bad
-        # rollout burns the full step limit before the buffer sees a terminal.
-        _key_success, key_failure = self.keys.poll_outcome()
+        # The operator is a reward source here, exactly as on hardware
+        # (`piper.py`): LIBERO's own checker only fires for the task as authored,
+        # so a human who takes over and finishes the job any other way would
+        # otherwise produce a chunk worth 0. With no reward anywhere the critic
+        # converges to Q=0 and the actor has nothing to maximise — which is what
+        # a run stuck at success20=0.00 with a full buffer looks like.
+        # The failure key is the only way to end a doomed episode: the simulator
+        # never reports failure, so without it a bad rollout burns the full step
+        # limit before the buffer sees a terminal.
+        key_success, key_failure = self.keys.poll_outcome()
+        success = bool(info.get("is_success", False)) or key_success
         reward = 1.0 if success else 0.0
         done = terminated or success or key_failure
         truncated = (not done) and self._steps >= self.max_episode_steps

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import sys
 from enum import IntEnum
 from typing import Any
@@ -77,12 +78,20 @@ class GamepadTeleop(Teleoperator):
         # use HidApi for macos
         if sys.platform == "darwin":
             # NOTE: On macOS, pygame doesn’t reliably detect input from some controllers so we fall back to hidapi
-            from .gamepad_utils import GamepadControllerHID as Gamepad
-        else:
-            from .gamepad_utils import GamepadController as Gamepad
+            from .gamepad_utils import GamepadControllerHID
 
-        kwargs = {"rotation_axes": self.config.rotation_axes} if self.config.use_rotation else {}
-        self.gamepad = Gamepad(**kwargs)
+            # The HID backend hard-codes one vendor's report layout, so it takes
+            # neither bindings nor rotation channels.
+            self.gamepad = GamepadControllerHID(deadzone=self.config.deadzone)
+            if self.config.use_rotation:
+                logging.warning("The macOS HID gamepad backend has no rotation channels; they stay at 0.")
+        else:
+            from .gamepad_utils import GamepadController
+
+            self.gamepad = GamepadController(
+                deadzone=self.config.deadzone,
+                bindings=self.config.bindings,
+            )
         self.gamepad.start()
 
     @check_if_not_connected

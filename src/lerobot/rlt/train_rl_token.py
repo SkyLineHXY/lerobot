@@ -23,6 +23,7 @@ from lerobot.policies.rlt import (
     load_smolvla_policy,
 )
 
+
 def build_dataset_and_processors(policy_config, dataset_repo: str, dataset_root: str | None):
     from lerobot.configs.types import FeatureType
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -113,8 +114,6 @@ def train(train_cfg: RLTokenTrainConfig):
 
     # The VLA is optimised separately: L_ro and L_vla have disjoint gradient
     # graphs (Eq. 2 stop-gradients the embeddings), so sharing one optimizer
-    # would only force a single learning rate onto two very differently scaled
-    # parameter groups and couple their gradient-clipping norms.
     vla_params = [p for p in policy.parameters() if p.requires_grad] if finetune_vla else []
     vla_opt = vla_sched = None
     if finetune_vla:

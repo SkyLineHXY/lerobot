@@ -31,6 +31,11 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.processor import RobotObservation
 from lerobot.utils.constants import LIBERO_DEFAULT_CAMERA_NAME_MAPPING
+from lerobot.utils.multiprocess_compat import patch_resource_tracker
+
+# robomimic drags in `multiprocess`, whose resource tracker raises at interpreter
+# exit on CPython 3.12.0 and hides the real traceback behind it.
+patch_resource_tracker()
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -240,6 +245,20 @@ class LiberoEnv(gym.Env):
         env = OffScreenRenderEnv(**env_args)
         env.reset()
         return env
+
+    def set_task(self, task_suite: Any, task_id: int) -> None:
+        """Swap in another task of the same suite, in place.
+
+        The task is baked into the underlying `OffScreenRenderEnv` at construction
+        — bddl file, object set, init states — so switching means tearing that env
+        down and building a new one. `reset()` afterwards: the new simulator has
+        never been stepped, and `control_mode` is only applied on reset.
+        """
+        self._env.close()
+        self.task_id = task_id
+        self._init_states = get_task_init_states(task_suite, task_id) if self.init_states else None
+        self.init_state_id = self.episode_index
+        self._env = self._make_envs_task(task_suite, task_id)
 
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         images = {}
