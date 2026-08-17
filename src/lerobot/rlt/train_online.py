@@ -7,17 +7,22 @@ Rollout-and-update loop:
     stored with stride-2 subsampling and the learner paces itself at
     `utd` gradient steps per stored transition (2 critic updates per actor
     update),
-  * a human may take over at any chunk boundary; the taken-over actions
-    replace both the executed action and the stored reference (paper Sec. V),
+  * once warmup is over a human may take over at any point, including
+    mid-chunk; the taken-over actions replace both the executed action and the
+    stored reference (paper Sec. V),
   * with `--critical-phase` the episode starts under the base VLA and the
     operator presses `r` to hand control to the RL policy, so data collection
     concentrates on the precise segment that decides success,
   * in a sim env, digit keys 0-9 switch the LIBERO task of the current suite
     between episodes,
   * `view.enabled` opens an OpenCV window showing the cameras plus the RL state
-    (phase, who is driving, success rate, buffer, learner metrics), and
-    `warmup_human_control` puts the human in charge for the whole warmup so the
-    prefill contains trajectories that actually score.
+    (phase, who is driving, success rate, buffer, learner metrics).
+
+Both the window and takeover stay off for the whole warmup phase. Warmup exists
+to fit the critic on what the frozen base VLA actually does, so a human-driven
+chunk there would teach it the value of an action the deployed policy cannot
+produce; and nobody needs to watch a policy they are not allowed to correct.
+The window opens and the controls arm together, at the warmup boundary.
 
 Rollout and learning run concurrently: the learner owns the agent in its own
 thread and publishes actor weights, the rollout thread reads them through a
@@ -56,6 +61,7 @@ from lerobot.policies.rlt import (
     RLTokenConfig,
     RLTokenModule,
     RLTOnlineTrainConfig,
+    check_stage1_matches_policy,
     load_smolvla_policy,
 )
 from lerobot.rlt.backends import make_backend
@@ -86,6 +92,7 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
     device = cfg.device
     print(f"[stage2] loading SmolVLA from {cfg.checkpoint} ...")
     policy = load_smolvla_policy(cfg.checkpoint, device=device, dtype=cfg.dtype)
+    check_stage1_matches_policy(cfg.rl_token, cfg.checkpoint)
     rl_token, rt_cfg = load_rl_token(cfg.rl_token, device)
     cfg.rl.ac.rl_token_dim = rt_cfg.d_model
 
@@ -160,13 +167,17 @@ def train(cfg: RLTOnlineTrainConfig):
             panel_height=cfg.view.panel_height,
             tile_height=cfg.view.tile_height,
             min_period_s=cfg.view.min_period_s,
-        ).start()
+        )
         worker = RolloutWorker(
             env, controller, backend.buffer, rl.subsample_stride, keys=keys, view=view
         )
         backend.start()
         print(f"[stage2] concurrency mode: {backend.mode}")
         hints = ["space=takeover", "s=success", "f=failure", f"{cfg.discard_key}=discard", "esc=quit"]
+        print(
+            f"[stage2] warmup: base VLA only for {rl.warmup_env_steps} env steps "
+            f"(no view, no takeover)"
+        )
         if hasattr(env, "set_task_id"):
             hints.append(f"0-9=task (0..{env.n_tasks - 1})")
             print(f"[stage2] task {env.task_id}: {env.task_description}")
@@ -183,10 +194,6 @@ def train(cfg: RLTOnlineTrainConfig):
 
         def reset_episode() -> None:
             worker.reset(critical_phase=cfg.critical_phase)
-            # Must come after reset: `env.reset()` clears the takeover toggle, so
-            # engaging it beforehand would be undone on the very next tick.
-            if cfg.warmup_human_control and env_steps < rl.warmup_env_steps:
-                keys.set_intervening(True)
 
         reset_episode()
         t0 = time.time()
@@ -208,6 +215,8 @@ def train(cfg: RLTOnlineTrainConfig):
 
             warmup = env_steps < rl.warmup_env_steps
             backend.set_warmup(warmup)
+            worker.allow_intervention = not warmup
+            view.set_active(not warmup)
 
             # Critical-phase handover: run the base VLA until the operator
             # presses `r`, then let the RL policy take over for the rest of the

@@ -44,6 +44,10 @@ class RolloutWorker:
         # Critical-phase mode starts every episode under the base VLA and only
         # switches to the RL policy when the operator says so.
         self.rl_engaged = True
+        # Cleared during warmup: that phase runs the frozen base VLA to fit the
+        # critic on what the VLA actually does, so a human-driven chunk would
+        # teach it the value of an action the deployed policy cannot produce.
+        self.allow_intervention = True
         if view is not None and hasattr(env, "intervention"):
             env.intervention.on_step = self._intervention_step
 
@@ -92,7 +96,7 @@ class RolloutWorker:
         # If the operator is already holding the leader, the VLA's action chunk
         # is guaranteed to be discarded; compute only the RL state x and skip
         # the flow-matching sampling the human would otherwise wait through.
-        taking_over = self.env.intervention_pending()
+        taking_over = self.allow_intervention and self.env.intervention_pending()
         plan = (
             {"x": self.controller.compute_x(batch)}
             if taking_over
@@ -100,7 +104,7 @@ class RolloutWorker:
         )
 
         self._live_steps = 0
-        intervention = self.env.run_intervention(c)
+        intervention = self.env.run_intervention(c) if self.allow_intervention else None
 
         if intervention is not None:
             # Human corrections replace the VLA reference too, so the actor's
@@ -146,6 +150,13 @@ class RolloutWorker:
                     break
                 if self.ep_steps >= self.env.max_episode_steps:
                     truncated = True
+                    break
+                if self.allow_intervention and self.env.intervention_pending():
+                    # Hand over mid-chunk. Waiting for the boundary costs the
+                    # operator up to C steps (~1 s at 10 Hz) between seeing the
+                    # policy go wrong and being able to grab it — long enough to
+                    # lose the object. A short chunk is already a representable
+                    # record: `done_step` covers n_exec < c.
                     break
             success = bool(rewards.sum() > 0)
 

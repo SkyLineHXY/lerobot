@@ -54,7 +54,6 @@ rl:
 critical_phase: false
 log_freq: 500
 save_freq: 5000
-warmup_human_control: false
 
 
 view:

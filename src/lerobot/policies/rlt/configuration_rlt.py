@@ -373,18 +373,6 @@ class RLTOnlineTrainConfig:
     # when the operator presses `r` (paper Sec. V).
     critical_phase: bool = False
 
-    # Human-in-the-loop during warmup is *on demand* and needs no flag: takeover
-    # is never gated by the warmup phase, so the operator watches the base VLA
-    # and grabs the controls the moment it goes wrong. The correction replaces
-    # both the executed action and the stored reference, and pressing success
-    # gives that episode the reward the VLA could not earn.
-    #
-    # This flag is the heavier fallback: engage the takeover toggle automatically
-    # at the start of every warmup episode, so the human drives the whole prefill.
-    # Only worth it when the base policy's success rate is flat zero and watching
-    # it fail is pure waste.
-    warmup_human_control: bool = False
-
     view: RolloutViewConfig = field(default_factory=RolloutViewConfig)
     num_inference_steps: int | None = None
     resume_buffer: str | None = None

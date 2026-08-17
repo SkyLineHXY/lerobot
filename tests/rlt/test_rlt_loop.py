@@ -150,6 +150,45 @@ def test_intervention_replaces_both_action_and_reference():
     assert torch.allclose(buffer.action[0], torch.full_like(buffer.action[0], env.human_value))
 
 
+class ProbingInterventionEnv(ScriptedInterventionEnv):
+    """记录 rollout 一共问了几次"人要接管吗"，以及真的交出去几次。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.n_pending_polls = 0
+
+    def intervention_pending(self):
+        self.n_pending_polls += 1
+        return True
+
+
+def test_warmup_never_asks_for_or_accepts_a_takeover():
+    """warmup 要让 critic 学冻结 VLA 的价值，人开的那一段不属于这个分布。"""
+    env = ProbingInterventionEnv(intervene_on=set(range(8)), action_dim=D, max_episode_steps=40)
+    _cfg, _e, _buf, _c, worker = _make(env=env)
+    worker.allow_intervention = False
+    worker.reset()
+    for _ in range(4):
+        _n, _done, _succ, intervened = worker.run_chunk(use_actor=False)
+        assert not intervened
+
+    assert env.n_pending_polls == 0, "warmup 期间连问都不该问"
+    assert env.chunk_idx == 0, "run_intervention 一次都不该被调用"
+
+
+def test_takeover_works_again_once_warmup_is_over():
+    env = ProbingInterventionEnv(intervene_on={0}, action_dim=D, max_episode_steps=40)
+    _cfg, _e, _buf, _c, worker = _make(env=env)
+    worker.allow_intervention = False
+    worker.reset()
+    worker.run_chunk(use_actor=False)
+
+    worker.allow_intervention = True
+    _n, _done, _succ, intervened = worker.run_chunk(use_actor=False)
+    assert intervened
+    assert env.n_pending_polls > 0
+
+
 def test_critical_phase_defers_rl_until_handover():
     cfg, _env, _buf, _ctrl, worker = _make()
     worker.reset(critical_phase=True)
