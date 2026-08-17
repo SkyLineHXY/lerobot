@@ -186,9 +186,10 @@ def serve(
         seconds_between_pushes=push_period,
         transition_queue=transition_queue,
         interaction_message_queue=interaction_queue,
-        # LearnerService busy-spins on an empty parameters queue, logging once
-        # per pass. Its 1 ms default turns that into ~1000 log lines a second
-        # for a whole training run; pacing it to the push period does not.
+        # This is how long a push attempt blocks on an empty parameters queue.
+        # The 1 ms default wakes the gRPC worker a thousand times a second to
+        # find nothing; half a push period is the shortest wait that can still
+        # deliver every publish on time.
         queue_get_timeout=max(push_period / 2, 0.05),
     )
     server = grpc.server(

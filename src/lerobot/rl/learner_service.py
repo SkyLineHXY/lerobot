@@ -64,12 +64,19 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
                 # and it's checked in the while loop
                 continue
 
-            logging.info("[LEARNER] Push parameters to the Actor")
+            # Per-push heartbeats, not events: at 10 Hz these two lines alone
+            # bury every other INFO record the learner emits.
+            logging.debug("[LEARNER] Push parameters to the Actor")
             buffer = get_last_item_from_queue(
                 self.parameters_queue, block=True, timeout=self.queue_get_timeout
             )
 
             if buffer is None:
+                # An empty queue still counts as an attempt. Leaving
+                # `last_push_time` alone would keep the rate limit above
+                # permanently satisfied, so the loop would spin at
+                # 1/queue_get_timeout instead of the requested push rate.
+                last_push_time = time.time()
                 continue
 
             yield from send_bytes_in_chunks(
@@ -80,7 +87,7 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
             )
 
             last_push_time = time.time()
-            logging.info("[LEARNER] Parameters sent")
+            logging.debug("[LEARNER] Parameters sent")
 
         logging.info("[LEARNER] Stream parameters finished")
         return services_pb2.Empty()
