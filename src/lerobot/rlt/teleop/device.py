@@ -88,6 +88,9 @@ class DeviceIntervention(InterventionManager):
                 "Teleop channels %s have no matching env action; they are ignored.",
                 self._unmapped,
             )
+        self._gripper_idx = (
+            self.action_names.index("gripper") if "gripper" in self.action_names else None
+        )
         # Held rather than re-read every step: robosuite's gripper command is a
         # continuous target, so "stay" has to repeat the last command. Sending 0
         # would let a closed gripper drift open mid-grasp.
@@ -135,9 +138,27 @@ class DeviceIntervention(InterventionManager):
     def on_reset(self) -> None:
         self._gripper = self.gripper_open_value
 
+    def _sync_gripper_from_env(self) -> None:
+        """Adopt the gripper command the env is already holding.
+
+        `_gripper` is a latch, because the device only ever reports open, close
+        or stay. Taking over with that latch still on its episode-reset value
+        makes the very first human step command "open", which drops whatever the
+        policy had just grasped — the operator grabs the controls precisely when
+        something is in the gripper, so this fires nearly every time. Envs that
+        do not publish their last action (the mock, which has no gripper channel
+        at all) keep the latch untouched.
+        """
+        if self._gripper_idx is None:
+            return
+        last = getattr(self.env, "last_env_action", None)
+        if last is not None:
+            self._gripper = float(last[self._gripper_idx])
+
     def run_chunk(self, chunk_len: int) -> InterventionResult | None:
         if not self.check():
             return None
+        self._sync_gripper_from_env()
 
         actions, rewards, obs_list = [], [], []
         done = truncated = False

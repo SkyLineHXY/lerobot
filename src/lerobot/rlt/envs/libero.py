@@ -154,14 +154,33 @@ class LiberoChunkEnv:
 
         self._steps = 0
         self._episode = 0
+        # robosuite's gripper command is a continuous target, so an operator
+        # taking over has to know what is currently being held. See
+        # `DeviceIntervention._sync_gripper_from_env`.
+        self.last_env_action: np.ndarray | None = None
 
     @property
     def task(self) -> str:
-        return self._env.task
+        """The language prompt handed to the VLA — `task.language`, not `task.name`.
+
+        `LiberoEnv.task` is the bddl identifier
+        (`open_the_middle_drawer_of_the_cabinet`); `LiberoEnv.task_description` is
+        the instruction the datasets and `add_envs_task` use ("open the middle
+        drawer of the cabinet"). They differ only by underscores, so feeding the
+        wrong one looks harmless and tokenizes to something else entirely — 17
+        tokens instead of 8, none of them shared past the first. The VLA then runs
+        on a prompt it never saw in training and quietly scores 0.
+        """
+        return self._env.task_description
 
     @property
     def task_description(self) -> str:
         return self._env.task_description
+
+    @property
+    def task_name(self) -> str:
+        """The bddl identifier. For logging only — never as a policy prompt."""
+        return self._env.task
 
     @property
     def task_id(self) -> int:
@@ -245,6 +264,7 @@ class LiberoChunkEnv:
     def apply_action(self, action: Tensor) -> tuple[dict, float, bool, bool]:
         """Execute one normalized action; returns (obs, reward, done, truncated)."""
         env_action = self._normalized_to_env_action(action)
+        self.last_env_action = env_action
         obs, _reward, terminated, _truncated, info = self._env.step(env_action)
         self._steps += 1
 
@@ -279,6 +299,7 @@ class LiberoChunkEnv:
 
     def reset(self) -> dict:
         obs, _info = self._env.reset(seed=self.seed + self._episode)
+        self.last_env_action = None
         self._steps = 0
         self._episode += 1
         self.keys.reset_episode_flags()
