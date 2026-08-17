@@ -110,7 +110,13 @@ class ActorCriticConfig:
 class OnlineRLConfig:
     """Stage 2 training loop (Algorithm 1 + App. B)."""
     ac: ActorCriticConfig = field(default_factory=ActorCriticConfig)
-    discount: float = 0.97  # per control step; chunk backup uses gamma^C
+    # Per control step; the chunk backup uses gamma^k for the k steps actually
+    # executed. The only reward is +1 at the terminal step, so the discount
+    # horizon has to reach back over a whole episode: at 0.97 it is 1/(1-gamma)
+    # = 33 steps and gamma^200 = 0.002, i.e. the first half of a 400-step
+    # episode receives no signal at all. Both reference implementations use
+    # 0.99 (horizon 100, gamma^200 = 0.13).
+    discount: float = 0.99
     critic_lr: float = 3e-4
     actor_lr: float = 3e-4
     tau: float = 0.005  # polyak for target critics (TD3)
@@ -120,11 +126,15 @@ class OnlineRLConfig:
     # C*d (= 60 here) and leave the actor essentially unanchored.
     bc_beta: float = 0.3
 
-    # TD3 target policy smoothing (paper only says "sample from pi_theta"; the
-    # reference implementations use explicit smoothing to stop the critic from
-    # being exploited at sharp Q peaks).
-    target_noise_std: float = 0.2
-    target_noise_clip: float = 0.5
+    # TD3 target policy smoothing (the paper only says "sample from pi_theta").
+    # TD3's own 0.2 is calibrated for an unconstrained [-1, 1] action space; here
+    # the action is already confined to a +-max_residual (0.3) box around the VLA
+    # reference, so 0.2 would smear the target over nearly the whole box and the
+    # critic would learn a Q that barely depends on the action. openpi-RLT
+    # smooths with its exploration std (0.05); Evo-RLT uses the deterministic
+    # mean and no noise at all.
+    target_noise_std: float = 0.05
+    target_noise_clip: float = 0.1
     # High UTD + sparse rewards + a small buffer is the classic recipe for Q
     # divergence. With binary rewards Q is bounded by 1/(1-gamma^C); clamping
     # the bootstrap to [0, q_max_scale/(1-gamma^C)] keeps it from running away.
@@ -363,11 +373,16 @@ class RLTOnlineTrainConfig:
     # when the operator presses `r` (paper Sec. V).
     critical_phase: bool = False
 
-    # Engage the takeover toggle automatically at the start of every *warmup*
-    # episode, so the human demonstrates the prefill instead of watching the base
-    # VLA fail at it. Worth turning on whenever the base policy's success rate is
-    # near zero: warmup exists to give the critic a reward signal to learn from,
-    # and it cannot do that from trajectories that never score.
+    # Human-in-the-loop during warmup is *on demand* and needs no flag: takeover
+    # is never gated by the warmup phase, so the operator watches the base VLA
+    # and grabs the controls the moment it goes wrong. The correction replaces
+    # both the executed action and the stored reference, and pressing success
+    # gives that episode the reward the VLA could not earn.
+    #
+    # This flag is the heavier fallback: engage the takeover toggle automatically
+    # at the start of every warmup episode, so the human drives the whole prefill.
+    # Only worth it when the base policy's success rate is flat zero and watching
+    # it fail is pure waste.
     warmup_human_control: bool = False
 
     view: RolloutViewConfig = field(default_factory=RolloutViewConfig)

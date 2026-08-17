@@ -35,7 +35,7 @@ rl:
     action_std: 0.05
     ref_dropout: 0.5
     max_residual: 0.3
-  discount: 0.97
+  discount: 0.99
   bc_beta: 0.3
   utd: 5
   batch_size: 256

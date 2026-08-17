@@ -61,16 +61,13 @@ rl:
   ac:
     chunk_len: 10
     action_dim: 7                   # 6 关节 + 夹爪开度
-    # 位置(7) + 有限差分速度(7)：论文 App. B 用的是 position 和 velocity
     proprio_dim: 14
     hidden_dim: 256
     n_layers: 2
     action_std: 0.05
     ref_dropout: 0.5
-    # 真机安全包围盒：actor 只能在 VLA 参考动作的邻域内修正。
-    # 配合零初始化的 residual，第一条真机动作严格等于 base VLA。
     max_residual: 0.2
-  discount: 0.97
+  discount: 0.99
   bc_beta: 0.3
   utd: 5
   batch_size: 256

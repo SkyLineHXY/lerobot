@@ -202,11 +202,20 @@ class ChunkReplayBuffer:
         truncation it is *not* masked, so a real post-episode state is needed;
         pointing `x_next` back at `x` would make the backup a self-loop and
         silently pin those states to zero value.
+
+        The same asymmetry decides `ref_next`. Every window here ends at the
+        same place — `x_last`, `d_step` control steps into the chunk — so its
+        reference is this chunk's own reference shifted to `d_step`. Zeroing it
+        instead would make the truncated backup evaluate `mu(x_last, 0)`, and
+        with the residual parameterisation `mu = 0 + residual` that is a pure
+        noise action inside the +-max_residual box, on an input the deployed
+        policy never sees.
         """
         if truncated and x_last is None:
             return
         c = self.chunk_len
         d_step = rec.n_executed
+        ref_next = self._ref_slice(rec.ref_full, d_step)
         for i, o in enumerate(range(0, c, self.stride)):
             if o >= d_step or i >= rec.xs.shape[0]:
                 break
@@ -220,10 +229,25 @@ class ChunkReplayBuffer:
                 ref=rec.ref_full[o : o + c],
                 rewards=rewards,
                 x_next=rec.xs[i] if x_last is None else x_last,
-                ref_next=torch.zeros_like(rec.ref_full[:c]),
+                ref_next=ref_next,
                 done=0.0 if truncated else 1.0,
                 actual_steps=steps,
             )
+
+    def _ref_slice(self, ref_full: Tensor, offset: int) -> Tensor:
+        """`ref_full[offset : offset + C]`, repeating the last row if it runs out.
+
+        Real references are long enough (the VLA chunk has horizon H = 50 and a
+        human-authored one is tiled to 2C), but hand-built records in tests are
+        not, and a short slice would be a shape error inside `_store`.
+        """
+        c = self.chunk_len
+        out = ref_full[offset : offset + c]
+        pad = c - out.shape[0]
+        if pad <= 0:
+            return out
+        tail = out[-1:] if out.shape[0] else ref_full[-1:]
+        return torch.cat([out, tail.expand(pad, -1)], dim=0)
 
     def _pad_window(self, action: Tensor, rewards: Tensor) -> tuple[Tensor, Tensor]:
         """Pad a short window to C steps; `actual_steps` records the real length."""
