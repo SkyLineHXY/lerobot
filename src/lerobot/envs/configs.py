@@ -262,6 +262,9 @@ class HILSerlRobotEnvConfig(EnvConfig):
 class LiberoEnv(EnvConfig):
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
     task_ids: list[int] | None = None
+    # Evaluate a single task of the suite instead of all of them; takes precedence over `task_ids`.
+    single_task: bool = False
+    task_id: int = 0
     fps: int = 30
     episode_length: int | None = None
     obs_type: str = "pixels_agent_pos"
@@ -296,9 +299,21 @@ class LiberoEnv(EnvConfig):
     def camera_names(self) -> list[str]:
         return [c.strip() for c in self.camera_name.split(",") if c.strip()]
 
+    @property
+    def suite_names(self) -> list[str]:
+        return [s.strip() for s in str(self.task).split(",") if s.strip()]
+
     def __post_init__(self):
         if self.obs_type not in ("pixels", "pixels_agent_pos"):
             raise ValueError(f"Unsupported obs_type: {self.obs_type}")
+
+        if self.single_task:
+            if len(self.suite_names) != 1:
+                raise ValueError(
+                    f"`single_task=True` needs `task` to name exactly one suite; got {self.suite_names}."
+                )
+            if self.task_id < 0:
+                raise ValueError(f"`task_id` must be non-negative; got {self.task_id}.")
 
         cameras = self.camera_names
         if not cameras:
@@ -359,7 +374,9 @@ class LiberoEnv(EnvConfig):
             "observation_width": self.observation_width,
             "camera_name_mapping": self.camera_name_mapping,
         }
-        if self.task_ids is not None:
+        if self.single_task:
+            kwargs["task_ids"] = [self.task_id]
+        elif self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
         return kwargs
 
