@@ -89,6 +89,11 @@ class RemoteLearner:
             stride=cfg.subsample_stride,
             device=device,
             seed=seed,
+            sample_strategy=cfg.sample_strategy,
+            recent_episode_window=cfg.recent_episode_window,
+            recent_ratio=cfg.recent_ratio,
+            human_ratio=cfg.human_ratio,
+            reward_ratio=cfg.reward_ratio,
         )
         if resume_buffer:
             self.buffer.load(resume_buffer)

@@ -18,6 +18,8 @@ Stored per transition:
   done         episode terminated within the window     scalar 0/1
   actual_steps k = steps actually executed in the window (<= C)
   bc_weight    multiplier on the actor's BC term         scalar 0/1
+  from_human   the operator drove this chunk             scalar 0/1
+  episode_id   which episode it came from                int
 
 A window that could not be filled to C steps keeps its real length in
 `actual_steps` so the critic bootstraps with gamma^k; the unexecuted tail is
@@ -63,7 +65,19 @@ class ChunkReplayBuffer:
         stride: int = 2,
         device: str | torch.device = "cuda",
         seed: int = 0,
+        sample_strategy: str = "uniform",
+        recent_episode_window: int = 20,
+        recent_ratio: float = 0.4,
+        human_ratio: float = 0.2,
+        reward_ratio: float = 0.1,
     ):
+        if sample_strategy not in ("uniform", "stratified"):
+            raise ValueError(f"sample_strategy must be uniform or stratified, got {sample_strategy!r}")
+        self.sample_strategy = sample_strategy
+        self.recent_episode_window = max(int(recent_episode_window), 1)
+        self.recent_ratio = float(recent_ratio)
+        self.human_ratio = float(human_ratio)
+        self.reward_ratio = float(reward_ratio)
         self.capacity = capacity
         self.chunk_len = chunk_len
         self.action_dim = action_dim
@@ -79,10 +93,9 @@ class ChunkReplayBuffer:
         self.ref_next = torch.zeros(capacity, chunk_len, action_dim)
         self.done = torch.zeros(capacity)
         self.actual_steps = torch.zeros(capacity)
-        # Multiplier on the actor's BC term. A takeover replaces `ref` with the
-        # operator's own command, which is only a better imitation target than
-        # the VLA if the correction actually worked; see `_finalize_episode`.
         self.bc_weight = torch.ones(capacity)
+        self.from_human = torch.zeros(capacity)
+        self.episode_id = torch.full((capacity,), -1, dtype=torch.long)
 
         self.size = 0
         self.total_added = 0  # monotone counter, used to pace the learner
@@ -90,15 +103,11 @@ class ChunkReplayBuffer:
         self._episode_ptr = 0  # write pointer when the current episode started
         self._episode_added = 0  # transitions stored since then
         self._episode_reward = 0.0  # reward seen this episode, for `_finalize_episode`
-        self._episode_human_rows: list[int] = []  # rows whose `ref` is an operator command
+        self._episode_id = -1  # monotone; `episode_id` column tags each stored row
+        self._episode_open = False  # guards `_finalize_episode` against a second call
         self._pending: ChunkRecord | None = None
         self._gammas = discount ** torch.arange(chunk_len).float()
         self._gen = torch.Generator().manual_seed(seed)
-        # The rollout thread writes and the learner thread samples. Appending
-        # alone would be safe enough (rows are filled before `size` moves), but
-        # `discard_episode` *rewinds* the write pointer and shrinks `size`, so a
-        # concurrent `sample` can draw rows that are about to be overwritten.
-        # Write bursts are microseconds; sampling is the only hot path.
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------- assembly
@@ -107,22 +116,16 @@ class ChunkReplayBuffer:
     def start_episode(self) -> None:
         with self._lock:
             if self._pending is not None:
-                # Previous episode ended without an explicit terminal/truncation
-                # signal; we have no trustworthy next state, so drop it.
                 self._pending = None
-            # Idempotent: the terminal and truncation paths already finalize, and
-            # this clears the trackers. It only bites when an episode ended
-            # through neither, which would otherwise leave a failed takeover
-            # holding a full BC weight.
             self._finalize_episode()
             self._episode_ptr = self._ptr
             self._episode_added = 0
             self._episode_reward = 0.0
-            self._episode_human_rows = []
+            self._episode_id += 1
+            self._episode_open = True
 
     def _finalize_episode(self) -> None:
         """Drop the BC target of takeovers that led nowhere.
-
         A takeover overwrites `ref` with the operator's command so the actor
         imitates the correction instead of the VLA attempt it replaced (paper
         Sec. V). That reasoning only holds when the correction worked. An
@@ -138,12 +141,19 @@ class ChunkReplayBuffer:
         the policy later rescues keeps its weight. Per-intervention credit would
         need the reward to be attributable to one takeover, which sparse
         terminal rewards do not give us.
+
+        `_episode_open` is what makes this idempotent, and it is not optional:
+        the reward counter is cleared here, so a second call on an already
+        finalized episode would read zero reward and mask a takeover that had
+        in fact succeeded.
         """
-        if self._episode_reward <= 0:
-            for row in self._episode_human_rows:
-                self.bc_weight[row] = 0.0
+        if not self._episode_open:
+            return
+        self._episode_open = False
+        if self._episode_reward <= 0 and self._episode_id >= 0:
+            rows = (self.episode_id == self._episode_id) & (self.from_human > 0)
+            self.bc_weight[rows] = 0.0
         self._episode_reward = 0.0
-        self._episode_human_rows = []
 
     def discard_episode(self) -> int:
         """Drop everything the current episode has stored. Returns the count.
@@ -160,7 +170,7 @@ class ChunkReplayBuffer:
         with self._lock:
             self._pending = None
             self._episode_reward = 0.0
-            self._episode_human_rows = []
+            self._episode_open = False
             n = self._episode_added
             if n == 0:
                 return 0
@@ -214,15 +224,9 @@ class ChunkReplayBuffer:
             steps = action.shape[0]
             action, rewards = self._pad_window(action, rewards)
             x_next_idx = i
-
-            # The window ends `steps` control steps after x, i.e. at offset o
-            # of chunk k+1. If k+1 stopped before reaching that offset we do
-            # not have the matching state — skip rather than misalign by up to
-            # C steps.
             terminated_in_window = bool(k1.done and o > 0 and n1 <= o)
             if not terminated_in_window and x_next_idx >= k1.xs.shape[0]:
                 continue
-
             x_next = k1.xs[min(x_next_idx, k1.xs.shape[0] - 1)]
             self._store(
                 x=k.xs[i],
@@ -310,8 +314,8 @@ class ChunkReplayBuffer:
     ) -> None:
         p = self._ptr
         self.bc_weight[p] = 1.0
-        if from_human:
-            self._episode_human_rows.append(p)
+        self.from_human[p] = 1.0 if from_human else 0.0
+        self.episode_id[p] = self._episode_id
         self.x[p] = x.cpu()
         self.action[p] = action.cpu()
         self.ref[p] = ref[: self.chunk_len].cpu()
@@ -340,7 +344,11 @@ class ChunkReplayBuffer:
         with self._lock:
             if self.size == 0:
                 return None
-            idx = torch.randint(0, self.size, (batch_size,), generator=self._gen)
+            idx = (
+                self._stratified_indices(batch_size)
+                if self.sample_strategy == "stratified"
+                else torch.randint(0, self.size, (batch_size,), generator=self._gen)
+            )
             batch = {
                 "x": self.x[idx],
                 "action": self.action[idx],
@@ -355,6 +363,55 @@ class ChunkReplayBuffer:
         if self.device.type != "cuda":
             return batch
         return {k: v.pin_memory().to(self.device, non_blocking=True) for k, v in batch.items()}
+
+    def _draw(self, pool: Tensor, count: int) -> Tensor:
+        """`count` rows from `pool`, with replacement. Empty pool draws nothing."""
+        if count <= 0 or pool.numel() == 0:
+            return torch.empty(0, dtype=torch.long)
+        return pool[torch.randint(0, pool.numel(), (count,), generator=self._gen)]
+
+    def _stratified_indices(self, batch_size: int) -> Tensor:
+        """Guarantee the rare-but-informative transitions a share of every batch.
+
+        Uniform sampling weighs a transition by how often it was collected, which
+        is exactly backwards for the three groups that carry the most signal:
+
+        * **recent** — the critic is asked for Q at the actor's *current*
+          actions, so it has to keep fitting the current policy's distribution.
+        * **human** — the policy's own actions all sit inside the +-max_residual
+          box around the VLA reference, so a takeover is the only place the
+          buffer holds a genuinely different action at a comparable state. That
+          contrast is what teaches the critic to depend on the action at all,
+          and it is 6.8% of a measured run.
+        * **rewarded** — with a sparse terminal reward these are ~5% of the
+          buffer and they anchor the whole value scale.
+
+        Pools deliberately overlap (a recent takeover counts in two), and each is
+        drawn with replacement, as in openpi-RLT `_sample_stratified_indices`.
+        Any shortfall — early on, every pool is small or empty — is topped up
+        uniformly, so this degrades to uniform sampling rather than to a batch of
+        five rows repeated fifty times.
+        """
+        n = self.size
+        rows = torch.arange(n)
+        episode = self.episode_id[:n]
+        newest = int(episode.max()) if n else -1
+
+        recent = rows[episode >= newest - self.recent_episode_window + 1]
+        human = rows[self.from_human[:n] > 0]
+        rewarded = rows[self.reward_disc[:n] > 0]
+
+        parts = [
+            self._draw(recent, round(batch_size * self.recent_ratio)),
+            self._draw(human, round(batch_size * self.human_ratio)),
+            self._draw(rewarded, round(batch_size * self.reward_ratio)),
+        ]
+        drawn = sum(p.numel() for p in parts)
+        parts.append(self._draw(rows, batch_size - drawn))
+        idx = torch.cat(parts)[:batch_size]
+        if idx.numel() < batch_size:  # every ratio rounded to zero
+            idx = torch.cat([idx, self._draw(rows, batch_size - idx.numel())])
+        return idx[torch.randperm(idx.numel(), generator=self._gen)]
 
     def __len__(self) -> int:
         return self.size
@@ -376,6 +433,8 @@ class ChunkReplayBuffer:
                 "x_next": self.x_next[:n],
                 "ref_next": self.ref_next[:n],
                 "bc_weight": self.bc_weight[:n],
+                "from_human": self.from_human[:n],
+                "episode_id": self.episode_id[:n],
                 "done": self.done[:n],
                 "actual_steps": self.actual_steps[:n],
                 "ptr": self._ptr,
@@ -395,6 +454,10 @@ class ChunkReplayBuffer:
         # Buffers written before BC weighting existed carry no column; those
         # transitions predate takeover gating, so full weight is the honest default.
         self.bc_weight[:n] = sd["bc_weight"][:n] if "bc_weight" in sd else 1.0
+        self.from_human[:n] = sd["from_human"][:n] if "from_human" in sd else 0.0
+        # Pre-stratification buffers have no episode column. Tagging them all as
+        # one episode keeps the "recent" stratum from silently preferring them.
+        self.episode_id[:n] = sd["episode_id"][:n] if "episode_id" in sd else 0
         self.size = n
         self._ptr = n % self.capacity
         self._episode_ptr = self._ptr

@@ -3,6 +3,7 @@
 这些测试全部不依赖硬件、也不加载 SmolVLA，用于在上真机之前锁住
 `replay_buffer` 的时间对齐、residual actor 的恒等性以及 TD 目标的数值。
 """
+import pytest
 import torch
 
 from lerobot.policies.rlt import (
@@ -325,6 +326,105 @@ def test_new_episode_does_not_inherit_the_previous_outcome():
     _human_episode(buf, success=False)
     assert (buf.bc_weight[:first] == 1).all(), "上一集的成功不该被下一集的失败改写"
     assert (buf.bc_weight[first : len(buf)] == 0).any()
+
+
+# --------------------------------------------------------------- 分层采样
+def _strat_buffer(capacity=4096, **kw):
+    opts = {"sample_strategy": "stratified", "recent_episode_window": 2,
+            "recent_ratio": 0.4, "human_ratio": 0.2, "reward_ratio": 0.1}
+    opts.update(kw)
+    return ChunkReplayBuffer(capacity=capacity, x_dim=X_DIM, chunk_len=C, action_dim=D,
+                             discount=0.9, stride=STRIDE, device="cpu", **opts)
+
+
+def _episode(buf, tag, *, human=False, success=False):
+    buf.start_episode()
+    buf.add_chunk(_record(tag, from_human=human))
+    rewards = torch.zeros(C)
+    if success:
+        rewards[0] = 1.0
+    buf.add_chunk(_record(tag + 1, rewards=rewards, from_human=human, done=True, done_step=1, n_xs=1))
+
+
+def test_stratified_lifts_rare_groups_above_their_share():
+    """人工介入只占 6.8% 时，均匀采样会把它冲淡——分层的意义就在这里。"""
+    buf = _strat_buffer()
+    _episode(buf, 0.0, human=True, success=False)          # 稀有：人工介入
+    for i in range(20):                                     # 大量普通策略数据
+        _episode(buf, 100.0 + 10 * i)
+    n = len(buf)
+    human_share = (buf.from_human[:n] > 0).float().mean().item()
+    assert human_share < 0.15, "前提：人工数据本来就很少"
+
+    idx = buf._stratified_indices(512)
+    drawn = (buf.from_human[idx] > 0).float().mean().item()
+    # human_ratio=0.2 是下界；均匀采样只能给到自然占比
+    assert drawn >= 0.18, f"分层后 {drawn:.3f}，human_ratio=0.2 没生效（自然 {human_share:.3f}）"
+
+
+def test_stratified_favours_the_newest_episodes():
+    buf = _strat_buffer(recent_episode_window=2)
+    for i in range(12):
+        _episode(buf, 100.0 + 10 * i)
+    newest = buf.episode_id[: len(buf)].max()
+    idx = buf._stratified_indices(512)
+    recent = (buf.episode_id[idx] >= newest - 1).float().mean().item()
+    assert recent > 0.4, f"最近两集只占 {recent:.3f}，recent_ratio=0.4 没生效"
+
+
+def test_stratified_lifts_rewarded_transitions():
+    buf = _strat_buffer()
+    _episode(buf, 0.0, success=True)
+    for i in range(20):
+        _episode(buf, 100.0 + 10 * i)
+    n = len(buf)
+    natural = (buf.reward_disc[:n] > 0).float().mean().item()
+    idx = buf._stratified_indices(512)
+    drawn = (buf.reward_disc[idx] > 0).float().mean().item()
+    # reward_ratio=0.1 是下界；均匀采样在这批数据上只有 ~0.03
+    assert drawn >= 0.09, f"有奖励样本占比 {drawn:.3f}，reward_ratio=0.1 没生效（自然 {natural:.3f}）"
+
+
+def test_stratified_always_returns_a_full_batch():
+    """池子空/不足时必须用均匀采样补齐，不能返回短批。"""
+    buf = _strat_buffer()
+    _episode(buf, 0.0)  # 没有人工介入，也没有奖励：两个池子全空
+    for size in (1, 7, 64, 256):
+        assert buf._stratified_indices(size).shape == (size,)
+
+
+def test_stratified_indices_stay_in_range():
+    buf = _strat_buffer()
+    for i in range(5):
+        _episode(buf, 100.0 + 10 * i, human=(i == 0), success=(i == 1))
+    idx = buf._stratified_indices(256)
+    assert idx.min() >= 0 and idx.max() < len(buf)
+
+
+def test_stratified_sample_returns_the_same_keys_as_uniform():
+    buf = _strat_buffer()
+    _episode(buf, 0.0, human=True, success=True)
+    uniform = _buffer()
+    _episode(uniform, 0.0, human=True, success=True)
+    assert set(buf.sample(8)) == set(uniform.sample(8))
+
+
+def test_unknown_sample_strategy_is_rejected():
+    with pytest.raises(ValueError, match="uniform or stratified"):
+        _strat_buffer(sample_strategy="prioritized")
+
+
+def test_episode_id_and_human_flag_survive_a_save_load(tmp_path):
+    buf = _strat_buffer()
+    _episode(buf, 0.0, human=True, success=True)
+    _episode(buf, 100.0)
+    path = tmp_path / "buf.pt"
+    buf.save(path)
+    restored = _strat_buffer()
+    restored.load(path)
+    n = len(buf)
+    assert torch.equal(restored.episode_id[:n], buf.episode_id[:n])
+    assert torch.equal(restored.from_human[:n], buf.from_human[:n])
 
 
 def test_save_and_load_roundtrip(tmp_path):

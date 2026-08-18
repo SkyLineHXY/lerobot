@@ -4,7 +4,6 @@ Runs on the main thread. Everything expensive it does — two VLM forwards and a
 flow-matching sample per chunk boundary — shares a CUDA context with the learner
 thread, so keep anything addable to the control loop out of `run_chunk`.
 """
-
 from __future__ import annotations
 
 import torch
@@ -107,20 +106,13 @@ class RolloutWorker:
         intervention = self.env.run_intervention(c) if self.allow_intervention else None
 
         if intervention is not None:
-            # Human corrections replace the VLA reference too, so the actor's
-            # BC term pulls toward the correction rather than toward the failed
-            # VLA attempt (paper Sec. V, "Rollout").
             actions = intervention.action_chunk.to(plan["x"])
-            # The buffer only ever reads ref_full[o : o+C] for o < C, so a 2C
-            # horizon is all a human-authored reference needs.
             ref_full = actions[-1:].repeat(2 * c, 1).clone()
             ref_full[:c] = actions
             rewards = intervention.rewards
             step_obs = intervention.obs_list
             n_exec = intervention.n_steps
             terminated, truncated = intervention.done, intervention.truncated
-            # Sparse reward model: +1 only on operator-judged success. `done`
-            # also fires on the failure key, which must NOT count as a success.
             success = bool(rewards.sum() > 0)
             if step_obs:
                 self.obs = step_obs[-1]
@@ -129,8 +121,6 @@ class RolloutWorker:
             self.ep_interventions += 1
         else:
             if taking_over:
-                # Pre-check said "human", but they let go before the chunk
-                # started; fall back to a full plan.
                 plan = self._plan(batch, use_actor, deterministic)
             actions = plan["action_chunk"][0]
             ref_full = plan["ref_full"][0]

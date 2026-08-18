@@ -40,6 +40,11 @@ class ThreadBackend:
             stride=rl.subsample_stride,
             device=cfg.device,
             seed=cfg.seed,
+            sample_strategy=rl.sample_strategy,
+            recent_episode_window=rl.recent_episode_window,
+            recent_ratio=rl.recent_ratio,
+            human_ratio=rl.human_ratio,
+            reward_ratio=rl.reward_ratio,
         )
         if cfg.resume_buffer:
             self.buffer.load(cfg.resume_buffer)

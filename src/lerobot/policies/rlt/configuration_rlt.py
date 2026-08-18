@@ -53,9 +53,6 @@ class RLTokenConfig:
     # the bottleneck in a standardised space makes L_ro measure information
     # rather than scale.
     normalize_targets: bool = True
-    # Max number of prefix tokens kept for reconstruction (subsample if more;
-    # SmolVLA: 64 connector tokens per camera x 3 cameras = 192 image tokens,
-    # so 256 also covers the language+state tokens if image_only is disabled).
     max_recon_tokens: int = 256
 
     # Stage-1 training (paper: 2000-10000 steps on task demos)
@@ -94,15 +91,6 @@ class ActorCriticConfig:
     # Reference-action dropout probability during training (paper: 50%).
     ref_dropout: float = 0.5
 
-    # The actor predicts a *residual* on top of the VLA reference chunk with a
-    # zero-initialised output layer, so at step 0 the RL policy is bit-exact
-    # equal to the base VLA (rlt-openpi `models/actor.py`). `max_residual`
-    # bounds how far RL may deviate per action dim in normalized action space —
-    # this is the safety box whose absence made HIL-SERL fail in the paper's
-    # 50 Hz setting (App. C), and it is the *only* bound this module applies.
-    # Because it is relative to the reference it needs no knowledge of what the
-    # VLA's normalized units mean, so it stays correct under MEAN_STD, MIN_MAX
-    # or QUANTILES alike. Physical limits are the env's job.
     max_residual: float = 0.3
     n_critics: int = 2  # TD3-style double Q, min for targets
 
@@ -151,6 +139,19 @@ class OnlineRLConfig:
     # Replay buffer
     buffer_capacity: int = 200_000
     subsample_stride: int = 2
+    # "stratified" reserves a share of every batch for the three groups uniform
+    # sampling under-weights: transitions from the last `recent_episode_window`
+    # episodes, operator takeovers, and reward-bearing transitions. Pools overlap
+    # and any shortfall is topped up uniformly, so an empty pool costs nothing
+    # (openpi-RLT `replay.py::_sample_stratified_indices`).
+    sample_strategy: str = "stratified"  # uniform | stratified
+    recent_episode_window: int = 20
+    recent_ratio: float = 0.4
+    # Takeovers are the only place the buffer holds an action far outside the
+    # +-max_residual box the policy itself can reach, so they are what teaches
+    # the critic to depend on the action rather than on the state alone.
+    human_ratio: float = 0.2
+    reward_ratio: float = 0.1
 
     # Rollout
     warmup_env_steps: int = 2_000  # N_warm: prefill with base VLA rollouts
