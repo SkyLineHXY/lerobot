@@ -17,6 +17,7 @@ Stored per transition:
   ref_next     reference chunk at x_next                (C, d)
   done         episode terminated within the window     scalar 0/1
   actual_steps k = steps actually executed in the window (<= C)
+  bc_weight    multiplier on the actor's BC term         scalar 0/1
 
 A window that could not be filled to C steps keeps its real length in
 `actual_steps` so the critic bootstraps with gamma^k; the unexecuted tail is
@@ -44,6 +45,7 @@ class ChunkRecord:
     ref_full: Tensor  # (>=C+max_off, d) reference (VLA chunk or tiled human action)
     done: bool = False
     done_step: int | None = None  # steps actually executed if done early
+    from_human: bool = False  # operator drove this chunk, so `ref_full` is their command
 
     @property
     def n_executed(self) -> int:
@@ -77,12 +79,18 @@ class ChunkReplayBuffer:
         self.ref_next = torch.zeros(capacity, chunk_len, action_dim)
         self.done = torch.zeros(capacity)
         self.actual_steps = torch.zeros(capacity)
+        # Multiplier on the actor's BC term. A takeover replaces `ref` with the
+        # operator's own command, which is only a better imitation target than
+        # the VLA if the correction actually worked; see `_finalize_episode`.
+        self.bc_weight = torch.ones(capacity)
 
         self.size = 0
         self.total_added = 0  # monotone counter, used to pace the learner
         self._ptr = 0
         self._episode_ptr = 0  # write pointer when the current episode started
         self._episode_added = 0  # transitions stored since then
+        self._episode_reward = 0.0  # reward seen this episode, for `_finalize_episode`
+        self._episode_human_rows: list[int] = []  # rows whose `ref` is an operator command
         self._pending: ChunkRecord | None = None
         self._gammas = discount ** torch.arange(chunk_len).float()
         self._gen = torch.Generator().manual_seed(seed)
@@ -102,8 +110,40 @@ class ChunkReplayBuffer:
                 # Previous episode ended without an explicit terminal/truncation
                 # signal; we have no trustworthy next state, so drop it.
                 self._pending = None
+            # Idempotent: the terminal and truncation paths already finalize, and
+            # this clears the trackers. It only bites when an episode ended
+            # through neither, which would otherwise leave a failed takeover
+            # holding a full BC weight.
+            self._finalize_episode()
             self._episode_ptr = self._ptr
             self._episode_added = 0
+            self._episode_reward = 0.0
+            self._episode_human_rows = []
+
+    def _finalize_episode(self) -> None:
+        """Drop the BC target of takeovers that led nowhere.
+
+        A takeover overwrites `ref` with the operator's command so the actor
+        imitates the correction instead of the VLA attempt it replaced (paper
+        Sec. V). That reasoning only holds when the correction worked. An
+        episode the operator ended with the failure key, or that ran out of
+        steps, contains a human command that demonstrably did *not* finish the
+        task, and BC-ing toward it teaches the actor to reproduce the failure.
+
+        The executed action is left alone — it is what really happened and the
+        critic needs it, with the reward it actually earned (zero). Only the
+        imitation target is withdrawn.
+
+        Credit is episode-level, which is coarse: a takeover early in an episode
+        the policy later rescues keeps its weight. Per-intervention credit would
+        need the reward to be attributable to one takeover, which sparse
+        terminal rewards do not give us.
+        """
+        if self._episode_reward <= 0:
+            for row in self._episode_human_rows:
+                self.bc_weight[row] = 0.0
+        self._episode_reward = 0.0
+        self._episode_human_rows = []
 
     def discard_episode(self) -> int:
         """Drop everything the current episode has stored. Returns the count.
@@ -119,6 +159,8 @@ class ChunkReplayBuffer:
         """
         with self._lock:
             self._pending = None
+            self._episode_reward = 0.0
+            self._episode_human_rows = []
             n = self._episode_added
             if n == 0:
                 return 0
@@ -135,11 +177,13 @@ class ChunkReplayBuffer:
     def add_chunk(self, rec: ChunkRecord) -> None:
         """Feed one executed chunk; emits transitions for the previous one."""
         with self._lock:
+            self._episode_reward += float(rec.rewards.sum())
             if self._pending is not None:
                 self._emit_pair(self._pending, rec)
             if rec.done:
                 self._flush_terminal(rec)
                 self._pending = None
+                self._finalize_episode()
             else:
                 self._pending = rec
 
@@ -154,6 +198,7 @@ class ChunkReplayBuffer:
             if self._pending is not None:
                 self._flush_terminal(self._pending, truncated=True, x_last=x_last)
             self._pending = None
+            self._finalize_episode()
 
     def _emit_pair(self, k: ChunkRecord, k1: ChunkRecord) -> None:
         c = self.chunk_len
@@ -188,6 +233,7 @@ class ChunkReplayBuffer:
                 ref_next=k1.ref_full[o : o + c],
                 done=float(terminated_in_window),
                 actual_steps=steps,
+                from_human=k.from_human,  # `ref` is sliced out of chunk k
             )
 
     def _flush_terminal(
@@ -232,6 +278,7 @@ class ChunkReplayBuffer:
                 ref_next=ref_next,
                 done=0.0 if truncated else 1.0,
                 actual_steps=steps,
+                from_human=rec.from_human,
             )
 
     def _ref_slice(self, ref_full: Tensor, offset: int) -> Tensor:
@@ -258,8 +305,13 @@ class ChunkReplayBuffer:
         rewards = torch.cat([rewards, torch.zeros(pad)], dim=0)
         return action, rewards
 
-    def _store(self, x, action, ref, rewards, x_next, ref_next, done, actual_steps) -> None:
+    def _store(
+        self, x, action, ref, rewards, x_next, ref_next, done, actual_steps, from_human=False
+    ) -> None:
         p = self._ptr
+        self.bc_weight[p] = 1.0
+        if from_human:
+            self._episode_human_rows.append(p)
         self.x[p] = x.cpu()
         self.action[p] = action.cpu()
         self.ref[p] = ref[: self.chunk_len].cpu()
@@ -298,6 +350,7 @@ class ChunkReplayBuffer:
                 "ref_next": self.ref_next[idx],
                 "done": self.done[idx],
                 "actual_steps": self.actual_steps[idx],
+                "bc_weight": self.bc_weight[idx],
             }
         if self.device.type != "cuda":
             return batch
@@ -322,6 +375,7 @@ class ChunkReplayBuffer:
                 "reward_disc": self.reward_disc[:n],
                 "x_next": self.x_next[:n],
                 "ref_next": self.ref_next[:n],
+                "bc_weight": self.bc_weight[:n],
                 "done": self.done[:n],
                 "actual_steps": self.actual_steps[:n],
                 "ptr": self._ptr,
@@ -338,6 +392,9 @@ class ChunkReplayBuffer:
             "x", "action", "ref", "reward_disc", "x_next", "ref_next", "done", "actual_steps",
         ):
             getattr(self, key)[:n] = sd[key][:n]
+        # Buffers written before BC weighting existed carry no column; those
+        # transitions predate takeover gating, so full weight is the honest default.
+        self.bc_weight[:n] = sd["bc_weight"][:n] if "bc_weight" in sd else 1.0
         self.size = n
         self._ptr = n % self.capacity
         self._episode_ptr = self._ptr

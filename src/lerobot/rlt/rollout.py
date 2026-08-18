@@ -182,6 +182,7 @@ class RolloutWorker:
             # bootstrap; only `success` carries the +1.
             done=terminated,
             done_step=done_step,
+            from_human=intervention is not None,
         )
         self.buffer.add_chunk(rec)
         if truncated and not terminated:

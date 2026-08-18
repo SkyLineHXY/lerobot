@@ -53,6 +53,7 @@ def chunk_op(episode_id: int, rec: ChunkRecord, warmup: bool = False) -> dict[st
         # -1 rather than None: `weights_only=True` accepts None, but keeping the
         # payload free of optional types makes the decode side total.
         "done_step": -1 if rec.done_step is None else int(rec.done_step),
+        "from_human": bool(rec.from_human),
     }
 
 
@@ -76,6 +77,7 @@ def record_from_op(op: dict[str, Any]) -> ChunkRecord:
         ref_full=op["ref_full"],
         done=bool(op["done"]),
         done_step=None if done_step < 0 else done_step,
+        from_human=bool(op.get("from_human", False)),
     )
 
 

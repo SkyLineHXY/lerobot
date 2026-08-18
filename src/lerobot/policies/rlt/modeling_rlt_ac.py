@@ -222,6 +222,13 @@ class RLTAgent:
         # Paper Eq. 5 uses the squared L2 *norm* over the whole chunk. Summing
         # (not averaging) over C x d keeps beta on the paper's scale.
         bc = (a - ref).pow(2).sum(dim=(1, 2))
+        # Zero for takeovers in an episode that earned nothing: the reference is
+        # the operator's own command there, and imitating a correction that did
+        # not finish the task is worse than not imitating at all. Only the BC
+        # term is masked — `-q` still applies, those states are real.
+        weight = batch.get("bc_weight")
+        if weight is not None:
+            bc = bc * weight
         actor_loss = (-q + cfg.bc_beta * bc).mean()
 
         self.actor_opt.zero_grad(set_to_none=True)

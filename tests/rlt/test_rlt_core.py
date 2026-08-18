@@ -41,7 +41,7 @@ def _buffer(discount=0.9, capacity=64):
     )
 
 
-def _record(tag: float, rewards=None, done=False, done_step=None, n_xs=None):
+def _record(tag: float, rewards=None, done=False, done_step=None, n_xs=None, from_human=False):
     """一个 chunk 的记录；用 tag 把每个 chunk 的张量区分开，便于断言来源。"""
     n_offsets = len(range(0, C, STRIDE)) if n_xs is None else n_xs
     return ChunkRecord(
@@ -51,6 +51,7 @@ def _record(tag: float, rewards=None, done=False, done_step=None, n_xs=None):
         ref_full=torch.arange(C + C, dtype=torch.float32).reshape(-1, 1).repeat(1, D) + tag,
         done=done,
         done_step=done_step,
+        from_human=from_human,
     )
 
 
@@ -240,6 +241,90 @@ def test_short_reference_is_padded_instead_of_raising():
 
     assert len(buf) > 0
     assert torch.allclose(buf.ref_next[0][-1], rec.ref_full[-1])
+
+
+# ------------------------------------------- 失败的人工修正不该被 BC 模仿
+def _human_episode(buf, *, success):
+    """一集：策略跑一段 -> 人接管一段 -> 成功或失败终止。"""
+    buf.start_episode()
+    buf.add_chunk(_record(0.0))
+    buf.add_chunk(_record(100.0, from_human=True))
+    rewards = torch.zeros(C)
+    if success:
+        rewards[0] = 1.0
+    buf.add_chunk(_record(200.0, rewards=rewards, done=True, done_step=1, n_xs=1))
+
+
+def test_failed_takeover_loses_its_bc_target():
+    """人接管后没做成，那段动作照存（critic 要），但不能再当模仿目标。"""
+    buf = _buffer()
+    _human_episode(buf, success=False)
+    n = len(buf)
+    assert n > 0
+    zeroed = (buf.bc_weight[:n] == 0).sum().item()
+    assert zeroed > 0, "介入产生的 transition 应该被摘掉 BC 权重"
+    # 执行动作和奖励原样保留
+    assert torch.isfinite(buf.action[:n]).all()
+
+
+def test_successful_takeover_keeps_its_bc_target():
+    """修正做成了，那才是比 VLA 更好的模仿目标（论文 Sec. V）。"""
+    buf = _buffer()
+    _human_episode(buf, success=True)
+    n = len(buf)
+    assert n > 0
+    assert (buf.bc_weight[:n] == 1).all(), "有奖励的一集不该摘掉任何 BC 权重"
+
+
+def test_policy_transitions_keep_full_weight_in_a_failed_episode():
+    """只摘人工介入那部分；策略自己跑失败的段落仍然要向 VLA 参考对齐。"""
+    buf = _buffer()
+    buf.start_episode()
+    buf.add_chunk(_record(0.0))
+    buf.add_chunk(_record(100.0, done=True, done_step=2, n_xs=1))
+    n = len(buf)
+    assert n > 0 and (buf.bc_weight[:n] == 1).all()
+
+
+def test_truncated_episode_also_withdraws_the_bc_target():
+    """跑满步数没做成，和按 f 是一回事。"""
+    buf = _buffer()
+    buf.start_episode()
+    buf.add_chunk(_record(0.0, from_human=True))
+    buf.add_chunk(_record(100.0, from_human=True))
+    buf.end_episode(x_last=torch.full((X_DIM,), 7.0))
+    n = len(buf)
+    assert n > 0 and (buf.bc_weight[:n] == 0).all()
+
+
+def test_bc_weight_is_sampled_and_masks_the_actor_loss():
+    """权重要真的到达 update_actor，否则前面全白做。
+
+    必须先打破零初始化：actor 出厂时 mu 就等于 ref，bc 恒为 0，加不加权都一样。
+    """
+    import copy
+
+    buf = _buffer()
+    _human_episode(buf, success=False)
+    batch = buf.sample(8)
+    assert "bc_weight" in batch
+
+    agent = RLTAgent(_online_cfg(bc_beta=1000.0), device="cpu")
+    _saturate(agent.actor)
+    assert (agent.actor.mu(batch["x"], batch["ref"]) - batch["ref"]).abs().max() > 0
+
+    masked = copy.deepcopy(agent).update_actor({**batch, "bc_weight": torch.zeros(8)})
+    kept = copy.deepcopy(agent).update_actor({**batch, "bc_weight": torch.ones(8)})
+    assert masked["actor_loss"] < kept["actor_loss"], "权重为 0 时 BC 项必须消失"
+
+
+def test_new_episode_does_not_inherit_the_previous_outcome():
+    buf = _buffer()
+    _human_episode(buf, success=True)
+    first = len(buf)
+    _human_episode(buf, success=False)
+    assert (buf.bc_weight[:first] == 1).all(), "上一集的成功不该被下一集的失败改写"
+    assert (buf.bc_weight[first : len(buf)] == 0).any()
 
 
 def test_save_and_load_roundtrip(tmp_path):
