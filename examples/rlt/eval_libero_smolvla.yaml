@@ -1,22 +1,22 @@
 # 在 LIBERO 上评估 SmolVLA 基线策略（RLT stage-2 的参考策略质量基准）
 policy:
   type: smolvla
-  repo_id: /home/zzq/lerobot/outputs/train/smolvla_sft_libero_goal_20260816/checkpoints/010000/pretrained_model
+  # 注意：这里必须是 pretrained_path，写 repo_id 不会加载权重（repo_id 只用于 push_to_hub）
+  pretrained_path: /home/zzq/lerobot/outputs/train/smolvla_sft_libero_goal_20260816/checkpoints/010000/pretrained_model
   use_amp: False
   device: cuda:0
 env:
   type: libero
   task: libero_goal
-  max_parallel_tasks: 2
+  max_parallel_tasks: 1
+  # 相机键要对齐训练集 lerobot/libero_goal_image 的 image / wrist_image
+  camera_name_mapping:
+    agentview_image: image
+    robot0_eye_in_hand_image: wrist_image
   # 只评估该 suite 里的单个任务时打开；task_id 为 suite 内的任务下标
-  single_task: false
-  task_id: 0
+  single_task: true
+  task_id: 3
 
 eval:
   batch_size: 2
-  n_episodes: 10
-
-
-rename_map:
-  observation.images.image: observation.images.camera1
-  observation.images.image2: observation.images.camera2
+  n_episodes: 20
