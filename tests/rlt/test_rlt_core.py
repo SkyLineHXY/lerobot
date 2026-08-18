@@ -104,19 +104,46 @@ def test_actor_starts_at_the_vla_reference():
     assert torch.allclose(actor.mu(x, ref), ref, atol=1e-6)
 
 
-def test_actor_residual_and_output_are_bounded():
-    actor = ChunkActor(_ac_cfg(max_residual=0.1))
-    with torch.no_grad():  # 打破零初始化，制造一个很大的 residual
+def _saturate(actor):
+    """打破零初始化，让 residual 顶到上界。"""
+    with torch.no_grad():
         last = [m for m in actor.net if isinstance(m, torch.nn.Linear)][-1]
         last.weight.fill_(5.0)
         last.bias.fill_(5.0)
+
+
+def test_residual_box_is_the_only_bound():
+    """动作只相对参考受限，不设绝对上界——这样才不依赖归一化模式的取值范围。"""
+    actor = ChunkActor(_ac_cfg(max_residual=0.1))
+    _saturate(actor)
     x = torch.randn(4, X_DIM)
     ref = torch.full((4, C, D), 0.95)
 
-    res = actor.residual(x, ref)
-    assert res.abs().max() <= 0.1 + 1e-6
+    assert actor.residual(x, ref).abs().max() <= 0.1 + 1e-6
     mu = actor.mu(x, ref)
-    assert mu.abs().max() <= 1.0 + 1e-6  # 归一化动作空间的硬上界
+    assert torch.all((mu - ref).abs() <= 0.1 + 1e-6)
+
+
+def test_a_reference_beyond_one_survives_untouched():
+    """SmolVLA 用 MEAN_STD 归一化，|a|>1 只是超过 1 个标准差，占 LIBERO 动作的 27%。
+
+    以前这里有一刀 clamp(±1)，会把这些动作静默截断——每步丢掉约 4mm 平移，夹爪闭合
+    只剩 71% 力度，而且 warmup 执行未截断的参考、RL 一接手就开始截断，
+    "零初始化 => step 0 等于 base VLA" 实际上不成立。
+    """
+    actor = ChunkActor(_ac_cfg())
+    x = torch.randn(4, X_DIM)
+    ref = torch.full((4, C, D), 2.5)
+    assert torch.allclose(actor.mu(x, ref), ref, atol=1e-6)
+
+
+def test_exploration_noise_is_not_clipped_either():
+    actor = ChunkActor(_ac_cfg(action_std=0.05))
+    x = torch.randn(256, X_DIM)
+    ref = torch.full((256, C, D), 3.0)
+    sampled = actor.sample(x, ref)
+    assert sampled.max() > 3.0, "噪声被削成单向就不再是零均值扰动"
+    assert sampled.min() < 3.0
 
 
 def test_ref_dropout_masks_input_but_not_the_residual_base():

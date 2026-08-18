@@ -99,20 +99,11 @@ class ActorCriticConfig:
     # equal to the base VLA (rlt-openpi `models/actor.py`). `max_residual`
     # bounds how far RL may deviate per action dim in normalized action space —
     # this is the safety box whose absence made HIL-SERL fail in the paper's
-    # 50 Hz setting (App. C).
+    # 50 Hz setting (App. C), and it is the *only* bound this module applies.
+    # Because it is relative to the reference it needs no knowledge of what the
+    # VLA's normalized units mean, so it stays correct under MEAN_STD, MIN_MAX
+    # or QUANTILES alike. Physical limits are the env's job.
     max_residual: float = 0.3
-    # Fallback elementwise bound, used only when `action_bounds` is unset. A
-    # scalar bound is correct when the VLA normalizes actions to a bounded range
-    # (openpi-RLT re-normalizes with quantiles for exactly that reason). SmolVLA
-    # uses mean/std, where +-1 is one sigma: measured on libero_goal it clips
-    # 27% of every chunk, so prefer the fitted per-dimension bounds below.
-    action_clip: float = 1.0
-    # Per-dimension `[low, high]` in the VLA's normalized units, fitted from the
-    # dataset's action quantiles by `lerobot-rlt-fit-action-bounds` and stored
-    # next to the RL token. Carried in the config rather than passed around so
-    # the spawned learner process and every actor mirror get it for free.
-    action_bounds: list[list[float]] | None = None
-
     n_critics: int = 2  # TD3-style double Q, min for targets
 
 @dataclass

@@ -82,3 +82,62 @@ def load_stage1_processors(stage1_dir: str | Path, device: str = "cuda"):
     )
     return preprocessor, postprocessor
 
+
+# Only the stats that actually steer the robot: the state the VLA is conditioned
+# on and the action space its output is mapped back through.
+_CHECKED_STATS = (
+    "observation.state.mean",
+    "observation.state.std",
+    "action.mean",
+    "action.std",
+)
+
+
+def check_stage1_matches_policy(stage1_dir: str | Path, checkpoint: str | Path, atol: float = 1e-5):
+    """Fail when the stage-1 processors were fitted on a different dataset.
+
+    Stage 2 normalises observations and un-normalises actions with the stats saved
+    next to the RL token, while the policy was trained with the stats in its own
+    checkpoint. Point `rl_token` at a stage-1 run over another dataset and nothing
+    errors: the arm moves, the loop logs, and the policy silently scores 0 because
+    every action it emits is rescaled and offset on the way out. Measured on a
+    libero_10 stage-1 dir driving a libero_goal policy: 0/10 versus 4/10.
+
+    Returns the list of mismatched stat names (empty when consistent); raises when
+    they differ beyond `atol`. Skipped with a warning when either side has no local
+    normalizer file, e.g. a checkpoint given as a bare Hub repo id.
+    """
+    import logging
+
+    from safetensors.torch import load_file
+
+    logger = logging.getLogger(__name__)
+    pattern = "policy_preprocessor_step_*_normalizer_processor.safetensors"
+    stage1_files = sorted(Path(stage1_dir).glob(pattern))
+    policy_files = sorted(Path(checkpoint).glob(pattern))
+    if not stage1_files or not policy_files:
+        logger.warning(
+            "Could not compare normalisation stats between %s and %s (no local normalizer file); "
+            "a dataset mismatch here is silent and ruinous, so verify them by hand.",
+            stage1_dir,
+            checkpoint,
+        )
+        return []
+
+    a, b = load_file(stage1_files[0]), load_file(policy_files[0])
+    mismatched = [
+        key
+        for key in _CHECKED_STATS
+        if key in a
+        and key in b
+        and (a[key].shape != b[key].shape or (a[key] - b[key]).abs().max().item() > atol)
+    ]
+    if mismatched:
+        raise ValueError(
+            f"Stage-1 processors in {stage1_dir} were fitted on different data than the policy in "
+            f"{checkpoint}: {mismatched} differ. Stage 2 would un-normalize every action with the "
+            f"wrong statistics and the policy would score ~0 without any error being raised. Point "
+            f"`rl_token` at the stage-1 run trained on this checkpoint."
+        )
+    return mismatched
+
