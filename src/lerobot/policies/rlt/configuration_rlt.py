@@ -101,8 +101,17 @@ class ActorCriticConfig:
     # this is the safety box whose absence made HIL-SERL fail in the paper's
     # 50 Hz setting (App. C).
     max_residual: float = 0.3
-    # Normalized action space of the VLA is [-1, 1]; executed chunks are clamped.
+    # Fallback elementwise bound, used only when `action_bounds` is unset. A
+    # scalar bound is correct when the VLA normalizes actions to a bounded range
+    # (openpi-RLT re-normalizes with quantiles for exactly that reason). SmolVLA
+    # uses mean/std, where +-1 is one sigma: measured on libero_goal it clips
+    # 27% of every chunk, so prefer the fitted per-dimension bounds below.
     action_clip: float = 1.0
+    # Per-dimension `[low, high]` in the VLA's normalized units, fitted from the
+    # dataset's action quantiles by `lerobot-rlt-fit-action-bounds` and stored
+    # next to the RL token. Carried in the config rather than passed around so
+    # the spawned learner process and every actor mirror get it for free.
+    action_bounds: list[list[float]] | None = None
 
     n_critics: int = 2  # TD3-style double Q, min for targets
 

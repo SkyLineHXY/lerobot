@@ -56,6 +56,7 @@ import torch
 
 from lerobot.configs import parser
 from lerobot.policies.rlt import (
+    ActionBounds,
     RLTAgent,
     RLTController,
     RLTokenConfig,
@@ -64,6 +65,7 @@ from lerobot.policies.rlt import (
     check_stage1_matches_policy,
     load_smolvla_policy,
 )
+from lerobot.policies.rlt.action_bounds import BOUNDS_FILENAME
 from lerobot.rlt.backends import make_backend
 from lerobot.rlt.envs import make_chunk_env
 from lerobot.rlt.rollout import RolloutWorker
@@ -88,6 +90,32 @@ def load_rl_token(path: str | Path, device: str) -> tuple[RLTokenModule, RLToken
     return module, cfg
 
 
+def load_action_bounds(stage1_dir: str | Path, action_dim: int) -> list[list[float]]:
+    """Per-dimension action bound fitted from the dataset's action quantiles.
+
+    Refusing to start is deliberate. The fallback — a scalar +-1 in SmolVLA's
+    mean/std space — truncates a quarter of every action chunk without erroring,
+    so the arm just moves less than the policy asked and the success rate
+    quietly drops. Better to stop before anything moves.
+    """
+    bounds = ActionBounds.load(stage1_dir)
+    if bounds is None:
+        raise FileNotFoundError(
+            f"No {BOUNDS_FILENAME} in {stage1_dir}. Stage 2 clamps executed chunks to the "
+            f"dataset's action quantiles; without them it would fall back to a scalar bound "
+            f"in the VLA's mean/std space, which silently truncates the largest commands. "
+            f"Fit them once with:\n"
+            f"  lerobot-rlt-fit-action-bounds --dataset <repo_id> --stage1 {stage1_dir}"
+        )
+    if bounds.action_dim != action_dim:
+        raise ValueError(
+            f"{BOUNDS_FILENAME} in {stage1_dir} is {bounds.action_dim}-dim but the policy acts "
+            f"in {action_dim} dims; re-fit it against the dataset this checkpoint was trained on."
+        )
+    print(f"[stage2] action bounds: {bounds.low.tolist()} .. {bounds.high.tolist()}")
+    return bounds.as_config_value()
+
+
 def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
     device = cfg.device
     print(f"[stage2] loading SmolVLA from {cfg.checkpoint} ...")
@@ -95,6 +123,7 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
     check_stage1_matches_policy(cfg.rl_token, cfg.checkpoint)
     rl_token, rt_cfg = load_rl_token(cfg.rl_token, device)
     cfg.rl.ac.rl_token_dim = rt_cfg.d_model
+    cfg.rl.ac.action_bounds = load_action_bounds(cfg.rl_token, cfg.rl.ac.action_dim)
 
     agent = RLTAgent(cfg.rl, device=device)
     controller = RLTController(

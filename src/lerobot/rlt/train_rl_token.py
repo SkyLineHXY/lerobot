@@ -71,6 +71,24 @@ def save_stage1(out_dir, rl_token, cfg, step, preprocessor, postprocessor) -> No
     postprocessor.save_pretrained(out_dir, config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
 
 
+def save_action_bounds(out_dir, dataset) -> None:
+    """Fit the stage-2 action bound from this dataset's action quantiles.
+
+    Stage 2 clamps executed chunks elementwise, and the bound has to come from
+    the data rather than from the VLA's normalisation constant — see
+    `policies/rlt/action_bounds.py`. Fitting it here means stage 2 never has to
+    open the dataset, which matters on a real robot.
+    """
+    import numpy as np
+
+    from lerobot.policies.rlt.action_bounds import fit_action_bounds
+
+    stats = dataset.meta.stats["action"]
+    actions = np.asarray(dataset.hf_dataset.with_format("numpy")["action"], dtype=np.float64)
+    path = fit_action_bounds(actions.reshape(len(actions), -1), stats["mean"], stats["std"]).save(out_dir)
+    print(f"[stage1] action bounds fitted from {len(actions)} frames -> {path}")
+
+
 def save_finetuned_vla(out_dir, policy, preprocessor, postprocessor) -> None:
     """Persist the jointly fine-tuned VLA as a loadable checkpoint directory.
 
@@ -133,6 +151,7 @@ def train(train_cfg: RLTokenTrainConfig):
 
     out_dir = Path(train_cfg.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    save_action_bounds(out_dir, dataset)
 
     step, t0 = 0, time.time()
     data_iter = iter(loader)

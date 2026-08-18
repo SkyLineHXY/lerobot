@@ -237,6 +237,7 @@ lerobot-rlt-train-token="lerobot.rlt.train_rl_token:main"
 lerobot-rlt-train-online="lerobot.rlt.train_online:main"
 lerobot-rlt-eval-token="lerobot.rlt.eval_rl_token:main"
 lerobot-rlt-collect-libero="lerobot.rlt.collect_libero:main"
+lerobot-rlt-fit-action-bounds="lerobot.scripts.lerobot_rlt_fit_action_bounds:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]

@@ -25,13 +25,19 @@ from .configuration_rlt import (
     SimTeleopConfig,
 )
 from .modeling_rlt import RLTController
+from .action_bounds import ActionBounds, fit_action_bounds
 from .modeling_rlt_ac import ChunkActor, ChunkCritic, RLTAgent
 from .modeling_rlt_token import RLTokenModule, SmolVLAPrefixExtractor
-from .processor_rlt import load_smolvla_policy, load_stage1_processors
+from .processor_rlt import (
+    check_stage1_matches_policy,
+    load_smolvla_policy,
+    load_stage1_processors,
+)
 
 __all__ = [
     "ActorCriticConfig",
     "CameraSpec",
+    "ActionBounds",
     "ChunkActor",
     "ChunkCritic",
     "ChunkEnvConfig",
@@ -41,6 +47,7 @@ __all__ = [
     "OnlineRLConfig",
     "PiperEnvConfig",
     "RolloutViewConfig",
+    "check_stage1_matches_policy",
     "SimTeleopConfig",
     "PiperLeaderTeleopConfig",
     "RLTAgent",
@@ -50,6 +57,7 @@ __all__ = [
     "RLTokenModule",
     "RLTokenTrainConfig",
     "SmolVLAPrefixExtractor",
+    "fit_action_bounds",
     "load_smolvla_policy",
     "load_stage1_processors",
 ]

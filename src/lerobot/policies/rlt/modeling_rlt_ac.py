@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .action_bounds import ActionBounds
 from .configuration_rlt import ActorCriticConfig, OnlineRLConfig
 
 
@@ -34,24 +35,47 @@ def _mlp(in_dim: int, hidden_dim: int, out_dim: int, n_layers: int) -> nn.Sequen
 class ChunkActor(nn.Module):
     """pi_theta(a_{1:C} | x, a~_{1:C}) = N(mu_theta(x, a~), sigma^2 I)  (Eq. 4).
 
-    ``mu = clamp(a~ + clamp(f(x, a~_masked), +-max_residual), +-action_clip)``.
-    Reference dropout masks the *input* pathway only: the residual is still
-    added to the full reference, so a dropped sample forces the network to
-    produce a correction from the RL token alone rather than to regenerate the
-    whole chunk from scratch.
+    ``mu = clip(a~ + clamp(f(x, a~_masked), +-max_residual))``, where `clip` is
+    the elementwise action bound. Reference dropout masks the *input* pathway
+    only: the residual is still added to the full reference, so a dropped
+    sample forces the network to produce a correction from the RL token alone
+    rather than to regenerate the whole chunk from scratch.
+
+    The bound is per-dimension and comes from the dataset's action quantiles
+    (`action_bounds.py`). A scalar +-1 is only correct when the VLA normalises
+    actions to a bounded range; SmolVLA uses mean/std, where +-1 is one sigma
+    and truncates a quarter of every chunk.
     """
 
-    def __init__(self, cfg: ActorCriticConfig):
+    def __init__(self, cfg: ActorCriticConfig, bounds: ActionBounds | None = None):
         super().__init__()
         self.cfg = cfg
         chunk_dim = cfg.chunk_len * cfg.action_dim
         in_dim = cfg.rl_token_dim + cfg.proprio_dim + chunk_dim
         self.net = _mlp(in_dim, cfg.hidden_dim, chunk_dim, cfg.n_layers)
 
+        # Registered so they ride along in `state_dict`: the rollout's
+        # `ActorMirror` and the process backend both rebuild the actor from a
+        # bare config and then load weights, and would otherwise silently keep
+        # the fallback bound.
+        if bounds is None:
+            bounds = ActionBounds.from_config(cfg)
+        if bounds.action_dim != cfg.action_dim:
+            raise ValueError(
+                f"action bounds are {bounds.action_dim}-dim but the policy acts in "
+                f"{cfg.action_dim} dims"
+            )
+        self.register_buffer("action_low", bounds.low.clone())
+        self.register_buffer("action_high", bounds.high.clone())
+
         # Zero-init the output layer => residual == 0 => mu == reference.
         last = [m for m in self.net if isinstance(m, nn.Linear)][-1]
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
+
+    def clip(self, action: Tensor) -> Tensor:
+        """Elementwise action bound; broadcasts over (B, C, d)."""
+        return torch.clamp(action, self.action_low, self.action_high)
 
     def residual(self, x: Tensor, ref_in: Tensor) -> Tensor:
         """Bounded correction predicted from x and the (possibly masked) ref."""
@@ -70,7 +94,7 @@ class ChunkActor(nn.Module):
         is always provided (paper App. B).
         """
         res = self.residual(x, ref_chunk if ref_in is None else ref_in)
-        return (ref_chunk + res).clamp(-self.cfg.action_clip, self.cfg.action_clip)
+        return self.clip(ref_chunk + res)
 
     def sample(
         self,
@@ -83,7 +107,7 @@ class ChunkActor(nn.Module):
         if deterministic:
             return mu
         noisy = mu + self.cfg.action_std * torch.randn_like(mu)
-        return noisy.clamp(-self.cfg.action_clip, self.cfg.action_clip)
+        return self.clip(noisy)
 
     def apply_ref_dropout(self, ref_chunk: Tensor) -> Tensor:
         """Zero the reference for a random subset of the batch (training only)."""
@@ -115,10 +139,15 @@ class ChunkCritic(nn.Module):
 
 class RLTAgent:
     """Owns actor/critic/targets and implements the Algorithm 1 updates."""
-    def __init__(self, cfg: OnlineRLConfig, device: str | torch.device = "cuda"):
+    def __init__(
+        self,
+        cfg: OnlineRLConfig,
+        device: str | torch.device = "cuda",
+        bounds: ActionBounds | None = None,
+    ):
         self.cfg = cfg
         self.device = torch.device(device)
-        self.actor = ChunkActor(cfg.ac).to(self.device)
+        self.actor = ChunkActor(cfg.ac, bounds).to(self.device)
         self.critic = ChunkCritic(cfg.ac).to(self.device)
         self.critic_target = copy.deepcopy(self.critic).requires_grad_(False)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
@@ -161,7 +190,7 @@ class RLTAgent:
             noise = (cfg.target_noise_std * torch.randn_like(a_next)).clamp(
                 -cfg.target_noise_clip, cfg.target_noise_clip
             )
-            a_next = (a_next + noise).clamp(-cfg.ac.action_clip, cfg.ac.action_clip)
+            a_next = self.actor.clip(a_next + noise)
 
             q_next = self.critic_target.min_q(x_next, a_next).clamp(0.0, self.q_max)
             if steps is None:
