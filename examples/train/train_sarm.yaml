@@ -1,0 +1,27 @@
+# 在 LIBERO 上微调 SmolVLA —— 产出的权重就是 RLT stage-1/stage-2 的基座 VLA。
+#   python -m lerobot.scripts.lerobot_train \
+#     --config_path examples/rlt/train_smolvla_libero.yaml \
+#     --policy.device=cuda:1 --policy.push_to_hub=false
+
+reward_model:
+  type: sarm
+  annotation_mode: single_stage
+  image_key: observation.images.image
+  device: cuda:0
+  n_obs_steps: 4
+  frame_gap: 5
+  max_rewind_steps: 3  # must be < n_obs_steps (default 4 fails when n_obs_steps=4)
+dataset:
+  repo_id: yzembodied/libero_10_image_task_1
+  root: null
+  video_backend: pyav
+  use_imagenet_stats: false
+
+steps: 5000
+batch_size: 32
+num_workers: 4
+output_dir: /home/zzq/lerobotv6/outputs/train/sarm_insertion_single_20260821
+
+wandb:
+    enable: true
+    project: lerobot_sarm

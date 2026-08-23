@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Training / experiment outputs
+outputs/
+wandb/
+checkpoints/
+
+# OS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Type checkers / test caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
