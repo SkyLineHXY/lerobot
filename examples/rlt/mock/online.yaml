@@ -1,0 +1,53 @@
+# 阶段 2：mock 环境冒烟测试（L1）
+#
+#   python -m lerobot.rlt.train_online --config_path examples/rlt/mock/online.yaml
+#
+# 注意：mock 环境的奖励只依赖 6 维状态的前 2 维，且动作空间未归一化。它只能验证
+# 「不崩、能跑、learner 线程正常」，不能作为算法有效性的证据 —— 那要看 LIBERO。
+
+rl_token: outputs/rl_token
+checkpoint: lerobot/smolvla_base
+out: outputs/rlt_online_mock
+device: cuda
+seed: 0
+
+env:
+  type: mock
+  max_episode_steps: 120
+  image_size: 256
+  success_eps: 0.15
+  prompt: reach the target
+
+rl:
+  ac:
+    chunk_len: 10
+    action_dim: 6
+    proprio_dim: 6
+    hidden_dim: 256
+    n_layers: 2
+    action_std: 0.05
+    ref_dropout: 0.5
+  # openpi-RLT 的 actor loss：bc_w * mean((a - bc_target)^2) - q_w * mean(Q1)。
+  # BC 项是 C*d 上的均值，所以这几个权重比 sum 口径的 beta 大约 C*d 倍。
+  # 数值取自 openpi-RLT 实机任务 configs/tasks/agilex_ethernet/online_rl.yaml。
+  warmup_bc_weight: 10.0
+  warmup_q_weight: 0.1
+  online_bc_weight: 5.0
+  online_q_weight: 0.1
+  utd: 5
+  batch_size: 256
+  warmup_env_steps: 400
+  total_env_steps: 2000
+
+wandb:
+  enable: true
+  project: lerobot_rlt
+  # run_name: null            # 默认用 wandb 自动生成的名字
+  # run_id: null              # 填上旧 run id 可以把中断的训练续到同一条曲线
+  mode: online                # online | offline | disabled
+  # 每多少个梯度步跑一次诊断探针（额外几次 critic 前向）。曲线的价值主要来自它们，
+  # 但不是免费的，所以走比 loss 更慢的时钟。
+  diagnostics_every: 100
+
+log_freq: 200
+save_freq: 2000

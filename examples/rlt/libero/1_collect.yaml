@@ -1,0 +1,56 @@
+# 用键盘/手柄在 LIBERO 里人工示教，采集阶段 1 需要的演示数据集
+#
+#   python -m lerobot.rlt.collect_libero --config_path examples/rlt/libero/1_collect.yaml
+#   lerobot-rlt-collect-libero --config_path examples/rlt/libero/1_collect.yaml \
+#       --teleop.device=gamepad
+#
+# 产出的列与 lerobot/libero_10 完全一致，采完可以直接：
+#   lerobot-rlt-train-token --config_path examples/rlt/libero/3_rl_token.yaml \
+#       --dataset=local/libero_teleop --dataset_root=outputs/datasets/libero_teleop
+#
+# 算子键：
+#   空格   开始/暂停记录（松开时不推机械臂，也不写帧）
+#   s      本集成功，保存
+#   f      本集失败（默认丢弃，keep_failures=true 才保存）
+#   退格   丢弃本集
+#   Esc    结束采集
+#
+# 手柄键位（方向写的是机器人基座系，不是"画面上往哪推"）：
+#   左摇杆 上下/左右   ±x / ±y（推左为 +y）
+#   LT / RT            -z / +z
+#   右摇杆 上下/左右   pitch（绕 y）/ yaw（绕 z，手腕自转）
+#   十字键 左右        roll（绕 x）
+#   A / B              夹爪闭合 / 张开
+
+suite: libero_object
+task_id: 0
+observation_size: 256
+camera_name: agentview_image,robot0_eye_in_hand_image
+max_episode_steps: 600
+n_episodes: 20
+seed: 0
+
+teleop:
+  device: gamepad          # keyboard / gamepad / spacemouse
+  use_rotation: true        # LIBERO 是 7 维 delta EE，需要手腕三轴
+  position_scale: 0.25
+  rotation_scale: 0.15
+  gamepad_deadzone: 0.1
+  gamepad_bindings: {}      # 只覆盖要改的通道，例如 {delta_yaw: -rightx}
+
+dataset:
+  repo_id: local/libero_teleop
+  root: /home/zzq/lerobot/outputs/datasets/libero_teleop
+  fps: 20
+  resume: false
+  video_codec: libsvtav1
+  image_keys: [image, wrist_image]
+
+view:
+  enabled: true
+  max_width: 640
+  panel_height: 190
+  tile_height: 360
+
+keyboard_backend: auto
+keep_failures: false

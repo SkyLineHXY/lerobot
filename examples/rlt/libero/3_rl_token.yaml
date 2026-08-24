@@ -1,0 +1,50 @@
+# 阶段 1：在已有的 SmolVLA-LIBERO 预训练权重上训练 RL token
+#
+#   lerobot-rlt-train-token --config_path examples/rlt/libero/3_rl_token.yaml \
+#     --checkpoint <你的 smolvla libero 权重目录> \
+#     --dataset_root <本地 libero_10 数据集根目录>
+#
+# 然后评估表征质量（不看这个就上 stage 2 是在赌运气）：
+#   lerobot-rlt-eval-token --config_path examples/rlt/libero/3_rl_token.yaml \
+#     --checkpoint <同上> --eval.n_episodes 20
+# 再跑 stage 2：
+#   lerobot-rlt-train-online --config_path examples/rlt/libero/4_online.yaml \
+#     --checkpoint <同上> --rl_token outputs/rl_token_libero
+
+# 你已有的 SmolVLA LIBERO 微调权重（本地目录或 HF repo id）
+checkpoint: /home/zzq/lerobot/outputs/train/smolvla_sft_libero_10_20260818/checkpoints/050000/pretrained_model
+dataset: lerobot/libero_10_image
+dataset_root: null
+out: /home/zzq/lerobot/outputs/rl_token/libero_10_20260818
+device: cuda
+dtype: null
+num_workers: 4
+log_freq: 20
+save_freq: 2000
+
+wandb:
+  enable: true
+  project: lerobot_rlt
+  mode: online                # online | offline | disabled
+  # run_id: <旧 run id>        # 把中断的训练续到同一条曲线上
+
+rl_token:
+  vla_width: 960              # SmolVLM2-500M
+  d_model: 512
+  n_heads: 8
+  n_encoder_layers: 2
+  n_decoder_layers: 2
+
+  drop_language_tokens: false  # 论文脚注 1：任务指令固定时丢语言 embedding
+  use_image_tokens_only: false
+  normalize_targets: true
+  max_recon_tokens: 256
+
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  steps: 10000
+  batch_size: 8
+
+  vla_sft_alpha: 0
+  vla_lr: 1.0e-5

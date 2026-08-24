@@ -10,6 +10,7 @@ either one independently is how mean/std and min/max modes silently drift apart.
 
 from __future__ import annotations
 
+import copy
 from typing import Protocol
 
 import torch
@@ -50,8 +51,9 @@ class ChunkEnv(Protocol):
     def intervention_pending(self) -> bool:
         """Is a human about to take over the next chunk?
 
-        Cheap, side-effect free probe: the rollout worker uses it to skip the
-        VLA action sampling whose result an intervention would discard.
+        Cheap, side-effect free probe. The rollout worker uses it to move the
+        VLA sampling for that chunk off the control thread — the reference is
+        still stored, but the operator no longer waits for it.
         """
         ...
 
@@ -74,6 +76,16 @@ class ActionNormalizer:
     command in physical units (joint radians, or LIBERO's delta-EE box), but
     `ChunkRecord.actions` and the actor's BC target are both normalized. Reuses
     the stage-1 normalizer step rather than re-deriving the transform.
+
+    It reuses a private *copy* of that step, pinned to the CPU. The pipeline's
+    own step keeps its statistics on whichever device it was last called with
+    and migrates them lazily (`_apply_transform` reads `first_stat.device`, then
+    `to()` rebinds the whole `_tensor_stats` dict). Teleop commands arrive on the
+    CPU while the rollout worker's assembler thread is inside that same step with
+    CUDA observations, so normalizing through the shared step drags the stats to
+    the CPU between the assembler's device check and its read, and observation
+    normalization dies with "found at least two devices, cuda:0 and cpu". A copy
+    keeps the exact stage-1 transform without the shared mutable device state.
     """
 
     def __init__(self, preprocessor, action_dim: int):
@@ -83,11 +95,15 @@ class ActionNormalizer:
 
     def __call__(self, raw: Tensor) -> Tensor:
         if self._step is None:
-            self._step = find_action_normalizer(self._preprocessor)
-        if self._step is None:
+            self._step = self._private_step()
+        raw = torch.as_tensor(raw, dtype=torch.float32).reshape(-1)
+        return self._step._normalize_action(raw, inverse=False)[: self.action_dim]
+
+    def _private_step(self):
+        step = find_action_normalizer(self._preprocessor)
+        if step is None:
             raise RuntimeError(
                 "No action normalizer found in the stage-1 preprocessor; human "
                 "interventions cannot be expressed in the policy's action space."
             )
-        raw = torch.as_tensor(raw, dtype=torch.float32).reshape(-1)
-        return self._step._normalize_action(raw, inverse=False)[: self.action_dim]
+        return copy.deepcopy(step).to(device="cpu", dtype=torch.float32)

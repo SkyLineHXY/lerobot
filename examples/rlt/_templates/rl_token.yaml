@@ -1,0 +1,52 @@
+# 阶段 1：在任务演示数据上训练 RL token（论文 Eq. 1-2）
+#
+#   python -m lerobot.rlt.train_rl_token --config_path examples/rlt/_templates/rl_token.yaml
+#
+# 输出目录同时包含 rl_token.pt 与 policy_pre/postprocessor.json —— 阶段 2 和真机
+# 必须复用同一套归一化统计量，否则 z_rl 与参考动作会静默错位。
+
+checkpoint: lerobot/smolvla_base
+dataset: lerobot/libero_10
+dataset_root: null            # 本地数据集根目录；null 表示从 HF Hub 拉取
+out: outputs/rl_token
+device: cuda
+dtype: null                   # null 保持 checkpoint 原有混合精度布局
+num_workers: 4
+log_freq: 20
+save_freq: 500
+
+rl_token:
+  # SmolVLM2-500M 的最终层宽度
+  vla_width: 960
+  # 论文中 RL token 宽度 = VLA 宽度（pi0.5 为 2048）。512 让瓶颈更紧、模块更轻
+  # （约 15M 参数）；要严格对齐论文就设成 960。
+  d_model: 512
+  n_heads: 8
+  n_encoder_layers: 2
+  n_decoder_layers: 2
+
+  # 论文脚注 1：任务指令固定时丢掉语言 embedding。图像 token 与 state token 都保留，
+  # state token 是 SmolVLA prefix 里唯一的本体感知入口。
+  drop_language_tokens: true
+  use_image_tokens_only: false
+  # SmolVLA 在 embed_prefix 里把图像 embedding 乘了 sqrt(dim)≈31，不做逐通道标准化
+  # 的话重建损失会被少数大范数通道主导。
+  normalize_targets: true
+  max_recon_tokens: 256
+
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  steps: 5000                 # 论文 App. B：2000~10000 步
+  batch_size: 8
+  # Algorithm 1 line 3 中联合微调 VLA 的权重 alpha；0 表示 VLA 完全冻结。
+  # 设为 >0 时微调结果会存到 <out>/smolvla_sft，阶段 2 需把 checkpoint 指向它。
+  #
+  # 推荐保持 0，改用两步走（Evo-RLT / openpi-RLT 实践中的做法）：
+  #   1) lerobot-train 先把 VLA 微调到位
+  #   2) 在冻结的微调 VLA 上训 RL token
+  # 联合训练时 RL token 编码器在追一个漂移的 z 分布，且显存占用会高一个量级。
+  vla_sft_alpha: 0.0
+  # alpha > 0 时 VLA 用独立的优化器和学习率：新初始化的 ~15M 编解码器要 1e-4，
+  # 预训练的 500M VLA 用同样的学习率会被打坏。
+  vla_lr: 1.0e-5

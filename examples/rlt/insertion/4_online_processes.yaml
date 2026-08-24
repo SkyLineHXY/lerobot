@@ -1,0 +1,85 @@
+rl_token: /home/zzq/lerobot/outputs/train/rl_token/insertion_sft050000_20260824
+checkpoint: /home/zzq/lerobot/outputs/train/smolvla_sft_insertion_demo_20260823/checkpoints/050000/pretrained_model
+out: /home/zzq/lerobot/outputs/rl_token/rlt_online_insertion_20260824
+device: cuda
+seed: 0
+
+concurrency:
+  mode: processes
+  learner_host: 127.0.0.1
+  learner_port: 50061
+  parameters_push_hz: 10.0
+  max_pending_ops: 4096
+  learner_torch_threads: 1
+
+env:
+  type: insertion
+  task_stage: pregrasped      # 初始已夹持；full 是先抓后插，长程得多
+  prompt: insert the red bar into the blue slot
+  control_mode: relative
+  control_freq: 20
+  observation_size: 256
+  camera_name: agentview_image,robot0_eye_in_hand_image
+  max_episode_steps: 400
+  init_state_offset: 0
+  n_init_states: 30
+  pool_size: 50
+  pool_seed: 0
+  task_kwargs: {}
+  teleop:
+    device: gamepad
+    use_rotation: true        # 7 维 delta EE，需要手腕三轴
+    position_scale: 0.25
+    rotation_scale: 0.1
+    gamepad_deadzone: 0.1
+    gamepad_bindings: {}
+    use_device_events: true   # 接管/成功/失败也认手柄按键
+rl:
+  ac:
+    chunk_len: 10
+    action_dim: 7
+    proprio_dim: 8
+    hidden_dim: 256
+    n_layers: 2
+    action_std: 0.05
+    ref_dropout: 0.5
+    residual_scale: 0.3
+
+  discount: 0.99
+  warmup_bc_weight: 10.0
+  warmup_q_weight: 0.1
+
+  online_bc_weight: 5.0
+  online_q_weight: 0.1
+  # 一步切换 BC/Q 权重会让 actor_ref_dist 在 500 个梯度步里从 0.14 跳到 0.39。
+  weight_ramp_updates: 20000
+  awr_weight: 0
+  human_bc_weight: 1.0
+
+  critic_mc_weight: 0
+  utd: 5
+  batch_size: 256
+  sample_strategy: stratified
+  truncation_is_failure: true
+  warmup_env_steps: 3000
+  # 交接前 learner 还必须跑够这么多梯度步（openpi-RLT tasks/agilex_ethernet 的取值）。
+  warmup_post_collect_updates: 20000
+  total_env_steps: 100000
+
+wandb:
+  enable: true
+  project: lerobot_rlt
+  mode: online                # online | offline | disabled
+  diagnostics_every: 100
+
+critical_phase: false
+log_freq: 500
+save_freq: 5000
+
+
+view:
+  enabled: true             # 相机画面 + RL 状态面板；没有 DISPLAY 时自动降级成空操作
+  max_width: 960
+  panel_height: 200
+  tile_height: 320
+  min_period_s: 0.0         # 每个 env step 都重画；仿真跑太快时可以设 0.05 限帧
