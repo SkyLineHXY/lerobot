@@ -11,7 +11,7 @@ import pytest
 from lerobot.rlt.envs.mock import MockManipEnv
 from lerobot.rlt.teleop.device import DeviceIntervention
 from lerobot.rlt.teleop.keys import KeyboardEventListener
-from lerobot.rlt.train_online import poll_task_switch
+from lerobot.rlt.train_online import advance_warmup_phase, poll_task_switch, warmup_required
 from lerobot.teleoperators.utils import TeleopEvents
 
 LIBERO_NAMES = [
@@ -23,6 +23,29 @@ LIBERO_NAMES = [
     "delta_yaw",
     "gripper",
 ]
+
+
+class WarmupCfg:
+    warmup_env_steps = 100
+    warmup_post_collect_updates = 200
+
+
+def test_warmup_handover_is_latched_until_episode_end():
+    rl = WarmupCfg()
+    assert warmup_required(rl, env_steps=100, updates=200) is False
+    assert advance_warmup_phase(
+        True, episode_done=False, rl=rl, env_steps=150, updates=250
+    ) is True
+    assert advance_warmup_phase(
+        True, episode_done=True, rl=rl, env_steps=150, updates=250
+    ) is False
+
+
+def test_warmup_waits_for_both_budgets_at_the_boundary():
+    rl = WarmupCfg()
+    assert advance_warmup_phase(
+        True, episode_done=True, rl=rl, env_steps=150, updates=199
+    ) is True
 
 
 class FakeKeys(KeyboardEventListener):
@@ -278,10 +301,10 @@ def test_task_property_is_the_language_instruction_not_the_bddl_name():
 def test_the_prompt_that_reaches_the_preprocessor_is_the_instruction(monkeypatch):
     from types import SimpleNamespace
 
-    from lerobot.rlt.envs import libero as libero_mod
+    from lerobot.rlt.envs import libero as libero_mod, robosuite_base
 
-    monkeypatch.setattr(libero_mod, "preprocess_observation", dict)
-    monkeypatch.setattr(libero_mod, "_batch_robot_state_", lambda frame: None)
+    monkeypatch.setattr(robosuite_base, "preprocess_observation", dict)
+    monkeypatch.setattr(robosuite_base, "_batch_robot_state_", lambda frame: None)
 
     seen = {}
 

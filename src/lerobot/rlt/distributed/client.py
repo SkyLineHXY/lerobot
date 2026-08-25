@@ -58,7 +58,7 @@ class RemoteBufferSink:
         self.remote_size = 0
         self.total_added = 0
         # Set by the training loop each iteration, exactly as it sets
-        # `LearnerThread.allow_actor_updates` in the threaded backend.
+        # `LearnerThread.warmup` in the threaded backend.
         self.warmup = True
 
     def __len__(self) -> int:
@@ -73,24 +73,38 @@ class RemoteBufferSink:
             logger.warning("Transition queue is full (%d); blocking the rollout.", self._max_pending)
             self._queue.put(op)
 
-    def start_episode(self) -> None:
+    def start_episode(self, warmup: bool = False) -> None:
         self._episode_id += 1
         self._sent_this_episode = 0
-        self._emit(start_op(self._episode_id))
+        self._emit(start_op(self._episode_id, warmup=warmup))
 
     def add_chunk(self, rec: ChunkRecord) -> None:
         self._sent_this_episode += 1
         self._emit(chunk_op(self._episode_id, rec, warmup=self.warmup))
 
-    def end_episode(self, x_last: torch.Tensor | None = None) -> None:
-        self._emit(end_op(self._episode_id, x_last))
+    def end_episode(
+        self,
+        x_last: torch.Tensor | None = None,
+        ref_last: torch.Tensor | None = None,
+        success: bool = False,
+        truncation_is_failure: bool = False,
+    ) -> None:
+        self._emit(
+            end_op(
+                self._episode_id,
+                x_last,
+                ref_last,
+                success=success,
+                truncation_is_failure=truncation_is_failure,
+            )
+        )
 
     def discard_episode(self) -> int:
-        """Ask the learner to rewind. Returns *chunks* sent, not transitions.
+        """Ask the learner to drop the episode. Returns *chunks* sent, not steps.
 
-        The transition count is only knowable where the buffer lives, and the
-        stream is ordered, so the learner applies this rewind against exactly
-        the state the in-process buffer would have had.
+        The step count is only knowable where the buffer lives, and the stream
+        is ordered, so the learner drops exactly the trace the in-process buffer
+        would have had.
         """
         self._emit(discard_op(self._episode_id))
         sent, self._sent_this_episode = self._sent_this_episode, 0

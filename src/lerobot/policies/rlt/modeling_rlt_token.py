@@ -7,13 +7,14 @@ Two pieces:
   final-layer token embeddings ``z_{1:M}`` *and* the prefix KV cache so the
   same forward pass can also be reused to sample the VLA reference action
   chunk (flow-matching denoising loop of the action expert).
-* :class:`RLTokenModule` — a lightweight encoder that appends a learned
-  ``e_rl`` embedding and reads out the RL token ``z_rl`` (Eq. 1), plus a
-  causal decoder trained with teacher forcing to autoregressively reconstruct
-  the (stop-gradient) VLA embeddings from ``z_rl`` (Eq. 2).
+* :class:`RLTokenModule` — a lightweight cross-attention encoder whose learned
+  queries read out the RL token ``z_rl`` (Eq. 1), plus a decoder that
+  reconstructs the (stop-gradient) VLA embeddings from ``z_rl`` alone (Eq. 2).
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch import Tensor, nn
@@ -142,51 +143,106 @@ class SmolVLAPrefixExtractor:
             x_t = x_t + dt * v_t
         return x_t
 
-def _causal_mask(size: int, device) -> Tensor:
-    return torch.triu(torch.full((size, size), float("-inf"), device=device), diagonal=1)
+def sinusoidal_pe(seq_len: int, d_model: int) -> Tensor:
+    """openpi-RLT `fsq_tokenizer.sinusoidal_pe_init`: sin and cos concatenated."""
+    position = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)
+    div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model))
+    return torch.cat([torch.sin(position * div), torch.cos(position * div)], dim=-1)
+
+
+class _GeGLU(nn.Module):
+    """openpi-RLT `GeGLU`: Dense(2d) then `x * gelu(gate)` over the split."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim * 2)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * nn.functional.gelu(gate)
+
+
+class CrossAttentionLayer(nn.Module):
+    """Pre-norm [self-attn, cross-attn, MLP], each residual.
+
+    Port of openpi-RLT `fsq_tokenizer.CrossAttentionLayer`. The cross-attention
+    block is what makes the bottleneck load-bearing: in the decoder it is the
+    only path from an output position to the RL token.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float, dropout: float):
+        super().__init__()
+        self.norm_self = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm_cross = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm_mlp = nn.LayerNorm(d_model)
+        d_ff = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_ff), nn.Dropout(dropout), _GeGLU(d_ff), nn.Linear(d_ff, d_model)
+        )
+
+    def forward(self, x: Tensor, y: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
+        h = self.norm_self(x)
+        x = x + self.self_attn(h, h, h, need_weights=False)[0]
+        h = self.norm_cross(x)
+        x = x + self.cross_attn(h, y, y, key_padding_mask=key_padding_mask, need_weights=False)[0]
+        return x + self.mlp(self.norm_mlp(x))
+
 
 class RLTokenModule(nn.Module):
-    """Encoder-decoder bottleneck producing the RL token (Eq. 1-2)."""
+    """Encoder-decoder bottleneck producing the RL token (Eq. 1-2).
+
+    Ported from openpi-RLT `src/openpi/models/rl_token.py`. Both halves are
+    cross-attention stacks over learned queries:
+
+    * encoder — `num_rl_tokens` learned queries cross-attend to the VLA prefix
+      embeddings and are read out as `z_rl`;
+    * decoder — one learned query per output position, cross-attending to
+      `z_rl` **only**.
+
+    The decoder deliberately gets no teacher forcing. An autoregressive decoder
+    fed the true `z_bar_1..z_bar_{t-1}` can reconstruct M-1 of M positions by
+    interpolating neighbours and never read the bottleneck at all: L_ro falls,
+    `recon_rel_err` falls, and `z_rl` stays empty. Measured on this repo's
+    LIBERO setup, that variant held `bottleneck_gain` at 0.001 for a whole run
+    while this one reaches ~1.4. `bottleneck_usage` is the probe that tells the
+    two apart; the loss curve cannot.
+    """
     def __init__(self, cfg: RLTokenConfig):
         super().__init__()
         self.cfg = cfg
         d = cfg.d_model
-        ff = int(cfg.d_model * cfg.mlp_ratio)
 
-        self.enc_in_proj = nn.Linear(cfg.vla_width, d)
-        self.e_rl = nn.Parameter(torch.randn(d) * 0.02)
-        self.enc_pos = nn.Parameter(torch.zeros(cfg.max_recon_tokens + 1, d))
+        self.in_proj = nn.Linear(cfg.vla_width, d) if cfg.vla_width != d else nn.Identity()
+        self.out_proj = nn.Linear(d, cfg.vla_width) if cfg.vla_width != d else nn.Identity()
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d, cfg.n_heads, ff, dropout=cfg.dropout, activation="gelu",
-            batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            enc_layer, cfg.n_encoder_layers, norm=nn.LayerNorm(d)
-        )
-        self.dec_in_proj = nn.Linear(cfg.vla_width, d)
-        self.dec_pos = nn.Parameter(torch.zeros(cfg.max_recon_tokens + 1, d))
-        dec_layer = nn.TransformerEncoderLayer(
-            d, cfg.n_heads, ff, dropout=cfg.dropout, activation="gelu",
-            batch_first=True, norm_first=True,
-        )
-        self.decoder = nn.TransformerEncoder(
-            dec_layer, cfg.n_decoder_layers, norm=nn.LayerNorm(d)
-        )
-        self.out_proj = nn.Linear(d, cfg.vla_width)  # h_phi
+        self.enc_query = nn.Parameter(sinusoidal_pe(cfg.num_rl_tokens, d))
+        self.enc_pos = nn.Parameter(sinusoidal_pe(cfg.max_recon_tokens, d))
+        self.dec_query = nn.Parameter(sinusoidal_pe(cfg.max_recon_tokens, d))
+        self.dec_pos = nn.Parameter(sinusoidal_pe(cfg.num_rl_tokens, d))
 
-        nn.init.trunc_normal_(self.enc_pos, std=0.02)
-        nn.init.trunc_normal_(self.dec_pos, std=0.02)
+        def stack(n: int) -> nn.ModuleList:
+            return nn.ModuleList(
+                [CrossAttentionLayer(d, cfg.n_heads, cfg.mlp_ratio, cfg.dropout) for _ in range(n)]
+            )
+
+        self.encoder = stack(cfg.n_encoder_layers)
+        self.decoder = stack(cfg.n_decoder_layers)
 
         # SmolVLA multiplies image embeddings by sqrt(width) (~31) inside
-        # embed_prefix, so raw-MSE reconstruction is dominated by whichever
-        # channels happen to be large. Standardising per channel with running
-        # dataset statistics makes L_ro measure information instead of scale.
-        # The buffers travel with the checkpoint, so stage 2 sees the same
-        # normalisation as stage 1.
+        # embed_prefix, so a raw MSE on z is dominated by whichever channels
+        # happen to be large. Standardising per channel with running dataset
+        # statistics makes L_ro measure information instead of scale. openpi-RLT
+        # reconstructs raw embeddings; its VLA does not have this scaling.
         self.register_buffer("z_mean", torch.zeros(cfg.vla_width))
         self.register_buffer("z_var", torch.ones(cfg.vla_width))
         self.register_buffer("z_stats_count", torch.zeros(()))
+
+    @property
+    def z_rl_dim(self) -> int:
+        """Width of the flattened RL token, i.e. the state dim stage 2 sees."""
+        return self.cfg.d_model * self.cfg.num_rl_tokens
 
     @torch.no_grad()
     def _update_z_stats(self, z: Tensor, mask: Tensor, momentum: float = 0.01) -> None:
@@ -212,17 +268,14 @@ class RLTokenModule(nn.Module):
         if m <= self.cfg.max_recon_tokens:
             return z, mask
         idx = torch.linspace(0, m - 1, self.cfg.max_recon_tokens, device=z.device).long()
-        return z[:,idx] , mask[:,idx]
+        return z[:, idx], mask[:, idx]
 
-    def encode(
-        self, z: Tensor, mask: Tensor | None = None, already_prepared: bool = False
-    ) -> Tensor:
-        """Eq. 1: z_rl = g_phi([z_{1:M}, e_rl])_{M+1}.
+    def encode(self, z: Tensor, mask: Tensor | None = None, already_prepared: bool = False) -> Tensor:
+        """Eq. 1: `num_rl_tokens` learned queries cross-attend to z_{1:M}.
 
-        z: (B, M, vla_width); mask: (B, M) bool, True = valid token.
-        `already_prepared` skips subsampling/normalisation for callers that
-        did it themselves (the reconstruction loss shares both with the
-        decoder targets).
+        z: (B, M, vla_width); mask: (B, M) bool, True = valid token. Returns the
+        flattened token (B, d_model * num_rl_tokens) — openpi-RLT flattens too,
+        and with the default `num_rl_tokens = 1` this is just a squeeze.
         """
         if mask is None:
             mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
@@ -230,43 +283,38 @@ class RLTokenModule(nn.Module):
             z, mask = self._subsample(z, mask)
             z = self.normalize_z(z)
         b, m, _ = z.shape
-        h = self.enc_in_proj(z)
-        h = torch.cat([h, self.e_rl.expand(b, 1, -1)], dim=1)
-        h = h + self.enc_pos[: m + 1]
-        pad = torch.cat(
-            [~mask, torch.zeros(b, 1, dtype=torch.bool, device=z.device)], dim=1
-        )
-        out = self.encoder(h, src_key_padding_mask=pad)
+        y = self.in_proj(z) + self.enc_pos[:m]
+        x = self.enc_query.expand(b, -1, -1)
+        for layer in self.encoder:
+            x = layer(x, y, key_padding_mask=~mask)
+        return x.reshape(b, -1)
 
-        return out[:, -1]
+    def decode(self, z_rl: Tensor, target_len: int) -> Tensor:
+        """Eq. 2: one learned query per output position, attending to z_rl only."""
+        b = z_rl.shape[0]
+        y = z_rl.reshape(b, self.cfg.num_rl_tokens, self.cfg.d_model) + self.dec_pos
+        x = self.dec_query[:target_len].expand(b, -1, -1)
+        for layer in self.decoder:
+            x = layer(x, y)
+        return self.out_proj(x)
 
     def reconstruction_loss(
         self, z: Tensor, mask: Tensor | None = None
     ) -> tuple[Tensor, Tensor, dict[str, float]]:
-        """Eq. 2 with teacher forcing (parallel autoregressive training).
+        """Eq. 2. Targets are stop-gradient embeddings z_bar; the encoder also
+        consumes z_bar since the VLA is frozen w.r.t. L_ro.
 
-        Targets and decoder inputs use stop-gradient embeddings z_bar; the
-        encoder also consumes z_bar since the VLA is frozen w.r.t. L_ro.
         Returns (loss, z_rl, metrics).
         """
         if mask is None:
             mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
-        z_bar = z.detach()
-        z_bar, mask = self._subsample(z_bar, mask)
+        z_bar, mask = self._subsample(z.detach(), mask)
         if self.training and self.cfg.normalize_targets:
             self._update_z_stats(z_bar, mask)
         z_bar = self.normalize_z(z_bar)
 
-        b, m, _ = z_bar.shape
-
         z_rl = self.encode(z_bar, mask, already_prepared=True)
-        # Decoder input: [z_rl, proj(z_bar_1), ..., proj(z_bar_{M-1})]
-        dec_in = torch.cat(
-            [z_rl.unsqueeze(1), self.dec_in_proj(z_bar[:, :-1])], dim=1
-        )
-        dec_in = dec_in + self.dec_pos[:m]
-        out = self.decoder(dec_in, mask=_causal_mask(m, z.device))
-        pred = self.out_proj(out)  # predicts z_bar_1 .. z_bar_M
+        pred = self.decode(z_rl, z_bar.shape[1])
 
         w = mask.float()
         denom = w.sum().clamp(min=1.0)
@@ -275,8 +323,8 @@ class RLTokenModule(nn.Module):
 
         with torch.no_grad():
             # Relative error tells you whether the bottleneck is too tight far
-            # better than the raw loss does, and z_rl's spread tells you
-            # whether the token has collapsed to a constant.
+            # better than the raw loss does, and z_rl's spread across the batch
+            # is a (noisy) collapse signal.
             target_energy = (z_bar.pow(2).mean(dim=-1) * w).sum() / denom
             metrics = {
                 "recon_rel_err": (loss / target_energy.clamp(min=1e-8)).item(),
@@ -284,6 +332,61 @@ class RLTokenModule(nn.Module):
             }
         return loss, z_rl, metrics
 
+    @torch.no_grad()
+    def reconstruct(self, z: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """(pred, z_bar, mask, z_rl) in the normalised space L_ro is measured in.
+
+        `reconstruction_loss` collapses everything to one scalar, which cannot
+        answer "was it the *language* tokens that failed to reconstruct" — and
+        that question is the whole point of the stage-1 diagnostics, since image
+        tokens outnumber language tokens ~5:1 and dominate the average. Doing
+        the subsample/normalise dance in the caller instead would duplicate the
+        two steps that have to stay in lockstep with training.
+        """
+        if mask is None:
+            mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
+        z_bar, mask = self._subsample(z.detach(), mask)
+        z_bar = self.normalize_z(z_bar)
+        z_rl = self.encode(z_bar, mask, already_prepared=True)
+        return self.decode(z_rl, z_bar.shape[1]), z_bar, mask, z_rl
+
+    @torch.no_grad()
+    def bottleneck_usage(self, z: Tensor, mask: Tensor | None = None) -> dict[str, float]:
+        """How much of the reconstruction actually flows through z_rl.
+
+        Re-runs the decoder with z_rl paired with the wrong observation.
+        `bottleneck_gain` is how much worse that is, relative to the true loss.
+        Near 0 means the token carries nothing and stage 2 would be RL on a
+        constant state — which `loss_ro` alone cannot tell you, since a decoder
+        with any shortcut drives it down regardless.
+
+        Mismatching is done by rolling the batch rather than by `randperm`: a
+        random permutation of 8 leaves one element in place on average, and each
+        fixed point contributes a zero to the average, biasing the number toward
+        "unused" exactly when the batch is small. Rolling is a derangement by
+        construction, and averaging a few shifts cuts the single-batch variance
+        that otherwise makes this metric swing an order of magnitude per log.
+        """
+        if mask is None:
+            mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
+        z_bar, mask = self._subsample(z.detach(), mask)
+        z_bar = self.normalize_z(z_bar)
+        b, m, _ = z_bar.shape
+        if b < 2:
+            return {}
+
+        z_rl = self.encode(z_bar, mask, already_prepared=True)
+        w = mask.float()
+        denom = w.sum().clamp(min=1.0)
+
+        def loss_for(token: Tensor) -> Tensor:
+            err = (self.decode(token, m) - z_bar).pow(2).mean(dim=-1)
+            return (err * w).sum() / denom
+
+        true_loss = loss_for(z_rl).clamp(min=1e-8)
+        shifts = range(1, min(b, 4))
+        gains = [((loss_for(z_rl.roll(s, 0)) - true_loss) / true_loss) for s in shifts]
+        return {"bottleneck_gain": (sum(gains) / len(gains)).item()}
 
     @torch.no_grad()
     def rl_token(self, z: Tensor, mask: Tensor | None = None) -> Tensor:

@@ -42,9 +42,11 @@ class ThreadBackend:
             seed=cfg.seed,
             sample_strategy=rl.sample_strategy,
             recent_episode_window=rl.recent_episode_window,
-            recent_ratio=rl.recent_ratio,
-            human_ratio=rl.human_ratio,
-            reward_ratio=rl.reward_ratio,
+            recent_online_ratio=rl.recent_online_ratio,
+            warmup_demo_ratio=rl.warmup_demo_ratio,
+            human_intervention_ratio=rl.human_intervention_ratio,
+            aligned_ratio=rl.aligned_ratio,
+            human_ref_override=rl.human_ref_override,
         )
         if cfg.resume_buffer:
             self.buffer.load(cfg.resume_buffer)
@@ -60,10 +62,10 @@ class ThreadBackend:
         self.mirror.sync(self.learner)
 
     def set_warmup(self, warmup: bool) -> None:
-        self.learner.allow_actor_updates = not warmup
+        self.learner.warmup = warmup
 
     def metrics(self) -> dict[str, float]:
-        return self.learner.metrics()
+        return {**self.learner.metrics(), **self.buffer.composition()}
 
     def check_health(self) -> None:
         self.learner.raise_if_failed()
@@ -186,7 +188,7 @@ def _learner_entry(serve, cfg, x_dim: int, shutdown_event) -> None:
         x_dim=x_dim,
         host=cfg.concurrency.learner_host,
         port=cfg.concurrency.learner_port,
-        device=cfg.device,
+        device=cfg.concurrency.learner_device or cfg.device,
         seed=cfg.seed,
         parameters_push_hz=cfg.concurrency.parameters_push_hz,
         shutdown_event=shutdown_event,

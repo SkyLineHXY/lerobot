@@ -13,6 +13,7 @@ from .configuration_rlt import (
     CameraSpec,
     ChunkEnvConfig,
     ConcurrencyConfig,
+    InsertionEnvConfig,
     LiberoEnvConfig,
     MockEnvConfig,
     OnlineRLConfig,
@@ -25,7 +26,7 @@ from .configuration_rlt import (
     SimTeleopConfig,
 )
 from .modeling_rlt import RLTController
-from .modeling_rlt_ac import ChunkActor, ChunkCritic, RLTAgent
+from .modeling_rlt_ac import ChunkActor, ChunkCritic, RLTAgent, TransitionSource
 from .modeling_rlt_token import RLTokenModule, SmolVLAPrefixExtractor
 from .processor_rlt import (
     check_stage1_matches_policy,
@@ -40,6 +41,7 @@ __all__ = [
     "ChunkCritic",
     "ChunkEnvConfig",
     "ConcurrencyConfig",
+    "InsertionEnvConfig",
     "LiberoEnvConfig",
     "MockEnvConfig",
     "OnlineRLConfig",
@@ -55,6 +57,7 @@ __all__ = [
     "RLTokenModule",
     "RLTokenTrainConfig",
     "SmolVLAPrefixExtractor",
+    "TransitionSource",
     "load_smolvla_policy",
     "load_stage1_processors",
 ]

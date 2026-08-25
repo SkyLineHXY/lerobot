@@ -38,18 +38,14 @@ dataset:
   root: /home/zzq/data/data_lerobot3/piper/DualPiperDemo
   task: "blood gas sample analysis"
   robot_type: dual_piper
-  fps: 25
+  fps: 30
 
   resume: false
   use_videos: true
   video_codec: h264_nvenc
-  # 关闭流式编码：PyAV 打开编码器时不释放 GIL（nvenc 首帧 ~400ms/相机），
-  # 会让遥操作线程在每集开头停顿 1~2 秒。关掉后改为存集时用独立进程编码。
   streaming_encoding: false
   encoder_threads: 4
   data_flush_every: 10        # 每 N 集把 parquet footer 落盘
-  # 写帧线程的排队上限。结束时打印的「写帧队列峰值」持续接近它，说明视频编码
-  # 跟不上采集速度，该降分辨率或换更快的 video_codec。
   writer_queue_maxsize: 90
 
   subtasks:
@@ -63,31 +59,19 @@ dataset:
     '8': 'return the robotic arm to the home position.'
 
 # ── 遥操作（从臂指令下发）──────────────────────────────────────────────
-# 每条臂一个线程、各自由自己的主臂新样本驱动，与 dataset.fps 无关。
-# 双臂把 fps 降到 25 是为了扛住写盘负载，指令频率不再受它影响（以前 fps 一降
-# 指令周期就从 33ms 涨到 40ms，双臂反而比单臂更顿）。
 teleop:
   enabled: true
   max_hz: 250.0
   idle_poll_s: 0.001
-  # 与单臂取同一量级。旧的 max_joint_step_rad=0.05 @25Hz 只有 1.25 rad/s，
-  # 正常示教就会持续饱和 —— 那是设计出来的滞后，不是安全裕度。
   max_joint_vel_rad_s: 6.0
   max_lead_rad: 0.5
-  # 双臂 4 个 CAN 接口合计约 12300 帧/秒全在 Python 里解析，过滤后约减半
   can_filters: true
 
 collection:
   max_timesteps: 10000
   use_back_event: true
   dry_run: false
-
-  # action 记什么：
-  #   follower_next —— 从臂在下一拍的实测位姿（默认）。示教时从臂并不能 100% 跟上
-  #      主臂，记主臂指令等于记了一个没被真正执行的动作。代价是每集丢掉最后一帧。
-  #   leader        —— 限速后实际下发给从臂的目标（即主臂指令）。
   action_source: follower_next
-
   init_mode: follower_to_leader
   init_duration_s: 2.0
   init_max_step_rad: 0.5

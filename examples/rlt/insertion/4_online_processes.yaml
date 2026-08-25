@@ -20,7 +20,10 @@ env:
   control_freq: 20
   observation_size: 256
   camera_name: agentview_image,robot0_eye_in_hand_image
-  max_episode_steps: 400
+  # 与 4_online.yaml / 5_eval_online.yaml 同一视界。400 是 OnlineRLConfig 的默认值，
+  # 不是为这个任务选的：专家均值 76 步，400 步的失败 episode 会往 buffer 里塞 200 行
+  # 全零奖励，并把终局奖励推到 40 个 chunk hop 之外（gamma^C=0.904，gamma^(40C)≈0.02）。
+  max_episode_steps: 250
   init_state_offset: 0
   n_init_states: 30
   pool_size: 50
@@ -29,6 +32,10 @@ env:
   teleop:
     device: gamepad
     use_rotation: true        # 7 维 delta EE，需要手腕三轴
+    # 摇杆按 TCP（末端）系解释：delta_z 沿工具接近轴 = 插入深度，左摇杆是垂直于
+    # 杆的横向修正，右摇杆是绕工具轴的倾斜/自转。手腕转过之后仍然一一对应，
+    # base 系下则要在脑子里换算。存进 buffer 的仍是转换回 base 系的动作。
+    frame: tcp                # base | tcp
     position_scale: 0.25
     rotation_scale: 0.1
     gamepad_deadzone: 0.1
@@ -43,7 +50,9 @@ rl:
     n_layers: 2
     action_std: 0.05
     ref_dropout: 0.5
-    residual_scale: 0.3
+    # 论文/openpi-RLT：直接吐完整 chunk。有界残差与 ref_dropout 不兼容——参考被置零的
+    # 那一半行上 mu 被夹在 ±scale 内，而 BC 目标是完整幅度的 ref，永远够不着。
+    residual_scale: 0.0
 
   discount: 0.99
   warmup_bc_weight: 10.0
@@ -61,15 +70,17 @@ rl:
   batch_size: 256
   sample_strategy: stratified
   truncation_is_failure: true
-  warmup_env_steps: 3000
+  warmup_env_steps: 8000
   # 交接前 learner 还必须跑够这么多梯度步（openpi-RLT tasks/agilex_ethernet 的取值）。
   warmup_post_collect_updates: 20000
   total_env_steps: 100000
 
 wandb:
+  # critic 探针（q_reward_gap / q_vs_mc / q_mc_corr / buffer_mc_mean）终端只挑着打印，
+  # 完整的一套只走 wandb。offline 无网也能存，事后 wandb sync。
   enable: true
   project: lerobot_rlt
-  mode: online                # online | offline | disabled
+  mode: offline               # online | offline | disabled
   diagnostics_every: 100
 
 critical_phase: false

@@ -15,10 +15,10 @@ Run this before `train_online.py` to answer two questions separately from RL:
    inside the policy's action space at all.
 
     # dry run: read only, never command the follower
-    python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml \
+    python -m lerobot.rlt.teleop_check --config_path examples/rlt/piper/teleop_check.yaml \
         --dry_run=true
-    python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml
-    python -m lerobot.rlt.teleop_check --config_path examples/rlt/teleop_check.yaml \
+    python -m lerobot.rlt.teleop_check --config_path examples/rlt/piper/teleop_check.yaml
+    python -m lerobot.rlt.teleop_check --config_path examples/rlt/piper/teleop_check.yaml \
         --rl_token=outputs/rl_token
 
 Keys match `train_online.py`: space toggles takeover, s/f label success/failure,
@@ -73,9 +73,12 @@ class LeaderCheckConfig:
     # at all.
     #
     # tx_ratio scales RNEA joint torques into SDK MIT torque units and doubles as
-    # a derating factor. Piper's 0.2 default compensates ~20% of the arm's weight,
-    # which feels like no compensation. Raise it until the arm holds itself up;
-    # if it starts drifting *upwards* that is over-compensation — lower it now.
+    # a derating factor. Piper's 0.2 default compensates about a fifth of the
+    # arm's weight, which feels like none at all. Raise it until the arm holds
+    # itself up; if it starts drifting *upwards* that is over-compensation —
+    # lower it now. Written out in words on purpose: a percent sign in a draccus
+    # field comment reaches argparse as a format string and kills --help for
+    # every entry point sharing this config tree.
     gravity_comp_tx_ratio: list[float] = field(
         default_factory=lambda: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
     )

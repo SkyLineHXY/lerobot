@@ -208,7 +208,7 @@ def probe(
             leader.disconnect()
         print(f"[probe] 结束。最终 tx_ratio = {np.array2string(ratios, precision=2)}")
         if ratios.any():
-            print("[probe] 把它写进 examples/rlt/teleop_check.yaml 的 leader 段：")
+            print("[probe] 把它写进 examples/rlt/piper/teleop_check.yaml 的 leader 段：")
             print(f"          gravity_comp_tx_ratio: {[round(v, 2) for v in ratios]}")
     return 0
 

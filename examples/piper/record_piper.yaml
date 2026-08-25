@@ -44,8 +44,6 @@ dataset:
   resume: false                # true = 追加到已有数据集；false = 新建（会先问一遍再删）
   use_videos: true
   video_codec: h264_nvenc     # 没有 NVENC 就换 libsvtav1
-  # 关闭流式编码：PyAV 打开编码器时不释放 GIL（nvenc 首帧 ~400ms/相机），
-  # 会让遥操作线程在每集开头停顿 1~2 秒。关掉后改为存集时用独立进程编码。
   streaming_encoding: false
   encoder_threads: 4
   data_flush_every: 10        # 每 N 集把 parquet footer 落盘

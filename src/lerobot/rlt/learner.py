@@ -32,6 +32,32 @@ from lerobot.policies.rlt import ChunkActor, OnlineRLConfig, RLTAgent
 from .replay_buffer import ChunkReplayBuffer
 
 
+def burst_size(
+    pending: int, utd: int, max_updates_per_burst: int, warmup_deficit: int = 0
+) -> tuple[int, int]:
+    """How many gradient steps to run now, and how many transitions that spends.
+
+    Two regimes share this. Normally the learner is paced by UTD against what
+    the rollout has actually stored. During warmup it may additionally owe
+    `warmup_deficit` steps (openpi-RLT `warmup_post_collect_updates`), and those
+    are *not* charged against a transition: the point of that phase is to fit
+    the critic on the data already collected, so once the UTD budget runs dry
+    the learner keeps grinding on the same rows. Leaving `_consumed` untouched
+    there is what preserves the `updates == utd * total_added` invariant for the
+    online phase that follows.
+    """
+    if pending > 0:
+        # Cap in *transitions*, not updates: crediting a partial transition
+        # would break that invariant, and the leftover is picked up next round.
+        if max_updates_per_burst > 0 and utd > 0:
+            pending = min(pending, max(1, max_updates_per_burst // utd))
+        return int(utd * pending), pending
+    if warmup_deficit > 0:
+        capped = min(warmup_deficit, max_updates_per_burst) if max_updates_per_burst > 0 else warmup_deficit
+        return int(capped), 0
+    return 0, 0
+
+
 class ActorMirror:
     """Read-only actor copy used by the rollout thread."""
 
@@ -83,11 +109,11 @@ class LearnerThread(threading.Thread):
         self._published: dict[str, torch.Tensor] = {}
         self._version = 0
         self._error: BaseException | None = None
-        # Warmup collects with the base VLA. The critic should still learn from
-        # that data (it is exactly the "initial learning signal" the paper wants
-        # from warmup); only the actor waits until there is a critic worth
-        # maximising.
-        self.allow_actor_updates = False
+        # Warmup collects with the base VLA. Both networks keep training on it —
+        # the actor is not frozen, it just runs on the warmup BC/Q weight pair,
+        # which leans on imitation while the critic is still worthless
+        # (openpi-RLT `trainer.py::_resolve_actor_loss_weights`).
+        self.warmup = True
 
         self._consumed = 0  # transitions already accounted for by the UTD pacer
         self.updates = 0
@@ -106,6 +132,11 @@ class LearnerThread(threading.Thread):
     def published_actor(self) -> tuple[dict[str, torch.Tensor], int]:
         with self._lock:
             return self._published, self._version
+
+    def warmup_deficit(self) -> int:
+        if not self.warmup:
+            return 0
+        return max(self.cfg.warmup_post_collect_updates - self.updates, 0)
 
     # --------------------------------------------------------------- stats
     def metrics(self) -> dict[str, float]:
@@ -171,25 +202,26 @@ class LearnerThread(threading.Thread):
             # UTD is defined per *transition*, so pace against what the rollout
             # thread actually stored rather than against a nominal chunk length
             # (chunks end early on success or truncation).
-            pending = self.buffer.total_added - self._consumed
-            if len(self.buffer) < cfg.batch_size or pending <= 0:
+            n_updates, consumed = burst_size(
+                self.buffer.total_added - self._consumed,
+                cfg.utd,
+                self.max_updates_per_burst,
+                self.warmup_deficit(),
+            )
+            if len(self.buffer) < cfg.batch_size or n_updates <= 0:
                 time.sleep(self.idle_sleep_s)
                 continue
 
-            # Cap in *transitions*, not updates: crediting a partial transition
-            # would break the `total updates == utd * total transitions`
-            # invariant, and the leftover is simply picked up next iteration.
-            if self.max_updates_per_burst > 0 and cfg.utd > 0:
-                pending = min(pending, max(1, self.max_updates_per_burst // cfg.utd))
-            n_updates = int(cfg.utd * pending)
-            self._consumed += pending
+            self._consumed += consumed
             for _ in range(n_updates):
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
                 batch = self.buffer.sample(cfg.batch_size)
                 if batch is None:  # operator discarded the episode mid-burst
                     break
-                metrics = self.agent.update(batch, allow_actor=self.allow_actor_updates)
+                metrics = self.agent.update(batch, warmup=self.warmup)
+                if cfg.diagnostics_every > 0 and self.updates % cfg.diagnostics_every == 0:
+                    metrics |= self.agent.diagnostics(batch)
                 self._recent.append(metrics)
                 self.updates += 1
                 self._publish()

@@ -35,21 +35,35 @@ from lerobot.rl.learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerSer
 from lerobot.transport import services_pb2_grpc
 from lerobot.transport.utils import MAX_MESSAGE_SIZE
 
+from ..learner import burst_size
 from ..replay_buffer import ChunkReplayBuffer
-from .messages import CHUNK, DISCARD, END, START, bytes_to_ops, params_to_bytes, record_from_op
+from .messages import (
+    CHUNK,
+    DISCARD,
+    END,
+    START,
+    bytes_to_ops,
+    params_to_bytes,
+    record_from_op,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def apply_op(buffer: ChunkReplayBuffer, op: dict) -> int:
-    """Replay one buffer op. Returns transitions dropped (only ever from discard)."""
+    """Replay one buffer op. Returns steps dropped (only ever from discard)."""
     kind = op["kind"]
     if kind == START:
-        buffer.start_episode()
+        buffer.start_episode(warmup=bool(op.get("warmup", False)))
     elif kind == CHUNK:
         buffer.add_chunk(record_from_op(op))
     elif kind == END:
-        buffer.end_episode(op.get("x_last"))
+        buffer.end_episode(
+            op.get("x_last"),
+            op.get("ref_last"),
+            success=bool(op.get("success", False)),
+            truncation_is_failure=bool(op.get("truncation_is_failure", False)),
+        )
     elif kind == DISCARD:
         return buffer.discard_episode()
     else:
@@ -79,6 +93,10 @@ class RemoteLearner:
         self.max_updates_per_burst = max_updates_per_burst
         self.save_every_updates = save_every_updates
 
+        # This object is constructed inside a spawned process. The parent's
+        # `torch.manual_seed(cfg.seed)` state is not a reproducible contract
+        # across spawn, so seed before creating actor/critic/targets here.
+        torch.manual_seed(seed)
         self.agent = RLTAgent(cfg, device=device)
         self.buffer = ChunkReplayBuffer(
             capacity=cfg.buffer_capacity,
@@ -91,9 +109,11 @@ class RemoteLearner:
             seed=seed,
             sample_strategy=cfg.sample_strategy,
             recent_episode_window=cfg.recent_episode_window,
-            recent_ratio=cfg.recent_ratio,
-            human_ratio=cfg.human_ratio,
-            reward_ratio=cfg.reward_ratio,
+            recent_online_ratio=cfg.recent_online_ratio,
+            warmup_demo_ratio=cfg.warmup_demo_ratio,
+            human_intervention_ratio=cfg.human_intervention_ratio,
+            aligned_ratio=cfg.aligned_ratio,
+            human_ref_override=cfg.human_ref_override,
         )
         if resume_buffer:
             self.buffer.load(resume_buffer)
@@ -102,10 +122,11 @@ class RemoteLearner:
         self.updates = 0
         self._consumed = 0
         self._last_metrics: dict[str, float] = {}
-        # Warmup collects with the base VLA; the critic learns from it, the
-        # actor waits. The rollout owns that decision, so it rides along with
-        # the ops rather than being recomputed here.
-        self.allow_actor_updates = False
+        self._diagnostics: dict[str, float] = {}
+        # Warmup collects with the base VLA and selects the actor's BC/Q weight
+        # pair. The rollout owns that decision, so it rides along with the ops
+        # rather than being recomputed here.
+        self.warmup = True
 
     # ----------------------------------------------------------------- ops
     def drain_ops(self, transition_queue: queue.Queue, budget: int = 64) -> None:
@@ -116,34 +137,39 @@ class RemoteLearner:
                 return
             for op in bytes_to_ops(payload):
                 if "warmup" in op:
-                    self.allow_actor_updates = not op["warmup"]
+                    self.warmup = bool(op["warmup"])
                 dropped = apply_op(self.buffer, op)
                 if dropped:
-                    logger.info("[learner] operator discarded %d transitions", dropped)
+                    logger.info("[learner] operator discarded %d steps", dropped)
 
     # ------------------------------------------------------------ updates
     def train_burst(self) -> int:
         cfg = self.cfg
-        pending = self.buffer.total_added - self._consumed
-        if len(self.buffer) < cfg.batch_size or pending <= 0:
+        deficit = max(cfg.warmup_post_collect_updates - self.updates, 0) if self.warmup else 0
+        n_updates, consumed = burst_size(
+            self.buffer.total_added - self._consumed,
+            cfg.utd,
+            self.max_updates_per_burst,
+            deficit,
+        )
+        if len(self.buffer) < cfg.batch_size or n_updates <= 0:
             return 0
-        if self.max_updates_per_burst > 0 and cfg.utd > 0:
-            pending = min(pending, max(1, self.max_updates_per_burst // cfg.utd))
-        n_updates = int(cfg.utd * pending)
-        self._consumed += pending
+        self._consumed += consumed
 
         for _ in range(n_updates):
             batch = self.buffer.sample(cfg.batch_size)
             if batch is None:  # operator discarded the episode mid-burst
                 break
-            self._last_metrics = self.agent.update(
-                batch, allow_actor=self.allow_actor_updates
-            )
+            self._last_metrics = self.agent.update(batch, warmup=self.warmup)
+            if cfg.diagnostics_every > 0 and self.updates % cfg.diagnostics_every == 0:
+                self._diagnostics = self.agent.diagnostics(batch)
             self.updates += 1
         return n_updates
 
     def stats(self) -> dict[str, float]:
-        out = dict(self._last_metrics)
+        # The rollout process has no buffer and no agent, so everything it logs
+        # has to ride back on the parameter stream.
+        out = {**self._last_metrics, **self._diagnostics, **self.buffer.composition()}
         out["updates"] = float(self.updates)
         out["buffer"] = float(len(self.buffer))
         out["total_added"] = float(self.buffer.total_added)

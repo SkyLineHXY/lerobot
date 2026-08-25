@@ -24,6 +24,12 @@ from ..config import TeleoperatorConfig
 # disables the channel. `lerobot-find-gamepad` prints these live so a layout can
 # be checked without launching a whole collection run.
 #
+# The signs below are in the robot base frame, which is also how the env reads
+# the assembled command. RLT's sim teleop can reinterpret the same channels in
+# the end-effector frame instead (`teleop.frame=tcp`, see rlt/teleop/frames.py);
+# the bindings do not change, but delta_z then runs along the tool's approach
+# axis and delta_x/delta_y span the plane across it.
+#
 # The signs below are in the robot base frame: stick-up is +x, stick-left is +y,
 # right-trigger is +z. Note that this is *not* the same as pushing the gripper
 # around the screen. LIBERO displays agentview as `img[::-1, ::-1]`, which leaves
@@ -34,8 +40,8 @@ from ..config import TeleoperatorConfig
 # two translation channels rather than the rotations:
 #   bindings: {delta_x: lefty, delta_y: -leftx}
 DEFAULT_GAMEPAD_BINDINGS: dict[str, str] = {
-    "delta_x": "-lefty",
-    "delta_y": "leftx",
+    "delta_x": "leftx",
+    "delta_y": "-lefty",
     "delta_z": "righttrigger-lefttrigger",
     "delta_roll": "dpright-dpleft",
     "delta_pitch": "-righty",

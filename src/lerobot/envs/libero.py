@@ -260,6 +260,11 @@ class LiberoEnv(gym.Env):
         self.init_state_id = self.episode_index
         self._env = self._make_envs_task(task_suite, task_id)
 
+    @property
+    def eef_rotation_matrix(self) -> np.ndarray:
+        """Base-frame orientation of the TCP, the frame `teleop.frame="tcp"` maps from."""
+        return np.asarray(self._env.robots[0].controller.ee_ori_mat, dtype=np.float64)
+
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         images = {}
         for camera_name in self.camera_name:

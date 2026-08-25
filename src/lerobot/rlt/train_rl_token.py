@@ -7,7 +7,7 @@ minimize the autoregressive reconstruction loss L_ro on task demos; with
 Configuration is a draccus YAML tree (see `examples/rlt/`); any field can be
 overridden on the command line:
 
-  python -m lerobot.rlt.train_rl_token --config_path examples/rlt/rl_token.yaml \
+  python -m lerobot.rlt.train_rl_token --config_path examples/rlt/_templates/rl_token.yaml \
     --dataset_root ~/data/lerobot/libero_10 --rl_token.steps 8000
 """
 import time
@@ -22,15 +22,65 @@ from lerobot.policies.rlt import (
     SmolVLAPrefixExtractor,
     load_smolvla_policy,
 )
+from lerobot.rlt.metrics import make_wandb_logger
 
 
-def build_dataset_and_processors(policy_config, dataset_repo: str, dataset_root: str | None):
+def select_task_episode_indices(
+    meta,
+    task_index: int | None,
+    episode_start: int = 0,
+    num_episodes: int | None = None,
+) -> list[int] | None:
+    """Resolve a dataset task id to episode ids without decoding any frames."""
+    if episode_start < 0 or (num_episodes is not None and num_episodes <= 0):
+        raise ValueError("dataset episode start must be >=0 and count must be >0")
+    if task_index is None and episode_start == 0 and num_episodes is None:
+        return None
+    if task_index is None:
+        episodes = [int(ep["episode_index"]) for ep in meta.episodes]
+    else:
+        names = {
+            str(name)
+            for name, row in meta.tasks.iterrows()
+            if int(row["task_index"]) == task_index
+        }
+        if not names:
+            available = sorted(int(v) for v in meta.tasks["task_index"].tolist())
+            raise ValueError(f"dataset task_index {task_index} is absent; available={available}")
+        episodes = [
+            int(ep["episode_index"])
+            for ep in meta.episodes
+            if names.intersection(str(task) for task in ep["tasks"])
+        ]
+    if not episodes:
+        raise ValueError(f"dataset task_index {task_index} has no episodes")
+    stop = None if num_episodes is None else episode_start + num_episodes
+    selected = episodes[episode_start:stop]
+    if not selected:
+        raise ValueError(
+            f"dataset episode slice [{episode_start}:{stop}] is empty after task filtering "
+            f"({len(episodes)} episodes available)"
+        )
+    return selected
+
+
+def build_dataset_and_processors(
+    policy_config,
+    dataset_repo: str,
+    dataset_root: str | None,
+    dataset_task_index: int | None = None,
+    dataset_episode_start: int = 0,
+    dataset_num_episodes: int | None = None,
+):
     from lerobot.configs.types import FeatureType
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.datasets.utils import dataset_to_policy_features
     from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
     meta = LeRobotDatasetMetadata(dataset_repo, root=dataset_root)
+    episodes = select_task_episode_indices(
+        meta, dataset_task_index, dataset_episode_start, dataset_num_episodes
+    )
     features = dataset_to_policy_features(meta.features)
     output_features = {k: f for k, f in features.items() if f.type is FeatureType.ACTION}
     input_features = {k: f for k, f in features.items() if k not in output_features}
@@ -47,7 +97,11 @@ def build_dataset_and_processors(policy_config, dataset_repo: str, dataset_root:
             delta_timestamps[k] = [i / meta.fps for i in policy_config.action_delta_indices]
 
     dataset = LeRobotDataset(
-        dataset_repo, root=dataset_root, delta_timestamps=delta_timestamps, video_backend="pyav"
+        dataset_repo,
+        root=dataset_root,
+        episodes=episodes,
+        delta_timestamps=delta_timestamps,
+        video_backend="pyav",
     )
     return dataset, preprocessor, postprocessor
 
@@ -92,12 +146,24 @@ def save_finetuned_vla(out_dir, policy, preprocessor, postprocessor) -> None:
 def train(train_cfg: RLTokenTrainConfig):
     device = train_cfg.device
     cfg = train_cfg.rl_token
+    torch.manual_seed(train_cfg.seed)
+    wb = make_wandb_logger(train_cfg, job_type="rlt_token", step_key="step")
 
     print(f"[stage1] loading SmolVLA from {train_cfg.checkpoint} ...")
     policy = load_smolvla_policy(train_cfg.checkpoint, device=device, dtype=train_cfg.dtype)
     dataset, preprocessor, postprocessor = build_dataset_and_processors(
-        policy.config, train_cfg.dataset, train_cfg.dataset_root
+        policy.config,
+        train_cfg.dataset,
+        train_cfg.dataset_root,
+        train_cfg.dataset_task_index,
+        train_cfg.dataset_episode_start,
+        train_cfg.dataset_num_episodes,
     )
+    if dataset.episodes is not None:
+        print(
+            f"[stage1] task {train_cfg.dataset_task_index}: "
+            f"{dataset.num_episodes} episodes, {dataset.num_frames} frames"
+        )
     extractor = SmolVLAPrefixExtractor(policy)
     finetune_vla = cfg.vla_sft_alpha > 0
     policy.requires_grad_(finetune_vla)
@@ -179,6 +245,13 @@ def train(train_cfg: RLTokenTrainConfig):
 
         if step % train_cfg.log_freq == 0 or step == 1:
             speed = step / (time.time() - t0)
+            # Teacher forcing lets the decoder solve M-1 of M positions without
+            # reading z_rl, so L_ro alone cannot tell a working run from a
+            # collapsed one. This is the probe that can.
+            log |= rl_token.bottleneck_usage(z, mask)
+            log["lr"] = sched.get_last_lr()[0]
+            log["it_per_s"] = speed
+            wb.log({f"stage1/{k}": v for k, v in log.items()}, step)
             msg = " ".join(f"{k}={v:.5f}" for k, v in log.items())
             print(f"[stage1] step {step}/{cfg.steps} {msg} ({speed:.2f} it/s)", flush=True)
 
@@ -187,6 +260,7 @@ def train(train_cfg: RLTokenTrainConfig):
             if finetune_vla:
                 save_finetuned_vla(out_dir / "smolvla_sft", policy, preprocessor, postprocessor)
 
+    wb.finish()
     print(f"[stage1] done; saved to {out_dir / 'rl_token.pt'}")
 
 @parser.wrap()
@@ -196,4 +270,3 @@ def main(cfg: RLTokenTrainConfig):
 
 if __name__ == "__main__":
     main()
-

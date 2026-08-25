@@ -12,8 +12,9 @@ import queue
 import pytest
 import torch
 
+from lerobot.policies.rlt import ActorCriticConfig, OnlineRLConfig, TransitionSource
 from lerobot.rlt.distributed.client import RemoteBufferSink
-from lerobot.rlt.distributed.learner_proc import apply_op
+from lerobot.rlt.distributed.learner_proc import RemoteLearner, apply_op
 from lerobot.rlt.distributed.messages import (
     bytes_to_ops,
     bytes_to_params,
@@ -24,7 +25,13 @@ from lerobot.rlt.distributed.messages import (
 from lerobot.rlt.replay_buffer import ChunkRecord, ChunkReplayBuffer
 
 C, D, X_DIM = 4, 6, 12
-FIELDS = ("x", "action", "ref", "reward_disc", "x_next", "ref_next", "done", "actual_steps")
+FIELDS = (
+    "x", "action", "ref", "rewards", "x_next", "ref_next", "done", "mc_return",
+    "intervention",
+)
+INT_FIELDS = (
+    "source_chunk", "source", "phase", "success", "episode_id", "mc_valid", "aligned",
+)
 
 
 def _buffer(capacity=256):
@@ -39,13 +46,35 @@ def _buffer(capacity=256):
     )
 
 
-def _record(seed: int, done=False):
+def test_remote_learner_initialisation_uses_the_configured_seed(tmp_path):
+    ac = ActorCriticConfig(
+        chunk_len=C,
+        action_dim=D,
+        proprio_dim=4,
+        rl_token_dim=X_DIM - 4,
+        hidden_dim=16,
+    )
+    cfg = OnlineRLConfig(ac=ac, device="cpu", buffer_capacity=16, batch_size=4)
+    a = RemoteLearner(cfg, tmp_path / "a", X_DIM, "cpu", seed=7)
+    b = RemoteLearner(cfg, tmp_path / "b", X_DIM, "cpu", seed=7)
+    c = RemoteLearner(cfg, tmp_path / "c", X_DIM, "cpu", seed=8)
+
+    sa, sb, sc = a.agent.actor.state_dict(), b.agent.actor.state_dict(), c.agent.actor.state_dict()
+    assert all(torch.equal(sa[k], sb[k]) for k in sa)
+    assert any(not torch.equal(sa[k], sc[k]) for k in sa)
+
+
+def _record(seed: int, base=0, done=False, source=int(TransitionSource.RL)):
     g = torch.Generator().manual_seed(seed)
+    offsets = [o for o in range(C) if (base + o) % 2 == 0]
     return ChunkRecord(
-        xs=torch.randn(C // 2, X_DIM, generator=g),
+        xs=torch.randn(len(offsets), X_DIM, generator=g),
+        x_offsets=torch.tensor(offsets, dtype=torch.long),
+        refs=torch.randn(len(offsets), C, D, generator=g),
+        aligned=torch.tensor([o == 0 for o in offsets], dtype=torch.bool),
         actions=torch.randn(C, D, generator=g),
         rewards=torch.zeros(C),
-        ref_full=torch.randn(2 * C, D, generator=g),
+        source=source,
         done=done,
     )
 
@@ -64,6 +93,9 @@ def _assert_buffers_equal(a: ChunkReplayBuffer, b: ChunkReplayBuffer):
     for name in FIELDS:
         left, right = getattr(a, name)[: len(a)], getattr(b, name)[: len(b)]
         assert torch.allclose(left, right), f"字段 {name} 不一致"
+    for name in INT_FIELDS:
+        left, right = getattr(a, name)[: len(a)], getattr(b, name)[: len(b)]
+        assert torch.equal(left, right), f"字段 {name} 不一致"
 
 
 @pytest.mark.parametrize("with_discard", [False, True])
@@ -78,15 +110,20 @@ def test_op_stream_matches_the_in_process_buffer(with_discard):
         getattr(local, fn_name)(*args)
         getattr(sink, fn_name)(*args)
 
-    both("start_episode")
+    x_last, ref_last = torch.randn(X_DIM), torch.randn(C, D)
+
+    both("start_episode", True)
     for i in range(4):
-        both("add_chunk", _record(i))
+        both("add_chunk", _record(i, base=i * C))
     if with_discard:
         both("discard_episode")
-    both("start_episode")
+    else:
+        both("end_episode", x_last, ref_last, False)
+    both("start_episode", False)
     for i in range(4, 8):
-        both("add_chunk", _record(i))
-    both("add_chunk", _record(99, done=True))
+        both("add_chunk", _record(i, base=(i - 4) * C, source=int(TransitionSource.HUMAN)))
+    both("add_chunk", _record(99, base=4 * C, done=True))
+    both("end_episode", x_last, ref_last, True)
 
     for op in _drain(op_queue):
         apply_op(remote, op)
@@ -100,13 +137,13 @@ def test_truncation_carries_the_real_next_state():
     local, remote = _buffer(), _buffer()
     op_queue: queue.Queue = queue.Queue()
     sink = RemoteBufferSink(op_queue)
-    x_last = torch.randn(X_DIM)
+    x_last, ref_last = torch.randn(X_DIM), torch.randn(C, D)
 
     for buf in (local, sink):
         buf.start_episode()
-        buf.add_chunk(_record(1))
-        buf.add_chunk(_record(2))
-        buf.end_episode(x_last)
+        buf.add_chunk(_record(1, base=0))
+        buf.add_chunk(_record(2, base=C))
+        buf.end_episode(x_last, ref_last)
 
     for op in _drain(op_queue):
         apply_op(remote, op)
@@ -116,8 +153,7 @@ def test_truncation_carries_the_real_next_state():
 
 
 def test_record_survives_the_roundtrip():
-    rec = _record(7, done=True)
-    rec.done_step = 3
+    rec = _record(7, done=True, source=int(TransitionSource.HUMAN))
     op_queue: queue.Queue = queue.Queue()
     sink = RemoteBufferSink(op_queue)
     sink.start_episode()
@@ -126,22 +162,38 @@ def test_record_survives_the_roundtrip():
     ops = _drain(op_queue)
     back = record_from_op(ops[1])
     assert torch.allclose(back.xs, rec.xs)
+    assert torch.equal(back.x_offsets, rec.x_offsets)
     assert torch.allclose(back.actions, rec.actions)
-    assert torch.allclose(back.ref_full, rec.ref_full)
+    assert torch.allclose(back.refs, rec.refs)
+    assert torch.equal(back.aligned, rec.aligned)
     assert back.done is True
-    assert back.done_step == 3
-    assert back.n_executed == 3
+    assert back.source == int(TransitionSource.HUMAN)
 
 
-def test_done_step_none_roundtrips_as_none():
-    """done_step 在线上编码成 -1；解回来必须还是 None，否则 n_executed 会算错。"""
+def test_final_anchor_survives_the_wire():
+    """每个越界的 partial window 都拿它当 bootstrap，丢了整条尾巴就静默消失。"""
+    op_queue: queue.Queue = queue.Queue()
+    sink = RemoteBufferSink(op_queue)
+    x_last, ref_last = torch.randn(X_DIM), torch.randn(C, D)
+    sink.start_episode()
+    sink.add_chunk(_record(0))
+    sink.end_episode(x_last, ref_last)
+
+    end = [op for op in _drain(op_queue) if op["kind"] == "end"][0]
+    assert torch.allclose(end["x_last"], x_last)
+    assert torch.allclose(end["ref_last"], ref_last)
+
+
+def test_episode_end_carries_the_success_label():
+    """success 只进采样分层与统计，但丢了它 stratified 的 warmup/human 池会错位。"""
     op_queue: queue.Queue = queue.Queue()
     sink = RemoteBufferSink(op_queue)
     sink.start_episode()
     sink.add_chunk(_record(3))
-    back = record_from_op(_drain(op_queue)[1])
-    assert back.done_step is None
-    assert back.n_executed == C
+    sink.end_episode(torch.randn(X_DIM), torch.randn(C, D), success=True)
+    end = [op for op in _drain(op_queue) if op["kind"] == "end"][0]
+    assert end["success"] is True
+    assert "ref_last" in end
 
 
 def test_ops_decode_without_pickle():

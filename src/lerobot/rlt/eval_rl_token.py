@@ -29,9 +29,10 @@ need, on held-out episodes:
    as z_rl, the encoder has not learned anything the raw features lacked.
 
 Usage:
-  python -m lerobot.rlt.eval_rl_token --config_path examples/rlt/rl_token.yaml \
+  python -m lerobot.rlt.eval_rl_token --config_path examples/rlt/_templates/rl_token.yaml \
     --eval.n_episodes 20
 """
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -62,6 +63,9 @@ class RLTokenEvalOptions:
     ridge_lambda: float = 1.0
     max_frames: int = 4000
     seed: int = 0
+    # Optional machine-readable report.  `cfg.out` remains the directory from
+    # which the RL-token checkpoint and processors are loaded.
+    result_out: str | None = None
 
 
 @dataclass
@@ -143,6 +147,30 @@ def _report(name: str, z: Tensor, targets: dict[str, Tensor], split, episode, op
     return out
 
 
+def _episode_rows(dataset, n_episodes: int, max_frames: int):
+    """Return relative frame rows and episode ids using metadata only.
+
+    Reading ``hf_dataset["episode_index"]`` while an image transform is active
+    can decode every image in the dataset. Besides being extremely slow, it
+    made an all-task dataset silently pick the first episodes across unrelated
+    tasks. Stage-1 already records its selected episode list; metadata lengths
+    are sufficient to build the same relative index vector without touching a
+    pixel.
+    """
+    selected = (
+        list(dataset.episodes)
+        if dataset.episodes is not None
+        else list(range(dataset.meta.total_episodes))
+    )[:n_episodes]
+    by_id = {int(ep["episode_index"]): ep for ep in dataset.meta.episodes}
+    lengths = [int(by_id[ep]["length"]) for ep in selected]
+    ep_idx = torch.repeat_interleave(
+        torch.tensor(selected, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
+    )
+    n = min(len(ep_idx), max_frames)
+    return torch.arange(n), ep_idx[:n], by_id
+
+
 # ----------------------------------------------------------------- collection
 @torch.no_grad()
 def collect(cfg: RLTokenEvalConfig):
@@ -153,7 +181,12 @@ def collect(cfg: RLTokenEvalConfig):
     policy = load_smolvla_policy(cfg.checkpoint, device=device, dtype=cfg.dtype)
     policy.eval()
     dataset, preprocessor, _ = build_dataset_and_processors(
-        policy.config, cfg.dataset, cfg.dataset_root
+        policy.config,
+        cfg.dataset,
+        cfg.dataset_root,
+        cfg.dataset_task_index,
+        cfg.dataset_episode_start,
+        cfg.dataset_num_episodes,
     )
     extractor = SmolVLAPrefixExtractor(policy)
 
@@ -169,10 +202,7 @@ def collect(cfg: RLTokenEvalConfig):
 
     # Episode-level split, so the probes are never scored on frames adjacent to
     # ones they were fit on.
-    ep_idx = dataset.hf_dataset["episode_index"]
-    ep_idx = torch.as_tensor(ep_idx) if not isinstance(ep_idx, Tensor) else ep_idx
-    episodes = torch.unique(ep_idx)[: opt.n_episodes]
-    frame_ids = torch.nonzero(torch.isin(ep_idx, episodes)).flatten()[: opt.max_frames]
+    frame_ids, ep_idx, meta_by_id = _episode_rows(dataset, opt.n_episodes, opt.max_frames)
     # `max_frames` truncates from the front, so it can cut the tail episodes off
     # entirely. Re-derive the episode list from what actually survived, or the
     # split below hands every frame to the fit set and every probe returns NaN.
@@ -184,7 +214,7 @@ def collect(cfg: RLTokenEvalConfig):
             "the probes need at least two to split on. Raise max_frames."
         )
 
-    ep_len = {int(e): int((ep_idx == e).sum()) for e in episodes}
+    ep_len = {int(e): int(meta_by_id[int(e)]["length"]) for e in episodes}
 
     z_rl_all, z_pool_all, state_all, action_all, prog_all, ep_all = [], [], [], [], [], []
     recon_errs = []
@@ -232,6 +262,7 @@ def collect(cfg: RLTokenEvalConfig):
         "episode": torch.cat(ep_all),
         "recon": sum(recon_errs) / len(recon_errs),
         "episodes": episodes,
+        "checkpoint_step": int(ckpt.get("step", -1)),
     }
 
 
@@ -311,6 +342,21 @@ def evaluate(cfg: RLTokenEvalConfig) -> dict:
         print("        cannot discriminate situations, dQ/da goes flat and the actor stalls.")
         print("        Try a wider d_model, or drop_language_tokens=true to stop spending")
         print("        capacity on the instruction embedding.")
+
+    results["metadata"] = {
+        "checkpoint_dir": cfg.out,
+        "checkpoint_step": data["checkpoint_step"],
+        "dataset_task_index": cfg.dataset_task_index,
+        "dataset_episode_start": cfg.dataset_episode_start,
+        "dataset_num_episodes": cfg.dataset_num_episodes,
+        "evaluated_episodes": int(n_eps),
+        "evaluated_frames": int(len(episode)),
+    }
+    if opt.result_out:
+        result_path = Path(opt.result_out)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(results, indent=2))
+        print(f"[eval] wrote {result_path}")
     return results
 
 

@@ -41,13 +41,16 @@ def _cfg():
     )
 
 
-def _record(seed: int, done=False):
+def _record(seed: int, base=0, done=False):
     g = torch.Generator().manual_seed(seed)
+    offsets = [o for o in range(C) if (base + o) % 2 == 0]
     return ChunkRecord(
-        xs=torch.randn(C // 2, X_DIM, generator=g),
+        xs=torch.randn(len(offsets), X_DIM, generator=g),
+        x_offsets=torch.tensor(offsets, dtype=torch.long),
+        refs=torch.randn(len(offsets), C, D, generator=g),
+        aligned=torch.tensor([o == 0 for o in offsets], dtype=torch.bool),
         actions=torch.randn(C, D, generator=g),
         rewards=torch.zeros(C),
-        ref_full=torch.randn(2 * C, D, generator=g),
         done=done,
     )
 
@@ -92,8 +95,9 @@ def test_ops_reach_the_learner_and_weights_come_back(tmp_path):
         sink.warmup = False
         sink.start_episode()
         for i in range(12):
-            sink.add_chunk(_record(i))
-        sink.add_chunk(_record(99, done=True))
+            sink.add_chunk(_record(i, base=i * C))
+        sink.add_chunk(_record(99, base=12 * C, done=True))
+        sink.end_episode(torch.randn(X_DIM), torch.randn(C, D), success=True)
 
         # 等 learner 收到数据并真的做了梯度步
         deadline = time.time() + 60.0
@@ -108,14 +112,14 @@ def test_ops_reach_the_learner_and_weights_come_back(tmp_path):
         assert mirror.version > 0, "权重没推回来"
 
         # 权重确实在变，而不是一直发同一份初始快照
-        before = mirror.actor.state_dict()["net.0.weight"].clone()
+        before = mirror.actor.state_dict()["trunk.0.weight"].clone()
         changed_deadline = time.time() + 30.0
         while time.time() < changed_deadline:
             mirror.sync()
-            if not torch.allclose(before, mirror.actor.state_dict()["net.0.weight"]):
+            if not torch.allclose(before, mirror.actor.state_dict()["trunk.0.weight"]):
                 break
             time.sleep(0.1)
-        after = mirror.actor.state_dict()["net.0.weight"]
+        after = mirror.actor.state_dict()["trunk.0.weight"]
         assert not torch.allclose(before, after), "actor 权重一直没更新"
     finally:
         stop_client(threads, channel, client_shutdown)

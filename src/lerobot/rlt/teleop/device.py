@@ -12,6 +12,13 @@ declares `action_names` in its own order. Matching them up by name means a
 with the channels the device lacks left at zero rather than shifted into the
 wrong slot.
 
+**Commands may be given in the tool frame.** `teleop.frame="tcp"` rotates the
+operator's translation and rotation triples by the current end-effector
+orientation before they are executed, so the stick keeps meaning the same thing
+relative to the tool no matter how the wrist has turned. The env still receives —
+and the buffer still stores — a base-frame action, so the frame is an operator
+setting, not a change of action space. See `frames.py`.
+
 **The takeover gate is the trainer's own keyboard listener, not the device's
 `get_teleop_events()`.** Routing takeover, success, failure and discard through
 `KeyboardEventListener` keeps those operator commands identical in sim and on
@@ -30,12 +37,16 @@ import torch
 from lerobot.teleoperators.utils import TeleopEvents
 
 from .base import InterventionManager, InterventionResult
+from .frames import (
+    POSITION_CHANNELS,
+    ROTATION_CHANNELS,
+    check_frame,
+    frame_triples,
+    tcp_to_base,
+)
 from .keys import KeyboardEventListener
 
 logger = logging.getLogger(__name__)
-
-POSITION_CHANNELS = ("delta_x", "delta_y", "delta_z")
-ROTATION_CHANNELS = ("delta_roll", "delta_pitch", "delta_yaw")
 
 # LeRobot teleoperators encode the gripper as GripperAction: 0 close, 1 stay,
 # 2 open. robosuite wants a continuous command where -1 opens and +1 closes.
@@ -55,6 +66,7 @@ class DeviceIntervention(InterventionManager):
         gripper_open_value: float = -1.0,
         gripper_close_value: float = 1.0,
         use_device_events: bool = False,
+        frame: str = "base",
     ):
         self.teleop = teleop
         self.env = env
@@ -88,6 +100,8 @@ class DeviceIntervention(InterventionManager):
                 "Teleop channels %s have no matching env action; they are ignored.",
                 self._unmapped,
             )
+        self.frame = check_frame(frame, env)
+        self._frame_triples = frame_triples(self.action_names) if self.frame == "tcp" else []
         self._gripper_idx = (
             self.action_names.index("gripper") if "gripper" in self.action_names else None
         )
@@ -126,6 +140,8 @@ class DeviceIntervention(InterventionManager):
                 vec[i] = float(raw.get(name, 0.0)) * self.rotation_scale
             else:
                 vec[i] = float(raw.get(name, 0.0))
+        if self._frame_triples:
+            vec = tcp_to_base(vec, self._frame_triples, self.env.eef_rotation_matrix)
         return vec
 
     def _gripper_value(self, command: float) -> float:
@@ -249,4 +265,5 @@ def build_sim_intervention(cfg, env, keys: KeyboardEventListener) -> DeviceInter
         position_scale=cfg.position_scale,
         rotation_scale=cfg.rotation_scale,
         use_device_events=cfg.use_device_events,
+        frame=cfg.frame,
     )

@@ -7,10 +7,14 @@ This closes the two gaps that make `MockManipEnv` unusable on hardware:
    preprocessor, and actions must come back through the same postprocessor,
    that stage 1 was trained with. Loading both from the stage-1 output
    directory is what keeps z_rl and the reference chunks consistent.
-2. **Motion limits.** Piper takes absolute joint targets. Every commanded step
-   is rate-limited against the arm's measured position, and the whole chunk is
-   scaled down rather than clipped per joint, so limiting never distorts the
-   direction of a motion.
+2. **Motion limits and the command path.** Piper takes absolute joint targets,
+   and in position mode every one of them is a position *step* whose size is
+   set by the command period. `PiperCommandStreamer` therefore owns the bus on
+   its own thread: the chunk loop only names a target, so the arm keeps being
+   commanded across a chunk boundary instead of freezing for the length of a
+   VLM forward. Limiting is a slew rate in rad/s anchored on the last command,
+   and scales the whole vector rather than clipping per joint, so it never
+   distorts the direction of a motion.
 
 Proprioception is position *and* velocity (paper App. B); velocity is obtained
 by finite differences of the measured joints, since the Piper bus exposes
@@ -19,14 +23,15 @@ positions only.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import deque
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from lerobot.utils.constants import OBS_STATE
-from lerobot.utils.robot_utils import precise_sleep
 
 from ..teleop.base import InterventionManager, InterventionResult
 from ..teleop.keys import KeyboardEventListener
@@ -130,6 +135,242 @@ class JointSlewLimiter:
         return limited, saturated
 
 
+class PiperCommandStreamer:
+    """Command the follower from its own thread, at its own rate.
+
+    In position mode every command is a position step whose size is set by the
+    command *period*, so bolting the command rate to the chunk loop makes the
+    arm both coarse and — worse — silent for the whole of a chunk boundary,
+    which on this stack is a VLM forward plus a flow-matching sample long. The
+    operator feels that as a notch at every boundary of a takeover, and the
+    correction they were in the middle of gets recorded as a stall followed by
+    a rate-limited catch-up.
+
+    Streaming separates the two clocks: the chunk loop only ever *names* a
+    target, and the arm keeps being commanded while that loop is off doing
+    inference. During a takeover the streamer is driven by the leader's own
+    feedback timestamps instead, so the operator's hand reaches the follower at
+    the leader's ~188 Hz without passing through the chunk loop at all.
+
+    The frame-skipping rules and the timestamp pacing come from
+    `scripts/lerobot_record_piper.py` (`ArmPair.send` / `_teleop_loop`), where
+    they were measured on hardware. That module keeps its own copy on purpose:
+    it is validated collection code, and sharing an abstraction with the online
+    RL path would put a robot run at risk to save a few lines.
+    """
+
+    def __init__(
+        self,
+        bus,
+        *,
+        max_joint_vel_rad_s: float,
+        max_lead_rad: float = 0.5,
+        stream_hz: float = 250.0,
+        idle_poll_s: float = 0.001,
+        joint_deadband_rad: float = 0.0,
+        gripper_deadband: int = 200,
+        mode_refresh_interval_s: float = 1.0,
+        move_speed_ratio: int = 60,
+        dry_run: bool = False,
+    ):
+        self.bus = bus
+        self.limiter = JointSlewLimiter(max_joint_vel_rad_s, max_lead_rad)
+        self.stream_hz = stream_hz
+        self.idle_poll_s = idle_poll_s
+        self.joint_deadband_rad = joint_deadband_rad
+        self.gripper_deadband = gripper_deadband
+        self.mode_refresh_interval_s = mode_refresh_interval_s
+        self.move_speed_ratio = move_speed_ratio
+        # 0xAD matches `PiperMotorsBus.write`. Changing it changes the
+        # follower's dynamics; do not touch it without a hardware run.
+        self.can_mit_flag = 0xAD
+        self.dry_run = dry_run
+
+        self._lock = threading.Lock()
+        self._target: np.ndarray | None = None
+        self._leader_read = None
+        self._leader_timestamp = None
+        self._last_command: np.ndarray | None = None
+        self._last_measured: np.ndarray | None = None
+
+        self._last_mode_refresh = -1e9
+        self._last_joints: np.ndarray | None = None
+        self._last_gripper: int | None = None
+        self._last_leader_ts = -1.0
+        self._warned_no_timestamp = False
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+        self.periods: deque[float] = deque(maxlen=512)
+        self.saturated: deque[bool] = deque(maxlen=512)
+
+    # ---------------------------------------------------------------- state
+    def read_joints(self) -> np.ndarray:
+        """The follower's measured pose, straight off the bus.
+
+        Deliberately not `robot.get_observation()`: that also grabs every
+        camera, and this runs a few hundred times a second.
+        """
+        return np.asarray(self.bus._read_joint_list(), dtype=np.float32)
+
+    @property
+    def last_command(self) -> np.ndarray | None:
+        """The last target actually issued to the arm, after slew limiting."""
+        with self._lock:
+            return None if self._last_command is None else self._last_command.copy()
+
+    def set_target(self, joints: np.ndarray) -> None:
+        with self._lock:
+            self._target = np.asarray(joints, dtype=np.float32).copy()
+
+    def follow_leader(self, read_target, timestamp) -> None:
+        """Drive from the leader arm until `follow_target` takes it back.
+
+        `timestamp` returns the leader's joint-feedback frame time so the loop
+        can run on new samples rather than on a clock; 0 means the SDK does not
+        provide one and the loop falls back to `stream_hz`.
+        """
+        with self._lock:
+            self._leader_read = read_target
+            self._leader_timestamp = timestamp
+            self._last_leader_ts = -1.0
+
+    def follow_target(self, seed: np.ndarray | None = None) -> None:
+        """Take the command path back from the leader.
+
+        `seed` replaces the stored target in the same critical section as the
+        source switch. Handing back without it would let one tick escape to the
+        target the policy left behind before the takeover.
+        """
+        with self._lock:
+            if seed is not None:
+                self._target = np.asarray(seed, dtype=np.float32).copy()
+            self._leader_read = None
+            self._leader_timestamp = None
+
+    def check(self) -> None:
+        """Re-raise a streamer failure on the caller's thread."""
+        exc, self._error = self._error, None
+        if exc is not None:
+            raise exc
+
+    # --------------------------------------------------------------- thread
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="piper-command-streamer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _run(self) -> None:
+        try:
+            self._loop()
+        except BaseException as exc:  # surfaced by `check()` on the control thread
+            self._error = exc
+
+    def _loop(self) -> None:
+        measured = self.read_joints()
+        self.limiter.reset(measured)
+        with self._lock:
+            if self._target is None:
+                self._target = measured.copy()
+        min_period = 1.0 / max(1e-6, self.stream_hz)
+        last_t = time.perf_counter()
+
+        while not self._stop.is_set():
+            target = self._next_target()
+            if target is None:  # leader has no new sample yet
+                time.sleep(self.idle_poll_s)
+                continue
+
+            now = time.perf_counter()
+            dt = now - last_t
+            if dt < min_period:
+                # `time.sleep`, never `precise_sleep`: the latter busy-waits its
+                # last 10 ms holding the GIL, which would throttle the very loop
+                # it is pacing — and the learner thread it shares the GIL with.
+                time.sleep(min_period - dt)
+                now = time.perf_counter()
+                dt = now - last_t
+            last_t = now
+
+            measured = self.read_joints()
+            limited, saturated = self.limiter(target, measured, dt)
+            if not self.dry_run:
+                self._send(limited)
+            with self._lock:
+                self._last_command = limited.copy()
+                self._last_measured = measured.copy()
+            self.periods.append(dt)
+            self.saturated.append(bool(saturated))
+
+    def _next_target(self) -> np.ndarray | None:
+        with self._lock:
+            read, timestamp, target = self._leader_read, self._leader_timestamp, self._target
+        if read is None:
+            return None if target is None else target.copy()
+
+        ts = float(timestamp() or 0.0) if timestamp is not None else 0.0
+        if ts:
+            if ts == self._last_leader_ts:
+                return None
+            self._last_leader_ts = ts
+        elif not self._warned_no_timestamp:
+            # Degrading quietly here looks exactly like a working streamer, so
+            # say it: without timestamps the loop cannot tell a new leader
+            # sample from a repeat and falls back to a fixed rate.
+            logger.warning(
+                "Leader feedback carries no timestamp; streaming at a fixed %.0f Hz "
+                "instead of on new samples.",
+                self.stream_hz,
+            )
+            self._warned_no_timestamp = True
+        return np.asarray(read(), dtype=np.float32)
+
+    def _send(self, joints: np.ndarray) -> None:
+        arm = self.bus.piper
+        factor = self.bus.joint_factor
+
+        now = time.perf_counter()
+        if now - self._last_mode_refresh >= self.mode_refresh_interval_s:
+            arm.MotionCtrl_2(0x01, 0x01, self.move_speed_ratio, self.can_mit_flag)
+            self._last_mode_refresh = now
+
+        # `joint_deadband_rad` defaults to 0 and should stay there. It compares
+        # against the last *commanded* target, so at streaming rates it
+        # quantizes slow continuous motion into steps: below
+        # deadband * stream_hz the arm waits for the budget to accumulate, and
+        # the operator feels that during exactly the slow, precise moves this
+        # whole thread exists to make smooth.
+        joints6 = np.asarray(joints[:6], dtype=np.float32)
+        if (
+            self._last_joints is None
+            or float(np.abs(joints6 - self._last_joints).max()) >= self.joint_deadband_rad
+        ):
+            arm.JointCtrl(*(round(float(j) * factor) for j in joints6))
+            self._last_joints = joints6.copy()
+
+        gripper = round(abs(float(joints[6])) * 1e6)
+        if self._last_gripper is None or abs(gripper - self._last_gripper) >= self.gripper_deadband:
+            arm.GripperCtrl(gripper, 1000, 0x01, 0)
+            self._last_gripper = gripper
+
+    # ---------------------------------------------------------------- report
+    def stats(self) -> dict[str, float]:
+        periods = [p for p in self.periods if p > 0]
+        return {
+            "hz": (len(periods) / sum(periods)) if periods else 0.0,
+            "saturation": (sum(self.saturated) / len(self.saturated)) if self.saturated else 0.0,
+        }
+
+
 def jitter_rms(traj: np.ndarray, dt: float) -> float:
     if traj.ndim != 2 or traj.shape[0] < 3:
         return float("nan")
@@ -203,7 +444,14 @@ class PiperChunkEnv:
         action_dim: int = 7,
         max_episode_steps: int = 400,
         control_hz: float = 30.0,
-        max_joint_step_rad: float = 0.05,
+        max_joint_vel_rad_s: float = 6.0,
+        max_lead_rad: float = 0.5,
+        stream_hz: float = 250.0,
+        idle_poll_s: float = 0.001,
+        joint_deadband_rad: float = 0.0,
+        gripper_deadband: int = 200,
+        mode_refresh_interval_s: float = 1.0,
+        move_speed_ratio: int = 60,
         reset_pose: list[float] | None = None,
         reset_noise_rad: float = 0.0,
         keys: KeyboardEventListener | None = None,
@@ -225,7 +473,6 @@ class PiperChunkEnv:
         self.max_episode_steps = max_episode_steps
         self.control_hz = control_hz
         self.dt = 1.0 / control_hz
-        self.max_joint_step_rad = max_joint_step_rad
         self.reset_pose = reset_pose
         self.reset_noise_rad = reset_noise_rad
         self.keys = keys or KeyboardEventListener()
@@ -236,10 +483,24 @@ class PiperChunkEnv:
         self._steps = 0
         self._last_joints: np.ndarray | None = None
         self._last_velocity = np.zeros(len(JOINT_ORDER), dtype=np.float32)
+        self._last_obs_t: float | None = None
         self._action_normalizer = ActionNormalizer(preprocessor, action_dim)
 
         if not self.robot.is_connected:
             self.robot.connect()
+
+        self.streamer = PiperCommandStreamer(
+            self.robot.bus,
+            max_joint_vel_rad_s=max_joint_vel_rad_s,
+            max_lead_rad=max_lead_rad,
+            stream_hz=stream_hz,
+            idle_poll_s=idle_poll_s,
+            joint_deadband_rad=joint_deadband_rad,
+            gripper_deadband=gripper_deadband,
+            mode_refresh_interval_s=mode_refresh_interval_s,
+            move_speed_ratio=move_speed_ratio,
+            dry_run=dry_run,
+        )
 
     # ------------------------------------------------------------ observation
     def _read_joints(self) -> np.ndarray:
@@ -248,10 +509,16 @@ class PiperChunkEnv:
 
     def _observe(self) -> dict:
         joints, raw = self._read_joints()
+        now = time.perf_counter()
+        # Measured, not nominal: a camera grab pushes the real period past
+        # `dt`, and dividing by the wrong number scales every velocity the
+        # actor and critic see.
+        dt = (now - self._last_obs_t) if self._last_obs_t is not None else self.dt
+        self._last_obs_t = now
         if self._last_joints is None:
             velocity = np.zeros_like(joints)
         else:
-            velocity = (joints - self._last_joints) / self.dt
+            velocity = (joints - self._last_joints) / max(dt, 1e-6)
         self._last_joints = joints
         self._last_velocity = velocity
         return {"joints": joints, "velocity": velocity, "raw": raw}
@@ -306,27 +573,31 @@ class PiperChunkEnv:
         out = self.postprocessor(action.detach().cpu().reshape(1, -1))
         return np.asarray(out[0].detach().cpu(), dtype=np.float32)[: len(JOINT_ORDER)]
 
-    def _rate_limit(self, target: np.ndarray, current: np.ndarray) -> np.ndarray:
-        limited, _saturated = rate_limit_joints(target, current, self.max_joint_step_rad)
-        return limited
-
     def apply_action(self, action: Tensor) -> tuple[dict, float, bool, bool]:
-        """Execute one normalized action; returns (obs, reward, done, truncated)."""
+        """Name one normalized action as the streamer's target.
+
+        This no longer writes to the bus. The streamer owns the command path so
+        that the arm keeps moving through a chunk boundary, and it also owns
+        rate limiting — in rad/s and anchored on the last command, which a
+        per-tick budget anchored on the measurement could not be.
+        """
         t0 = time.perf_counter()
+        self.streamer.check()
         target = self._normalized_to_joints(action)
-        current = self._last_joints if self._last_joints is not None else self._read_joints()[0]
-        target = self._rate_limit(target, current)
 
         if self.dry_run:
+            current = self._last_joints if self._last_joints is not None else self._read_joints()[0]
             logger.info(
                 "[dry-run] joint delta (rad): %s",
                 np.array2string(target[:6] - current[:6], precision=4),
             )
-        else:
-            self.robot.send_action(dict(zip(JOINT_ORDER, target.tolist(), strict=True)))
+        self.streamer.set_target(target)
 
-        precise_sleep(max(self.dt - (time.perf_counter() - t0), 0.0))
+        # Observe first, pad afterwards: the camera grab belongs inside the
+        # control period, not on top of it, or the loop silently runs slower
+        # than `control_hz` and every finite-difference velocity is wrong.
         obs = self._observe()
+        time.sleep(max(self.dt - (time.perf_counter() - t0), 0.0))
         self._steps += 1
 
         success, failure = self.keys.poll_outcome()
@@ -345,7 +616,7 @@ class PiperChunkEnv:
     def intervention_pending(self) -> bool:
         """Is the operator holding the leader right now? (cheap, non-blocking)
 
-        The rollout worker uses this to skip the VLA's flow-matching sampling
+        The rollout worker uses this to defer the VLA's flow-matching sampling
         for a chunk whose actions would be thrown away anyway — on hardware
         that sampling is dead time the operator has to wait through at every
         chunk boundary of a takeover.
@@ -360,11 +631,18 @@ class PiperChunkEnv:
             noise = self.rng.uniform(-self.reset_noise_rad, self.reset_noise_rad, size=6)
             target[:6] = [t + n for t, n in zip(target[:6], noise, strict=True)]
 
+        # The streamer and `move_to_joint_smoothly` are both writers on the same
+        # bus; stopping it here is what keeps the homing trajectory from
+        # fighting the last commanded target. It restarts seeded from wherever
+        # homing actually left the arm.
+        self.streamer.stop()
         if not self.dry_run:
             self.robot.bus.move_to_joint_smoothly(target)
+        self.streamer.start()
 
         self._steps = 0
         self._last_joints = None
+        self._last_obs_t = None
         self.keys.reset_episode_flags()
         self.keys.clear_intervention()
         obs = self._observe()
@@ -375,6 +653,10 @@ class PiperChunkEnv:
         return obs
 
     def close(self) -> None:
+        try:
+            self.streamer.stop()
+        except Exception:
+            logger.exception("stopping the command streamer failed")
         self.intervention.close()
         # `Piper.disconnect()` already runs `bus.safe_disconnect()`; calling it
         # here too would drive the arm to the safe pose twice.

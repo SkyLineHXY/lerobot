@@ -48,12 +48,12 @@ class DualPIPERConfig(RobotConfig):
                 width=320,
                 height=180,
             ),
-            "cam_right": RealSenseCameraConfig(
-                serial_number_or_name="241222073777",
-                fps=60,
-                width=320,
-                height=180,
-            ),
+            # "cam_right": RealSenseCameraConfig(
+            #     serial_number_or_name="241222073777",
+            #     fps=60,
+            #     width=320,
+            #     height=180,
+            # ),
             "cam_top": RealSenseCameraConfig(
                 serial_number_or_name="327122074756",
                 fps=60,

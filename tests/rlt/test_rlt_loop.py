@@ -7,9 +7,15 @@ RolloutWorker 的 chunk 组装与中间状态补算、干预路径、learner 线
 
 import time
 
+import pytest
 import torch
 
-from lerobot.policies.rlt import ActorCriticConfig, OnlineRLConfig, RLTAgent
+from lerobot.policies.rlt import (
+    ActorCriticConfig,
+    OnlineRLConfig,
+    RLTAgent,
+    TransitionSource,
+)
 from lerobot.rlt.envs.mock import MockManipEnv
 from lerobot.rlt.learner import ActorMirror, LearnerThread
 from lerobot.rlt.replay_buffer import ChunkReplayBuffer
@@ -20,11 +26,16 @@ C, D, PROPRIO, TOKEN = 4, 6, 6, 8
 X_DIM = TOKEN + PROPRIO
 
 
-def _cfg(**kw):
+def _cfg(residual_scale=0.0, **kw):
     ac = ActorCriticConfig(
-        chunk_len=C, action_dim=D, proprio_dim=PROPRIO, rl_token_dim=TOKEN, hidden_dim=16
+        chunk_len=C,
+        action_dim=D,
+        proprio_dim=PROPRIO,
+        rl_token_dim=TOKEN,
+        hidden_dim=16,
+        residual_scale=residual_scale,
     )
-    base = dict(ac=ac, device="cpu", batch_size=8, subsample_stride=2, utd=2)
+    base = {"ac": ac, "device": "cpu", "batch_size": 8, "subsample_stride": 2, "utd": 2}
     base.update(kw)
     return OnlineRLConfig(**base)
 
@@ -49,15 +60,21 @@ class StubController:
         b = state.shape[0]
         return torch.cat([state[:, :1].expand(b, TOKEN), state[:, :PROPRIO]], dim=-1)
 
-    def compute_x(self, batch):
+    def compute_x(self, batch, with_ref=False):
         self.n_compute_x += 1
-        return self._x(batch)
+        x = self._x(batch)
+        if not with_ref:
+            return x
+        return x, self._ref_full(x.shape[0])
+
+    def _ref_full(self, b):
+        return torch.full((b, 2 * self.chunk_len, self.action_dim), 0.25)
 
     def plan_chunk(self, batch, use_actor=True, deterministic=False):
         self.n_plans += 1
         x = self._x(batch)
         b = x.shape[0]
-        ref_full = torch.full((b, 2 * self.chunk_len, self.action_dim), 0.25)
+        ref_full = self._ref_full(b)
         ref = ref_full[:, : self.chunk_len]
         action = (
             self.agent.act(x, ref, deterministic=deterministic)
@@ -65,6 +82,79 @@ class StubController:
             else ref
         )
         return {"x": x, "ref_full": ref_full, "action_chunk": action}
+
+
+class DriftingPlanController(StubController):
+    """A controller whose plan is derived from the observation, like a real VLA.
+
+    `StubController` hands back the same constant chunk forever, so a stale
+    slice of an old plan and a freshly sampled one are numerically identical —
+    which is precisely why the mislabelled-reference bug survived the suite.
+    Here the plan is `seed(x) + [0, 1, 2, ...]`, so shifting an old plan forward
+    by k gives `seed(x_0) + k` where a fresh sample gives `seed(x_k)`.
+    """
+
+    def _plan(self, x):
+        steps = torch.arange(2 * self.chunk_len, dtype=torch.float32).view(1, -1, 1)
+        return (x[:, :1].unsqueeze(-1) + steps).expand(-1, -1, self.action_dim)
+
+    def compute_x(self, batch, with_ref=False):
+        self.n_compute_x += 1
+        x = self._x(batch)
+        return (x, self._plan(x)) if with_ref else x
+
+    def plan_chunk(self, batch, use_actor=True, deterministic=False):
+        self.n_plans += 1
+        x = self._x(batch)
+        ref_full = self._plan(x)
+        ref = ref_full[:, : self.chunk_len]
+        action = (
+            self.agent.act(x, ref, deterministic=deterministic)
+            if (use_actor and self.agent is not None)
+            else ref
+        )
+        return {"x": x, "ref_full": ref_full, "action_chunk": action}
+
+
+def test_every_anchor_stores_the_reference_belonging_to_its_own_state():
+    """存下来的参考必须是控制器在该 anchor 的状态上会给出的那一份。
+
+    子采样出来的 anchor 曾经复用 chunk 边界的计划、只做平移，于是 80% 的
+    transition 的参考是 VLA 的开环续写，而 `action` 里存的是下一次重新规划的结果
+    ——在真实 buffer 上两者逐元素差 0.41（参考本身的 std 只有 0.9）。
+    """
+    cfg = _cfg()
+    env = MockManipEnv(action_dim=D, max_episode_steps=40)
+    buffer = ChunkReplayBuffer(
+        capacity=256,
+        x_dim=X_DIM,
+        chunk_len=C,
+        action_dim=D,
+        discount=cfg.discount,
+        stride=cfg.subsample_stride,
+        device="cpu",
+    )
+    worker = RolloutWorker(env, DriftingPlanController(cfg), buffer, cfg.subsample_stride)
+    _run_episode(worker)
+
+    n = len(buffer)
+    assert n > 0
+    # `_x` 把 state[:, 0] 放在 x 的第 0 维，计划的第一步就等于它。
+    seed = buffer.x[:n][:, :1].expand(-1, D)
+    assert torch.allclose(buffer.ref[:n][:, 0, :], seed)
+    assert torch.allclose(buffer.ref_next[:n][:, 0, :], buffer.x_next[:n][:, :1].expand(-1, D))
+
+
+def test_only_chunk_boundary_anchors_are_valid_imitation_targets():
+    """基线 rollout 执行的就是参考本身，所以 aligned 行必须是恒等映射。"""
+    cfg = _cfg()
+    _c, _e, buffer, _ctrl, worker = _make(cfg=cfg)
+    _run_episode(worker)
+
+    n = len(buffer)
+    aligned = buffer.aligned[:n] > 0
+    assert aligned.float().mean() == pytest.approx(cfg.subsample_stride / C)
+    assert torch.allclose(buffer.action[:n][aligned], buffer.ref[:n][aligned])
 
 
 class ScriptedInterventionEnv(MockManipEnv):
@@ -110,20 +200,31 @@ def _make(env=None, cfg=None):
     return cfg, env, buffer, controller, worker
 
 
+def _run_episode(worker, max_chunks=64) -> int:
+    """Run one episode to its end and wait for its records to land.
+
+    Transitions are emitted when the episode ends, and the assembler thread is
+    what emits them, so the drain is part of the contract — not test noise.
+    """
+    worker.reset()
+    for i in range(max_chunks):
+        _n, done, _succ, _interv = worker.run_chunk(use_actor=False)
+        if done:
+            worker.drain()
+            return i + 1
+    raise AssertionError("episode never ended")
+
+
 def test_rollout_fills_buffer_with_aligned_transitions():
     cfg, _env, buffer, controller, worker = _make()
-    worker.reset()
-    for _ in range(6):
-        worker.run_chunk(use_actor=False)
+    chunks = _run_episode(worker)
 
     assert len(buffer) > 0
     # 每个 chunk 只规划一次；中间 offset 的状态是批量补算的，不占控制回路
-    assert controller.n_plans == 6
+    assert controller.n_plans == chunks
     n = len(buffer)
     assert torch.isfinite(buffer.x[:n]).all()
     assert torch.isfinite(buffer.x_next[:n]).all()
-    assert (buffer.actual_steps[:n] > 0).all()
-    assert (buffer.actual_steps[:n] <= C).all()
     # 非终止样本的 x_next 必须是真实的后继状态，不能自指
     non_terminal = buffer.done[:n] == 0
     if non_terminal.any():
@@ -131,23 +232,19 @@ def test_rollout_fills_buffer_with_aligned_transitions():
         assert not same.all()
 
 
-def test_intervention_replaces_both_action_and_reference():
-    """人类修正必须同时替换执行动作与存储的参考，否则 BC 项会把 actor 拉回失败的 VLA 动作。"""
+def test_intervention_preserves_reference_and_records_executed_human_action():
+    """接管不改变 actor 条件输入；human action 单独保存在行为 target 中。"""
     env = ScriptedInterventionEnv(intervene_on={0}, action_dim=D, max_episode_steps=40)
-    cfg, _e, buffer, _c, worker = _make(env=env)
-    worker.reset()
-    _n, _done, _succ, intervened = worker.run_chunk(use_actor=False)
-    assert intervened
-    worker.run_chunk(use_actor=False)  # 触发上一个 chunk 的 transition 落库
+    _cfg_, _e, buffer, _c, worker = _make(env=env)
+    _run_episode(worker)
 
-    assert len(buffer) > 0
-    # 被接管的 chunk，其存储的参考动作整条都是人类动作 —— 这正是论文 Sec. V 的要求：
-    # 干预替换的是 VLA 参考，从而让 BC 项把 actor 拉向人类修正。
-    stored_ref = buffer.ref[: len(buffer)]
-    assert torch.allclose(stored_ref, torch.full_like(stored_ref, env.human_value))
-    # offset 0 的动作窗口完全落在被接管的 chunk 内；offset>0 的窗口按定义横跨
-    # 下一个 chunk，因此是人类动作与策略动作的拼接，不应整条都是人类值。
-    assert torch.allclose(buffer.action[0], torch.full_like(buffer.action[0], env.human_value))
+    n = len(buffer)
+    assert n > 0
+    human = buffer.source_chunk[:n] == int(TransitionSource.HUMAN)
+    assert human.any(), "被接管的步要打上 HUMAN 标签"
+    # HUMAN 步的执行动作是人的命令，但条件 reference 仍是 VLA 的 0.25。
+    assert torch.allclose(buffer.action[:n][human], torch.tensor(env.human_value))
+    assert torch.allclose(buffer.ref[:n], torch.tensor(0.25))
 
 
 class ProbingInterventionEnv(ScriptedInterventionEnv):
@@ -186,7 +283,7 @@ def test_takeover_works_again_once_warmup_is_over():
     worker.allow_intervention = True
     _n, _done, _succ, intervened = worker.run_chunk(use_actor=False)
     assert intervened
-    assert env.n_pending_polls > 0
+    assert env.chunk_idx > 0, "run_intervention 必须被调用"
 
 
 def test_critical_phase_defers_rl_until_handover():
@@ -200,9 +297,8 @@ def test_critical_phase_defers_rl_until_handover():
 
 def test_learner_thread_updates_and_publishes_weights():
     cfg, _env, buffer, _ctrl, worker = _make()
-    worker.reset()
-    for _ in range(8):
-        worker.run_chunk(use_actor=False)
+    for _ in range(2):
+        _run_episode(worker)
     assert len(buffer) >= cfg.batch_size
 
     agent = RLTAgent(cfg, device="cpu")
@@ -211,7 +307,7 @@ def test_learner_thread_updates_and_publishes_weights():
     mirror.sync(learner)
     v0 = mirror.version
 
-    learner.allow_actor_updates = True
+    learner.warmup = False
     learner.start()
     try:
         deadline = time.time() + 10.0
@@ -232,9 +328,8 @@ def test_learner_thread_updates_and_publishes_weights():
 def test_learner_paces_itself_by_the_update_to_data_ratio():
     """UTD 按真实入库的 transition 数计，而不是按名义 chunk 长度。"""
     cfg, _env, buffer, _ctrl, worker = _make(cfg=_cfg(utd=3))
-    worker.reset()
-    for _ in range(8):
-        worker.run_chunk(use_actor=False)
+    for _ in range(2):
+        _run_episode(worker)
 
     agent = RLTAgent(cfg, device="cpu")
     learner = LearnerThread(agent, buffer, cfg, idle_sleep_s=0.001)
@@ -253,16 +348,50 @@ def test_learner_paces_itself_by_the_update_to_data_ratio():
     assert learner.updates == expected, f"{learner.updates} != {expected}"
 
 
-def test_warmup_holds_the_actor_at_the_vla_reference():
-    cfg, _env, buffer, _ctrl, worker = _make()
-    worker.reset()
-    for _ in range(8):
-        worker.run_chunk(use_actor=False)
+def test_warmup_grinds_past_the_utd_budget_and_then_stops():
+    """UTD 会把 20000 步 warmup 拖成一场采集；参考实现是就地把已有数据磨够。"""
+    target = 200
+    cfg = _cfg(utd=1, warmup_post_collect_updates=target)
+    cfg, _env, buffer, _ctrl, worker = _make(cfg=cfg)
+    _run_episode(worker)
+    assert cfg.utd * buffer.total_added < target, "UTD 额度本来就该不够，否则测不到东西"
+
+    agent = RLTAgent(cfg, device="cpu")
+    learner = LearnerThread(agent, buffer, cfg, idle_sleep_s=0.001)
+    learner.warmup = True
+
+    learner.start()
+    try:
+        deadline = time.time() + 20.0
+        while learner.updates < target and time.time() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)  # 给它机会越过目标，确认它真的停住了
+    finally:
+        learner.stop()
+        learner.join(timeout=5.0)
+
+    assert learner.updates == target, f"{learner.updates} != {target}"
+    # UTD 额度照常花掉，补足的那部分不额外记账——否则 online 阶段一开始就欠着
+    assert learner._consumed == buffer.total_added
+
+
+def test_warmup_trains_the_actor_on_the_warmup_weight_pair():
+    """warmup 不冻结 actor，只换 BC/Q 权重对——冻结会连带停掉 target 的 EMA。
+
+    `residual_scale=0` 才测得出来：残差参数化的 actor 出厂就等于 VLA 参考，而
+    warmup 数据里执行的正是那份参考，所以 BC 项在初始点上恰好为 0，没有梯度可看。
+    """
+    cfg = _cfg(
+        residual_scale=0.0, warmup_bc_weight=10.0, warmup_q_weight=0.0, actor_update_period=1
+    )
+    cfg, _env, buffer, _ctrl, worker = _make(cfg=cfg)
+    for _ in range(2):
+        _run_episode(worker)
 
     agent = RLTAgent(cfg, device="cpu")
     before = [p.detach().clone() for p in agent.actor.parameters()]
     learner = LearnerThread(agent, buffer, cfg, idle_sleep_s=0.001)
-    learner.allow_actor_updates = False  # warmup 期：只训 critic
+    learner.warmup = True
 
     learner.start()
     try:
@@ -275,8 +404,10 @@ def test_warmup_holds_the_actor_at_the_vla_reference():
 
     assert learner.updates >= 10
     after = list(agent.actor.parameters())
-    for b, a in zip(before, after, strict=True):
-        assert torch.allclose(b, a), "warmup 期间 actor 不应被更新"
+    assert any(
+        not torch.allclose(b, a) for b, a in zip(before, after, strict=True)
+    ), "warmup 期间 actor 仍然要训练"
+    assert learner.metrics()["bc_penalty"] > 0
 
 
 class FailureTerminatingEnv(MockManipEnv):
@@ -298,39 +429,42 @@ class FailureTerminatingEnv(MockManipEnv):
 
 
 def test_failure_key_terminates_without_counting_as_success():
-    env = FailureTerminatingEnv(fail_at=3, action_dim=D, max_episode_steps=40)
+    env = FailureTerminatingEnv(fail_at=6, action_dim=D, max_episode_steps=40)
     _cfg_, _e, buffer, _c, worker = _make(env=env)
     worker.reset()
+    worker.run_chunk(use_actor=False)
     n_exec, ep_done, ep_success, _interv = worker.run_chunk(use_actor=False)
 
-    assert n_exec == 3, "失败键应立即结束当前 chunk"
+    assert n_exec == 2, "失败键应立即结束当前 chunk"
     assert ep_done, "失败同样结束 episode"
     assert not ep_success, "reward 为 0 的终止不能被算作成功"
-    # 失败仍是终止态（后续无奖励可得），所以要屏蔽 bootstrap
+    # 失败仍是终止态（后续无奖励可得），所以覆盖到它的窗口要屏蔽 bootstrap
+    worker.drain()
     n = len(buffer)
     assert n > 0
-    assert (buffer.done[:n] == 1).all()
-    assert (buffer.reward_disc[:n] == 0).all()
+    assert (buffer.done[:n] == 1).any()
+    assert (buffer.rewards[:n] == 0).all()
+    assert (buffer.success[:n] == 0).all()
 
 
 def test_discard_episode_drops_the_whole_episode():
     _cfg_, _env, buffer, _c, worker = _make()
+    _run_episode(worker)
+    stored, added = len(buffer), buffer.total_added
+    assert stored > 0
+
     worker.reset()
     for _ in range(4):
         worker.run_chunk(use_actor=False)
-    assert len(buffer) > 0
-
-    before_total = buffer.total_added
+    worker.drain()
     dropped = buffer.discard_episode()
-    assert dropped == before_total
-    assert len(buffer) == 0, "`←` 应丢掉整个 episode，而不只是未配对的那个 chunk"
-    assert buffer.total_added == 0
+    assert dropped == 4 * C, "`←` 应丢掉整个 episode 的 step trace"
+    assert len(buffer) == stored, "已经落库的上一集不受影响"
+    assert buffer.total_added == added
 
     # 丢弃后仍能继续正常写入
-    worker.reset()
-    for _ in range(4):
-        worker.run_chunk(use_actor=False)
-    assert len(buffer) > 0
+    _run_episode(worker)
+    assert len(buffer) > stored
 
 
 def test_mock_env_can_be_closed():
@@ -338,3 +472,174 @@ def test_mock_env_can_be_closed():
     env = MockManipEnv(action_dim=D, max_episode_steps=40)
     env.reset()
     env.close()
+
+
+# ------------------------------------------------------- 边界处的异步装配
+class TakeoverEnv(MockManipEnv):
+    """操作员从第一个 chunk 起就一直握着控制权。
+
+    和 `ScriptedInterventionEnv` 的区别只有一个，但正是被测的那个：
+    `intervention_pending()` 为真，所以 rollout 应当把这一段的 VLA 采样推迟到
+    装配线程上，而不是让人在边界上干等。
+    """
+
+    def __init__(self, human_value=0.75, **kw):
+        super().__init__(**kw)
+        self.human_value = human_value
+        self.pending = True
+
+    def intervention_pending(self):
+        return self.pending
+
+    def run_intervention(self, chunk_len):
+        if not self.pending:
+            return None
+        obs_list, rewards = [], []
+        done = truncated = False
+        for _ in range(chunk_len):
+            o, r, done, truncated = self.apply_action(
+                torch.full((self.action_dim,), self.human_value)
+            )
+            obs_list.append(o)
+            rewards.append(r)
+            self.intervention.notify_step(o)
+            if done or truncated:
+                break
+        n = len(obs_list)
+        chunk = torch.full((n, self.action_dim), self.human_value)
+        if n < chunk_len:  # 和真实 manager 一样，尾部保持最后一条人类指令
+            chunk = torch.cat([chunk, chunk[-1:].expand(chunk_len - n, -1)], dim=0)
+        rew = torch.zeros(chunk_len)
+        rew[:n] = torch.tensor(rewards, dtype=torch.float32)
+        return InterventionResult(
+            action_chunk=chunk,
+            obs_list=obs_list,
+            rewards=rew,
+            n_steps=n,
+            done=done,
+            truncated=truncated,
+        )
+
+
+class RefusingTakeoverEnv(TakeoverEnv):
+    """人按了接管，但安全门拒绝了（真机上主臂被挪得太远）。"""
+
+    def run_intervention(self, chunk_len):
+        return None
+
+
+BUFFER_COLUMNS = (
+    "x", "action", "ref", "rewards", "x_next", "ref_next",
+    "done", "mc_return", "mc_valid", "source_chunk", "source", "aligned", "success",
+)
+
+
+def _episode_columns(env_factory, *, async_records: bool):
+    cfg = _cfg()
+    env = env_factory()
+    buffer = ChunkReplayBuffer(
+        capacity=256,
+        x_dim=X_DIM,
+        chunk_len=C,
+        action_dim=D,
+        discount=cfg.discount,
+        stride=cfg.subsample_stride,
+        device="cpu",
+    )
+    worker = RolloutWorker(
+        env,
+        DriftingPlanController(cfg),
+        buffer,
+        cfg.subsample_stride,
+        async_records=async_records,
+    )
+    _run_episode(worker)
+    worker.stop()
+    n = len(buffer)
+    return n, {name: getattr(buffer, name)[:n].clone() for name in BUFFER_COLUMNS}
+
+
+@pytest.mark.parametrize(
+    "env_factory",
+    [
+        lambda: MockManipEnv(action_dim=D, max_episode_steps=40),
+        lambda: ScriptedInterventionEnv(intervene_on={1}, action_dim=D, max_episode_steps=40),
+        lambda: TakeoverEnv(action_dim=D, max_episode_steps=40),
+    ],
+    ids=["policy", "scripted-takeover", "held-takeover"],
+)
+def test_deferring_assembly_does_not_change_a_single_stored_value(env_factory):
+    """把装配挪到后台线程只改"什么时候算"，不改算出来的东西。
+
+    这是整个改动的安全网：控制回路上省下来的时间如果是拿存进 buffer 的内容换的，
+    那 actor 的 BC 目标就被悄悄改了，而这在真机上要几百个 episode 之后才看得出来。
+    """
+    n_async, cols_async = _episode_columns(env_factory, async_records=True)
+    n_sync, cols_sync = _episode_columns(env_factory, async_records=False)
+
+    assert n_async == n_sync > 0
+    for name in BUFFER_COLUMNS:
+        assert torch.equal(cols_async[name], cols_sync[name]), name
+
+
+def test_a_held_takeover_never_plans_on_the_control_thread():
+    """人已经握着主臂时，边界上不该再有一次 VLM 前向 + flow-matching 采样。"""
+    cfg = _cfg()
+    env = TakeoverEnv(action_dim=D, max_episode_steps=40)
+    buffer = ChunkReplayBuffer(
+        capacity=256, x_dim=X_DIM, chunk_len=C, action_dim=D,
+        discount=cfg.discount, stride=cfg.subsample_stride, device="cpu",
+    )
+    controller = DriftingPlanController(cfg)
+    worker = RolloutWorker(env, controller, buffer, cfg.subsample_stride)
+    _run_episode(worker)
+    worker.stop()
+
+    assert controller.n_plans == 0, "接管期间 plan_chunk 一次都不该被调用"
+    assert controller.n_compute_x > 0, "但参考仍然要被采样并存下来"
+
+    # 边界 anchor 的参考仍是"在该 anchor 的状态上重新采样"的那一份 —— 推迟计算
+    # 不等于允许复用上一次的计划。
+    n = len(buffer)
+    assert n > 0
+    assert torch.allclose(buffer.ref[:n][:, 0, :], buffer.x[:n][:, :1].expand(-1, D))
+
+
+def test_a_refused_takeover_still_gets_a_plan():
+    """安全门拒绝接管后策略要接着开，这时候计划是同步需要的。"""
+    cfg = _cfg()
+    env = RefusingTakeoverEnv(action_dim=D, max_episode_steps=40)
+    buffer = ChunkReplayBuffer(
+        capacity=256, x_dim=X_DIM, chunk_len=C, action_dim=D,
+        discount=cfg.discount, stride=cfg.subsample_stride, device="cpu",
+    )
+    controller = StubController(cfg)
+    worker = RolloutWorker(env, controller, buffer, cfg.subsample_stride)
+    chunks = _run_episode(worker)
+    worker.stop()
+
+    assert controller.n_plans == chunks
+    n = len(buffer)
+    assert n > 0
+    assert (buffer.source_chunk[:n] == int(TransitionSource.BASE)).all()
+
+
+def test_an_assembler_failure_surfaces_on_the_control_thread():
+    """装配线程静默死掉就是静默丢数据，必须炸在主线程上。"""
+    cfg = _cfg()
+
+    class ExplodingController(StubController):
+        def compute_x(self, batch, with_ref=False):
+            raise RuntimeError("boom")
+
+    env = MockManipEnv(action_dim=D, max_episode_steps=40)
+    buffer = ChunkReplayBuffer(
+        capacity=256, x_dim=X_DIM, chunk_len=C, action_dim=D,
+        discount=cfg.discount, stride=cfg.subsample_stride, device="cpu",
+    )
+    worker = RolloutWorker(env, ExplodingController(cfg), buffer, cfg.subsample_stride)
+    worker.reset()
+    worker.run_chunk(use_actor=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        worker.drain()
+    worker.stop()

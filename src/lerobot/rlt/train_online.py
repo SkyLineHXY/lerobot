@@ -2,14 +2,14 @@
 
 Rollout-and-update loop:
   * warmup: execute the base VLA reference chunks for N_warm env steps while
-    the learner already trains the critic on that data,
-  * afterwards the actor refines the VLA chunks; every executed chunk is
-    stored with stride-2 subsampling and the learner paces itself at
-    `utd` gradient steps per stored transition (2 critic updates per actor
-    update),
+    the learner already trains on that data under the warmup BC/Q weight pair,
+  * afterwards the actor refines the VLA chunks; every episode is turned into
+    stride-2 subsampled chunk transitions when it ends, and the learner paces
+    itself at `utd` gradient steps per stored transition (actor and both target
+    networks move every `actor_update_period` critic steps),
   * once warmup is over a human may take over at any point, including
-    mid-chunk; the taken-over actions replace both the executed action and the
-    stored reference (paper Sec. V),
+    mid-chunk; the taken-over actions replace the executed action and are
+    labelled `HUMAN`, which is what the actor's BC term keys off (paper Sec. V),
   * with `--critical-phase` the episode starts under the base VLA and the
     operator presses `r` to hand control to the RL policy, so data collection
     concentrates on the precise segment that decides success,
@@ -38,14 +38,14 @@ Configuration is a draccus YAML tree (see `examples/rlt/`); any field can be
 overridden on the command line:
 
   # mock smoke run
-  python -m lerobot.rlt.train_online --config_path examples/rlt/mock_online.yaml
+  python -m lerobot.rlt.train_online --config_path examples/rlt/mock/online.yaml
 
   # LIBERO simulation, pre-hardware validation
-  python -m lerobot.rlt.train_online --config_path examples/rlt/libero_online.yaml \
+  python -m lerobot.rlt.train_online --config_path examples/rlt/libero/4_online.yaml \
     --env.task_id=3
 
   # real Piper arm, leader-arm interventions
-  python -m lerobot.rlt.train_online --config_path examples/rlt/piper_online.yaml \
+  python -m lerobot.rlt.train_online --config_path examples/rlt/piper/online.yaml \
     --env.dry_run=true
 """
 import logging
@@ -66,6 +66,12 @@ from lerobot.policies.rlt import (
 )
 from lerobot.rlt.backends import make_backend
 from lerobot.rlt.envs import make_chunk_env
+from lerobot.rlt.metrics import (
+    EpisodeTracker,
+    format_terminal,
+    make_wandb_logger,
+    prefix_learner_metrics,
+)
 from lerobot.rlt.rollout import RolloutWorker
 from lerobot.rlt.teleop.keys import KeyboardEventListener
 from lerobot.rlt.view import RolloutView
@@ -94,7 +100,7 @@ def build_agent_and_controller(cfg: RLTOnlineTrainConfig):
     policy = load_smolvla_policy(cfg.checkpoint, device=device, dtype=cfg.dtype)
     check_stage1_matches_policy(cfg.rl_token, cfg.checkpoint)
     rl_token, rt_cfg = load_rl_token(cfg.rl_token, device)
-    cfg.rl.ac.rl_token_dim = rt_cfg.d_model
+    cfg.rl.ac.rl_token_dim = rl_token.z_rl_dim
 
     agent = RLTAgent(cfg.rl, device=device)
     controller = RLTController(
@@ -137,6 +143,42 @@ def poll_task_switch(env, keys) -> int | None:
     return wanted
 
 
+def stream_stats(env) -> dict[str, float]:
+    """Command-thread health on hardware; empty everywhere else.
+
+    `hz` is the rate the follower is actually commanded at — if it collapses
+    toward `control_hz` the streamer is not doing its job and the boundary
+    stutter is back. A high `saturation` means the operator is routinely moving
+    faster than `max_joint_vel_rad_s`, so the recorded action is a limited
+    version of what they meant.
+    """
+    streamer = getattr(env, "streamer", None)
+    return streamer.stats() if streamer is not None else {}
+
+
+def prefix_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}_{k}": v for k, v in metrics.items()}
+
+
+def warmup_required(rl, env_steps: int, updates: float) -> bool:
+    """Whether the two warmup budgets have not both been satisfied."""
+    return env_steps < rl.warmup_env_steps or updates < rl.warmup_post_collect_updates
+
+
+def advance_warmup_phase(
+    warmup: bool, *, episode_done: bool, rl, env_steps: int, updates: float
+) -> bool:
+    """Latch collection phase for a whole episode.
+
+    Changing policy halfway through an episode contaminates both the episode
+    success statistic and the replay `phase` label. A completed episode is the
+    only boundary at which a warmup run may hand control to the actor.
+    """
+    if not warmup or not episode_done:
+        return warmup
+    return warmup_required(rl, env_steps, updates)
+
+
 def train(cfg: RLTOnlineTrainConfig):
     rl = cfg.rl
     torch.manual_seed(cfg.seed)
@@ -148,9 +190,12 @@ def train(cfg: RLTOnlineTrainConfig):
     x_dim = rl.ac.rl_token_dim + rl.ac.proprio_dim
 
     keys = KeyboardEventListener(backend=cfg.keyboard_backend, discard_key=cfg.discard_key)
+    wb = make_wandb_logger(cfg)
+    stats = EpisodeTracker()
     env = None
     backend = None
     view = None
+    worker = None
     try:
         # Build the env *before* putting stdin in cbreak mode: connecting the
         # leader can drop into the interactive calibration flow, whose `input()`
@@ -169,14 +214,20 @@ def train(cfg: RLTOnlineTrainConfig):
             min_period_s=cfg.view.min_period_s,
         )
         worker = RolloutWorker(
-            env, controller, backend.buffer, rl.subsample_stride, keys=keys, view=view
+            env,
+            controller,
+            backend.buffer,
+            rl.subsample_stride,
+            keys=keys,
+            view=view,
+            truncation_is_failure=rl.truncation_is_failure,
         )
         backend.start()
         print(f"[stage2] concurrency mode: {backend.mode}")
         hints = ["space=takeover", "s=success", "f=failure", f"{cfg.discard_key}=discard", "esc=quit"]
         print(
-            f"[stage2] warmup: base VLA only for {rl.warmup_env_steps} env steps "
-            f"(no view, no takeover)"
+            f"[stage2] warmup: base VLA only for {rl.warmup_env_steps} env steps and "
+            f"{rl.warmup_post_collect_updates} gradient steps (no view, no takeover)"
         )
         if hasattr(env, "set_task_id"):
             hints.append(f"0-9=task (0..{env.n_tasks - 1})")
@@ -190,11 +241,15 @@ def train(cfg: RLTOnlineTrainConfig):
             hint=" | ".join(hints),
         )
 
-        env_steps, episodes, ep_results = 0, 0, []
+        env_steps = 0
+        warmup = warmup_required(rl, env_steps=0, updates=0.0)
 
         def reset_episode() -> None:
-            worker.reset(critical_phase=cfg.critical_phase)
+            worker.reset(critical_phase=cfg.critical_phase, warmup=warmup)
 
+        backend.set_warmup(warmup)
+        worker.allow_intervention = not warmup
+        view.set_active(not warmup)
         reset_episode()
         t0 = time.time()
 
@@ -208,15 +263,17 @@ def train(cfg: RLTOnlineTrainConfig):
                 break
 
             if poll_task_switch(env, keys) is not None:
+                # Records still in the assembler belong to the episode being
+                # dropped; letting them land after the discard would file them
+                # under the next one.
+                worker.drain()
                 backend.buffer.discard_episode()
                 view.set(task=env.task_description, task_id=env.task_id)
                 reset_episode()
                 continue
 
-            warmup = env_steps < rl.warmup_env_steps
-            backend.set_warmup(warmup)
-            worker.allow_intervention = not warmup
-            view.set_active(not warmup)
+            learner_metrics = backend.metrics()
+            updates = learner_metrics.get("updates", 0.0)
 
             # Critical-phase handover: run the base VLA until the operator
             # presses `r`, then let the RL policy take over for the rest of the
@@ -226,17 +283,17 @@ def train(cfg: RLTOnlineTrainConfig):
                 print("[stage2] handover -> RL policy")
 
             use_actor = (not warmup) and worker.rl_engaged
-            recent = ep_results[-20:]
+            summary = stats.summary()
             view.set(
                 phase="WARMUP" if warmup else ("RL" if use_actor else "VLA"),
                 env_steps=env_steps,
-                episodes=episodes,
-                success_rate=sum(recent) / max(len(recent), 1),
-                successes=int(sum(ep_results)),
+                episodes=stats.episodes,
+                success_rate=summary.get(f"rollout/success_rate_{stats.window}", 0.0),
+                successes=stats.successes,
                 buffer=len(backend.buffer),
                 fps=env_steps / max(time.time() - t0, 1e-6),
                 elapsed=time.time() - t0,
-                metrics=backend.metrics(),
+                metrics=learner_metrics,
             )
             backend.sync_mirror()
             prev_steps = env_steps
@@ -246,34 +303,93 @@ def train(cfg: RLTOnlineTrainConfig):
             if keys.poll_discard():
                 # `env_steps` is not rolled back: the arm really did move, and
                 # the budget is a wear/time budget, not a data counter.
+                worker.drain()
                 dropped = backend.buffer.discard_episode()
                 print(f"[stage2] episode discarded by operator ({dropped} dropped)")
                 reset_episode()
                 continue
 
             if ep_done:
-                episodes += 1
-                ep_results.append(1.0 if ep_success else 0.0)
+                # Read the worker before resetting it: those counters are the
+                # episode's own totals. `warmup` is deliberately latched for
+                # the episode, so this label cannot disagree with its actions.
+                wb.log(
+                    stats.add(
+                        success=ep_success,
+                        length=worker.ep_steps,
+                        ep_return=worker.ep_return,
+                        interventions=worker.ep_interventions,
+                        warmup=warmup,
+                        intervention_steps=worker.ep_intervention_steps,
+                    ),
+                    env_steps,
+                )
+                backend.sync_mirror()
+                updates = backend.metrics().get("updates", updates)
+                was_warmup = warmup
+                warmup = advance_warmup_phase(
+                    warmup,
+                    episode_done=True,
+                    rl=rl,
+                    env_steps=env_steps,
+                    updates=updates,
+                )
+                if was_warmup and not warmup:
+                    print(f"[stage2] warmup done: {env_steps} env steps, {updates:.0f} updates")
+                backend.set_warmup(warmup)
+                worker.allow_intervention = not warmup
+                view.set_active(not warmup)
                 reset_episode()
 
             if env_steps // cfg.log_freq != prev_steps // cfg.log_freq:
-                recent = ep_results[-20:]
-                sr = sum(recent) / max(len(recent), 1)
+                summary = stats.summary()
+                sr = summary.get(f"rollout/success_rate_{stats.window}", 0.0)
                 speed = env_steps / (time.time() - t0)
-                m = " ".join(f"{k}={v:.4f}" for k, v in backend.metrics().items())
+                learner_metrics = backend.metrics()
+                gaps = list(worker.boundary_gaps)
+                wb.log(
+                    {
+                        **prefix_learner_metrics(learner_metrics),
+                        **summary,
+                        "rollout/env_steps_per_s": speed,
+                        "rollout/warmup": float(warmup),
+                        # Dead time at a chunk boundary — what the operator
+                        # feels as a stutter mid-correction, and the number
+                        # that says whether deferring the VLA work worked.
+                        "rollout/boundary_gap_s": sum(gaps) / max(len(gaps), 1),
+                        "rollout/boundary_gap_max_s": max(gaps, default=0.0),
+                        **prefix_metrics("rollout/stream", stream_stats(env)),
+                        # Realised UTD, directly comparable to `rl.utd`. It
+                        # collapses silently when the learner cannot keep up
+                        # with the arm, and then nothing else on these plots
+                        # means what it looks like it means.
+                        "train/realised_utd": learner_metrics.get("updates", 0.0)
+                        / max(learner_metrics.get("buffer_total_added", 0.0), 1.0),
+                        "train/updates_per_env_step": learner_metrics.get("updates", 0.0)
+                        / max(env_steps, 1),
+                    },
+                    env_steps,
+                )
+                m = format_terminal(learner_metrics)
                 print(
-                    f"[stage2] steps={env_steps} eps={episodes} buffer={len(backend.buffer)} "
-                    f"success20={sr:.2f} {'(warmup) ' if warmup else ''}"
+                    f"[stage2] steps={env_steps} eps={stats.episodes} buffer={len(backend.buffer)} "
+                    f"success20={sr:.2f} gap={sum(gaps) / max(len(gaps), 1) * 1e3:.0f}ms "
+                    f"{'(warmup) ' if warmup else ''}"
                     f"{'(interv) ' if intervened else ''}{m} ({speed:.1f} steps/s)",
                     flush=True,
                 )
 
             if env_steps // cfg.save_freq != prev_steps // cfg.save_freq:
+                worker.drain()
                 backend.checkpoint(out_dir)
     finally:
         # Each step gets its own try/except: an exception raised while tearing
         # down masks whatever actually ended the run.
         for label, teardown in (
+            # The assembler first: its in-flight records are only reachable
+            # while the buffer and the controller are still alive.
+            ("rollout", (worker.stop if worker is not None else lambda: None)),
+            ("wandb", wb.finish),
             ("view", (view.stop if view is not None else lambda: None)),
             ("keyboard", keys.stop),
             ("backend", (backend.stop if backend is not None else lambda: None)),
@@ -286,7 +402,7 @@ def train(cfg: RLTOnlineTrainConfig):
 
     if backend is not None:
         backend.checkpoint(out_dir)
-    print(f"[stage2] done; {episodes} episodes, saved under {out_dir}")
+    print(f"[stage2] done; {stats.episodes} episodes, saved under {out_dir}")
 
 
 @parser.wrap()
