@@ -112,32 +112,18 @@ class TrainPipelineConfig(HubMixin):
     env: envs.EnvConfig | None = None
     policy: PreTrainedConfig | None = None
     reward_model: RewardModelConfig | None = None
-    # Set `dir` to where you would like to save all of the run outputs. If you run another training session
-    # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
+
     output_dir: Path | None = None
     job_name: str | None = None
-    # Set `resume` to true to resume a previous run. Pass `--config_path` pointing at either a local
-    # checkpoint's train_config.json or a Hub repo id holding `checkpoints/<step>/` subtrees (the
-    # latest checkpoint is downloaded and resumed from). Note that when resuming, the default behavior
-    # is to use the configuration from the checkpoint, regardless of what's provided with the training
-    # command at the time of resumption (CLI `--*` flags still override).
     resume: bool = False
-    # `seed` is used for training (eg: model initialization, dataset shuffling)
-    # AND for the evaluation environments.
+
     seed: int | None = 1000
-    # Set to True to use deterministic cuDNN algorithms for reproducibility.
-    # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
+
     cudnn_deterministic: bool = False
-    # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
     prefetch_factor: int = 4
     persistent_workers: bool = True
-    # DataLoader worker start method. "spawn" is safer than "fork" with
-    # non-fork-safe libs (PyAV / torchcodec / ffmpeg), but adds some
-    # worker-startup time per run since workers re-import modules instead
-    # of inheriting parent state. Override with `--dataloader_multiprocessing_context=fork`
-    # when appropriate, or set it to `null` to use Python's platform default.
     dataloader_multiprocessing_context: str | None = "spawn"
     steps: int = 100_000
     # Run policy in the simulation environment every N steps to measure reward/success (0 = disabled).

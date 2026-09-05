@@ -28,7 +28,12 @@ Only the last two steps are active today; CP/AC/compile are configured
 placeholders wired in later rounds.
 """
 
-from .factory import guard_against_env_interference, make_accelerator, set_fsdp_wrap_modules
+from .factory import (
+    guard_against_env_interference,
+    make_accelerator,
+    pin_device_from_config,
+    set_fsdp_wrap_modules,
+)
 from .parallel_dims import ParallelDims
 from .utils import finalize_sharded_policy, is_main_process, strip_accelerate_cp_hooks
 
@@ -38,6 +43,7 @@ __all__ = [
     "guard_against_env_interference",
     "is_main_process",
     "make_accelerator",
+    "pin_device_from_config",
     "set_fsdp_wrap_modules",
     "strip_accelerate_cp_hooks",
 ]

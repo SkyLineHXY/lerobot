@@ -950,7 +950,7 @@ def worker_process_episodes(
 
 def main():
     parser = argparse.ArgumentParser(description="SARM-style subtask annotation using local GPU (Qwen3-VL)")
-    parser.add_argument("--repo-id", type=str, required=True, help="HuggingFace dataset repository ID")
+    parser.add_argument("--repo-id", type=str,default='/home/zzq/lerobotv6/outputs/train/sarm_insertion_single_20260904/checkpoints/005000/pretrained_model', required=False, help="HuggingFace dataset repository ID")
     parser.add_argument(
         "--sparse-subtasks", type=str, default=None, help="Comma-separated sparse subtask names"
     )

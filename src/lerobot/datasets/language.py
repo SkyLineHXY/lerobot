@@ -37,30 +37,13 @@ CORE_STYLES = {
     "trace",
     "task_aug",
 }
-# Project-local styles can be registered at import time by appending to
-# ``EXTENDED_STYLES`` before ``column_for_style`` is called. Anything added
-# here is treated as a known style alongside ``CORE_STYLES`` for resolver
-# validation. Empty by default — populate from a downstream module that
-# also extends ``PERSISTENT_STYLES`` or ``EVENT_ONLY_STYLES`` to declare
-# the new style's column.
+
 EXTENDED_STYLES: set[str] = set()
 STYLE_REGISTRY = CORE_STYLES | EXTENDED_STYLES
 
 PERSISTENT_STYLES = {"subtask", "plan", "memory", "motion", "task_aug"}
 EVENT_ONLY_STYLES = {"interjection", "vqa", "trace"}
-
-# Styles whose ``content`` is grounded in a specific camera view. Rows of these
-# styles MUST carry a non-null ``camera`` referencing an ``observation.images.*``
-# feature key. Rows of every other style MUST have ``camera=None``. ``motion``
-# is intentionally NOT in this set: motion primitives are described in
-# robot-frame (joint / Cartesian) terms, not pixel space, so they are
-# camera-agnostic. ``trace`` is the pixel-trajectory event style and IS
-# view-dependent. The ``camera`` field nevertheless lives on
-# ``PERSISTENT_ROW_FIELDS`` too so the schema, validator, and resolver
-# behave symmetrically across the two columns; persistent rows simply
-# always have ``camera=None`` in practice today.
 VIEW_DEPENDENT_STYLES = {"vqa", "trace"}
-
 LanguageColumn = Literal["language_persistent", "language_events"]
 
 

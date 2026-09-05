@@ -21,6 +21,7 @@ alone. `accelerate launch` without a `--config_file` remains equivalent (it only
 env vars in that mode); the yaml flow is superseded.
 """
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -32,12 +33,19 @@ if TYPE_CHECKING:
 
     from lerobot.policies.pretrained import PreTrainedPolicy
 
+#: accelerate's own hook for pinning `state.device`, read by `PartialState.__init__` before
+#: `set_device()` would otherwise fall back to the default card.
+_TORCH_DEVICE_ENV = "ACCELERATE_TORCH_DEVICE"
+
 # Env vars through which `accelerate launch --config_file` (or a stray shell) would configure
 # accelerate behind the config system's back, making train_config.json lie about what ran.
 _ACCELERATE_ENV_VARS = (
     "ACCELERATE_USE_FSDP",
     "ACCELERATE_USE_PARALLELISM_CONFIG",
     "ACCELERATE_GRADIENT_ACCUMULATION_STEPS",
+    # Set by `pin_device_from_config` below, from `--policy.device` / `--reward_model.device`.
+    # Inherited from a shell it would silently move a run to another card.
+    _TORCH_DEVICE_ENV,
 )
 _ENV_OVERRIDE = "LEROBOT_ALLOW_ACCELERATE_ENV"
 
@@ -66,6 +74,65 @@ def guard_against_env_interference() -> None:
         )
 
 
+def pin_device_from_config(cfg: TrainPipelineConfig) -> None:
+    """Make an indexed `--policy.device=cuda:1` actually decide where the run lands.
+
+    `make_policy` honours the setting (`policy.to(cfg.device)`), but `accelerator.prepare()`
+    immediately moves the model to `accelerator.device`, and accelerate's own default for a
+    single-process run is the index-less `torch.device("cuda")` — card 0. So the config was
+    obeyed for a few milliseconds and then overruled, and a run pinned away from a busy GPU
+    OOMed on it anyway. `ACCELERATE_TORCH_DEVICE` is the documented hook: `PartialState`
+    reads it in `__init__`, which makes `set_device()` return early instead of falling back.
+
+    Only for single-process runs. Under `torchrun` the device is per-rank (LOCAL_RANK), and
+    a config-level index would collapse every rank onto one card; the index is ignored with
+    a warning there. Select the *set* of cards for a distributed run with
+    `CUDA_VISIBLE_DEVICES`, which is what maps local ranks onto physical GPUs.
+
+    Args:
+        cfg (TrainPipelineConfig): The training config; `cfg.trainable_config.device` is the
+            requested device, whether the run trains a policy or a reward model.
+    """
+    import torch
+
+    requested = getattr(cfg.trainable_config, "device", None)
+    if not requested:
+        return
+    device = torch.device(requested)
+    if device.index is None:
+        # "cuda" / "cpu" / "mps": no card was named, so accelerate's default is the answer.
+        return
+
+    if world_size_from_env() > 1:
+        # Rank 0 only: the same misconfiguration would otherwise print once per rank. This
+        # runs before `init_logging()`, so it reaches stderr through logging's lastResort
+        # handler — which is why it is a warning and the success path stays silent.
+        if os.environ.get("LOCAL_RANK", "0") != "0":
+            return
+        logging.warning(
+            f"Ignoring device index in device='{requested}': under a multi-process launch each "
+            "rank takes its own card from LOCAL_RANK, so a config-level index would put every "
+            "rank on the same GPU. Use CUDA_VISIBLE_DEVICES to choose which cards the run sees."
+        )
+        return
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        if device.index >= count:
+            raise ValueError(
+                f"device='{requested}' asks for CUDA device {device.index}, but only {count} "
+                f"{'is' if count == 1 else 'are'} visible to this process. Indices are relative "
+                "to CUDA_VISIBLE_DEVICES, so a masked run renumbers its cards from 0."
+            )
+        # Also make it the *current* device, so the index-less "cuda" that torch and
+        # safetensors resolve lazily (see resolve_safetensors_device) lands here too.
+        torch.cuda.set_device(device)
+
+    # Not logged here: `init_logging()` runs *after* the accelerator is built and clears the
+    # root handlers, so anything said now would vanish. train() reports the resolved device.
+    os.environ[_TORCH_DEVICE_ENV] = str(device)
+
+
 def make_accelerator(cfg: TrainPipelineConfig) -> "Accelerator":
     """Resolve the topology against the launched world and build the `Accelerator`.
 
@@ -84,6 +151,9 @@ def make_accelerator(cfg: TrainPipelineConfig) -> "Accelerator":
             non-sharded run.
     """
     guard_against_env_interference()
+    # Before the Accelerator is built: `PartialState.__init__` reads the pin exactly once,
+    # and the state is a process-wide singleton.
+    pin_device_from_config(cfg)
     cfg.parallelism.resolve(world_size_from_env())
     # The parse-time format check ran against the declared degrees, where the dp_shard=-1
     # sentinel counts as sharded; it may resolve to an unsharded run (e.g. -1 at world size 1).

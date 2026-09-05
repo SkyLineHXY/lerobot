@@ -17,6 +17,9 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
+
+from lerobot.utils.record_controls import MAX_SUBTASKS
 
 from .video import DepthEncoderConfig, RGBEncoderConfig, depth_encoder_defaults, rgb_encoder_defaults
 
@@ -31,14 +34,21 @@ class DatasetRecordConfig:
     root: str | Path | None = None
     # Limit the frames per second.
     fps: int = 30
-    # Number of seconds for data recording for each episode.
+    # Number of seconds for data recording for each episode. Used by the timed rollout
+    # strategies; `lerobot-record` is operator-driven and ignores it.
     episode_time_s: int | float = 60
-    # Number of seconds for resetting the environment after each episode.
+    # Number of seconds for resetting the environment after each episode. Rollout only,
+    # for the same reason as `episode_time_s`.
     reset_time_s: int | float = 60
-    # Number of episodes to record.
+    # Number of episodes to record. For `lerobot-record` this is a target: the session
+    # ends once that many episodes have been saved.
     num_episodes: int = 50
     # Encode frames in the dataset into video
     video: bool = True
+    # Decoder used if the just-recorded dataset is read back in the same process. Recording
+    # itself only encodes video, so default to PyAV instead of probing TorchCodec and printing
+    # a large shared-library warning on machines where TorchCodec is installed but unusable.
+    video_backend: Literal["pyav", "torchcodec"] = "pyav"
     # Upload dataset to Hugging Face hub.
     push_to_hub: bool = True
     # If True, upload as private; if None, defer to the org default on the Hub (only affects orgs).
@@ -74,6 +84,26 @@ class DatasetRecordConfig:
     # Skip appending the date-time tag to repo_id, keeping the user-provided name as-is
     # (e.g. self-managed versioned names intended for a later `lerobot-edit-dataset merge`).
     no_stamp: bool = False
+    # Subtask vocabulary for interactive recording. Digit keys 1-N select the index written
+    # into every frame's `subtask_index` column; the names are also written to
+    # meta/subtasks.parquet. Empty/None disables subtask annotation.
+    subtasks: list[str] | None = None
+    # Write a per-frame `back_event` column, set to 1 while the operator holds error mode
+    # ('e'), marking frames that reached an unrecoverable state. Off by default.
+    use_back_event: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.subtasks:
+            return
+        if len(self.subtasks) > MAX_SUBTASKS:
+            raise ValueError(
+                f"At most {MAX_SUBTASKS} subtasks are supported (they are selected with the digit "
+                f"keys 1-{MAX_SUBTASKS}), got {len(self.subtasks)}."
+            )
+        if any(not name or not name.strip() for name in self.subtasks):
+            raise ValueError("Subtask names must be non-empty.")
+        if len(set(self.subtasks)) != len(self.subtasks):
+            raise ValueError(f"Subtask names must be unique, got {self.subtasks}.")
 
     def stamp_repo_id(self) -> None:
         """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.
